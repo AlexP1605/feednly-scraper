@@ -1,3 +1,8 @@
+// Patch pour éviter l'erreur "File is not defined" (Node 18 + Undici)
+if (typeof File === "undefined") {
+  global.File = class File {};
+}
+
 import express from "express";
 import * as cheerio from "cheerio";
 import axios from "axios";
@@ -269,3 +274,4 @@ setTimeout(async () => {
     console.warn("⚠️ Puppeteer preload failed:", err.message);
   }
 }, 1000);
+
