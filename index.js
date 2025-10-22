@@ -6,6 +6,7 @@ import pRetry from "p-retry";
 
 const app = express();
 
+// Configuration
 const PORT = process.env.PORT || 3000;
 const PROXY = process.env.SCRAPER_PROXY || null;
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
@@ -19,17 +20,20 @@ const LAUNCH_ARGS = [
   "--no-zygote",
   "--single-process"
 ];
-
 if (PROXY) LAUNCH_ARGS.unshift(`--proxy-server=${PROXY}`);
 
+// ✅ Lance Chromium intégré (compatible Render)
 async function launchBrowser() {
+  const browserFetcher = puppeteer.createBrowserFetcher();
+  const revisionInfo = await browserFetcher.download('1095492'); // Version stable de Chromium
   return await puppeteer.launch({
     headless: true,
     args: LAUNCH_ARGS,
-    executablePath: puppeteer.executablePath() // important for Render
+    executablePath: revisionInfo.executablePath
   });
 }
 
+// Normalisation des URLs d’images
 function normalizeUrl(src, baseUrl) {
   if (!src) return null;
   src = src.trim();
@@ -53,6 +57,7 @@ function normalizeUrl(src, baseUrl) {
   return src;
 }
 
+// Fallback simple avec Axios
 async function fetchWithAxios(url) {
   const res = await axios.get(url, {
     headers: {
@@ -65,8 +70,10 @@ async function fetchWithAxios(url) {
   return res.data;
 }
 
+// Scraping via Puppeteer (chargement complet de la page)
 async function scrapeWithPuppeteer(url) {
   const browser = await launchBrowser();
+
   try {
     const page = await browser.newPage();
     await page.setUserAgent(
@@ -75,7 +82,6 @@ async function scrapeWithPuppeteer(url) {
     await page.setExtraHTTPHeaders({
       "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
     });
-
     await page.goto(url, { waitUntil: "networkidle2", timeout: 40000 });
     await page.waitForTimeout(500);
 
@@ -97,13 +103,16 @@ async function scrapeWithPuppeteer(url) {
   }
 }
 
+// Extraction des données depuis le HTML
 function extractFromHtml(html, url, jsonLdText) {
   const $ = cheerio.load(html);
+
   const title =
     $("meta[property='og:title']").attr("content") ||
     $("meta[name='twitter:title']").attr("content") ||
     $("title").text() ||
     null;
+
   const description =
     $("meta[property='og:description']").attr("content") ||
     $("meta[name='description']").attr("content") ||
@@ -135,6 +144,7 @@ function extractFromHtml(html, url, jsonLdText) {
   return { title, description, price, images };
 }
 
+// Route principale /scrape
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url)
@@ -144,11 +154,12 @@ app.get("/scrape", async (req, res) => {
 
   try {
     const { html, jsonLd } = await pRetry(() => scrapeWithPuppeteer(url), {
-      retries: MAX_RETRIES,
+      retries: MAX_RETRIES
     });
 
     const out = extractFromHtml(html, url, jsonLd);
 
+    // Fallback si aucune image
     if (!out.images || out.images.length === 0) {
       try {
         const fallbackHtml = await fetchWithAxios(url);
