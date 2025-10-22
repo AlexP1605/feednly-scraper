@@ -3,8 +3,10 @@ services:
     name: feednly-scraper
     env: node
     plan: free
-    buildCommand: "npm install"
-    startCommand: "npm start"
+    buildCommand: |
+      npm install
+      npx puppeteer browsers install chrome
+    startCommand: npm start
     envVars:
       - key: NODE_VERSION
         value: 18
