@@ -9,6 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const PROXY = process.env.SCRAPER_PROXY || null;
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
+const DISABLE_PUPPETEER = process.env.DISABLE_PUPPETEER === "true";
 
 const LAUNCH_ARGS = [
   "--no-sandbox",
@@ -21,21 +22,17 @@ const LAUNCH_ARGS = [
 ];
 if (PROXY) LAUNCH_ARGS.unshift(`--proxy-server=${PROXY}`);
 
-// ✅ Nouvelle méthode Render-friendly (compatible Puppeteer v22+)
 async function launchBrowser() {
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: LAUNCH_ARGS,
-    // Cette ligne force Puppeteer à utiliser Chromium intégré automatiquement
-    executablePath: await puppeteer
-      .launch()
-      .then(b => {
-        const path = b.process().spawnargs.find(a => a.includes("chrome"));
-        b.close();
-        return path;
-      })
-  });
-  return browser;
+  const launchOptions = {
+    headless: "new",
+    args: LAUNCH_ARGS
+  };
+
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  return puppeteer.launch(launchOptions);
 }
 
 // Normalisation des URLs d’images
@@ -75,8 +72,169 @@ async function fetchWithAxios(url) {
   return res.data;
 }
 
+function extractJsonLdScriptsFromHtml(html) {
+  const $ = cheerio.load(html);
+  return $("script[type='application/ld+json']")
+    .map((_, el) => $(el).text())
+    .get();
+}
+
+function flattenJsonLd(node, seen = new Set()) {
+  const result = [];
+  const stack = [node];
+
+  while (stack.length) {
+    const current = stack.pop();
+    if (!current || typeof current !== "object") continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+
+    if (!Array.isArray(current)) {
+      result.push(current);
+    }
+
+    const values = Array.isArray(current) ? current : Object.values(current);
+    for (const value of values) {
+      if (value && typeof value === "object") {
+        stack.push(value);
+      }
+    }
+  }
+
+  return result;
+}
+
+function parseJsonLdScripts(jsonLdScripts) {
+  const nodes = [];
+
+  for (const script of jsonLdScripts || []) {
+    if (typeof script !== "string") continue;
+    const trimmed = script.trim();
+    if (!trimmed) continue;
+
+    const tryParse = (text) => {
+      try {
+        const parsed = JSON.parse(text);
+        nodes.push(...flattenJsonLd(parsed));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    if (tryParse(trimmed)) continue;
+
+    const withoutComments = trimmed.replace(/\/\*[\s\S]*?\*\//g, "");
+    if (tryParse(withoutComments)) continue;
+
+    const withoutHtmlComments = withoutComments.replace(/<!--.*?-->/gs, "");
+    tryParse(withoutHtmlComments);
+  }
+
+  return nodes;
+}
+
+function nodeIsProduct(node) {
+  if (!node || typeof node !== "object") return false;
+  const type = node["@type"];
+  if (!type) return false;
+  if (Array.isArray(type)) {
+    return type.some(
+      (t) => typeof t === "string" && t.toLowerCase().includes("product")
+    );
+  }
+  return typeof type === "string" && type.toLowerCase().includes("product");
+}
+
+function extractPriceFromOffers(offers) {
+  if (!offers) return null;
+  const offerList = Array.isArray(offers) ? offers : [offers];
+
+  for (const offer of offerList) {
+    if (!offer || typeof offer !== "object") continue;
+    const directPrice = offer.price ?? offer.lowPrice ?? offer.highPrice;
+    const spec = offer.priceSpecification || {};
+    const specPrice =
+      spec.price ?? spec.priceAmount ?? spec.minPrice ?? spec.maxPrice ?? null;
+    const price = directPrice ?? specPrice;
+    if (price == null) continue;
+
+    const currency =
+      offer.priceCurrency ||
+      spec.priceCurrency ||
+      spec.currency ||
+      offer.currency;
+
+    const priceString = String(price).trim();
+    if (!priceString) continue;
+
+    return currency ? `${priceString} ${currency}`.trim() : priceString;
+  }
+
+  return null;
+}
+
+function extractImagesFromNode(node, baseUrl) {
+  const images = new Set();
+  const addImage = (value) => {
+    if (!value) return;
+    if (typeof value === "string") {
+      const normalized = normalizeUrl(value, baseUrl);
+      if (normalized && !normalized.startsWith("data:")) images.add(normalized);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(addImage);
+      return;
+    }
+    if (typeof value === "object") {
+      if (value.url) addImage(value.url);
+      if (value.contentUrl) addImage(value.contentUrl);
+    }
+  };
+
+  addImage(node.image);
+  addImage(node.images);
+  addImage(node.photo);
+  addImage(node.thumbnailUrl);
+
+  return Array.from(images);
+}
+
+function extractFromJsonLd(jsonLdScripts, url) {
+  const nodes = parseJsonLdScripts(jsonLdScripts);
+  const productNode = nodes.find(nodeIsProduct);
+  if (!productNode) {
+    return { title: null, description: null, price: null, images: [] };
+  }
+
+  const title = productNode.name || productNode.headline || productNode.title || null;
+  const description = productNode.description || null;
+  const price =
+    extractPriceFromOffers(productNode.offers) ||
+    (productNode.price ? String(productNode.price) : null);
+  const images = extractImagesFromNode(productNode, url);
+
+  return { title, description, price, images };
+}
+
+function mergeProductData(primary, secondary) {
+  return {
+    title: primary.title || secondary.title || null,
+    description: primary.description || secondary.description || null,
+    price: primary.price || secondary.price || null,
+    images: Array.from(
+      new Set([...(primary.images || []), ...(secondary.images || [])])
+    )
+  };
+}
+
 // Scraping via Puppeteer
 async function scrapeWithPuppeteer(url) {
+  if (DISABLE_PUPPETEER) {
+    throw new Error("Puppeteer usage disabled by DISABLE_PUPPETEER env var");
+  }
+
   const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
@@ -93,7 +251,7 @@ async function scrapeWithPuppeteer(url) {
     const html = await page.content();
     const jsonLd = await page.$$eval(
       'script[type="application/ld+json"]',
-      (scripts) => scripts.map((s) => s.innerText).join("\n")
+      (scripts) => scripts.map((s) => s.innerText)
     );
 
     await page.close();
@@ -109,20 +267,31 @@ async function scrapeWithPuppeteer(url) {
 }
 
 // Extraction des données
-function extractFromHtml(html, url, jsonLdText) {
+function extractFromHtml(html, url, jsonLdScripts = null) {
   const $ = cheerio.load(html);
+  const scripts =
+    jsonLdScripts && Array.isArray(jsonLdScripts) && jsonLdScripts.length
+      ? jsonLdScripts
+      : $("script[type='application/ld+json']")
+          .map((_, el) => $(el).text())
+          .get();
+
+  const jsonLdData = extractFromJsonLd(scripts, url);
   const title =
+    jsonLdData.title ||
     $("meta[property='og:title']").attr("content") ||
     $("meta[name='twitter:title']").attr("content") ||
     $("title").text() ||
     null;
   const description =
+    jsonLdData.description ||
     $("meta[property='og:description']").attr("content") ||
     $("meta[name='description']").attr("content") ||
     $("meta[name='twitter:description']").attr("content") ||
     null;
 
   let price =
+    jsonLdData.price ||
     $("meta[property='product:price:amount']").attr("content") ||
     $("meta[name='price']").attr("content") ||
     $('[itemprop="price"]').attr("content") ||
@@ -130,7 +299,12 @@ function extractFromHtml(html, url, jsonLdText) {
     $('[data-price]').attr("data-price") ||
     null;
 
+  price = price ? String(price).trim() : null;
+
   const imgs = new Set();
+  for (const img of jsonLdData.images || []) {
+    if (img && !img.startsWith("data:")) imgs.add(img);
+  }
   $("img").each((i, el) => {
     const src =
       $(el).attr("src") ||
@@ -156,21 +330,39 @@ app.get("/scrape", async (req, res) => {
       .json({ error: "Missing URL query param (example: /scrape?url=https://...)" });
 
   try {
-    const { html, jsonLd } = await pRetry(() => scrapeWithPuppeteer(url), {
-      retries: MAX_RETRIES
-    });
+    let html = null;
+    let jsonLdScripts = null;
+    let usedPuppeteer = false;
 
-    const out = extractFromHtml(html, url, jsonLd);
+    if (!DISABLE_PUPPETEER) {
+      try {
+        const result = await pRetry(() => scrapeWithPuppeteer(url), {
+          retries: MAX_RETRIES
+        });
+        html = result.html;
+        jsonLdScripts = result.jsonLd;
+        usedPuppeteer = true;
+      } catch (err) {
+        console.warn("Puppeteer scrape failed, falling back to Axios:", err.message);
+      }
+    }
 
-    if (!out.images || out.images.length === 0) {
+    if (!html) {
+      html = await fetchWithAxios(url);
+      jsonLdScripts = extractJsonLdScriptsFromHtml(html);
+    }
+
+    let out = extractFromHtml(html, url, jsonLdScripts);
+
+    if (usedPuppeteer && (!out.images?.length || !out.title || !out.description || !out.price)) {
       try {
         const fallbackHtml = await fetchWithAxios(url);
-        const fallback = extractFromHtml(fallbackHtml, url, null);
-        out.images = Array.from(new Set([...(out.images || []), ...(fallback.images || [])]));
-        out.title = out.title || fallback.title;
-        out.description = out.description || fallback.description;
-        out.price = out.price || fallback.price;
-      } catch {}
+        const fallbackScripts = extractJsonLdScriptsFromHtml(fallbackHtml);
+        const fallback = extractFromHtml(fallbackHtml, url, fallbackScripts);
+        out = mergeProductData(out, fallback);
+      } catch (fallbackErr) {
+        console.warn("Axios fallback enrichment failed:", fallbackErr.message);
+      }
     }
 
     res.json({ ok: true, ...out });
