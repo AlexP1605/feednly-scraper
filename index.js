@@ -7,71 +7,65 @@ import { constants as fsConstants } from "node:fs";
 
 const app = express();
 
-// Gestion des erreurs globales
+// --- Gestion globale des erreurs ---
 process.on("uncaughtException", (err) => {
-  console.error("Uncaught exception:", err);
+  console.error("❌ Uncaught exception:", err);
 });
 process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled rejection:", reason);
+  console.error("⚠️ Unhandled rejection:", reason);
 });
 
-// Vérification du port Cloud Run
+// --- Vérification du PORT (Cloud Run) ---
 const portValue = process.env.PORT;
 let PORT = Number.parseInt(`${portValue ?? ""}`.trim(), 10);
 if (!Number.isFinite(PORT) || PORT <= 0) {
-  console.warn(
-    `Invalid PORT environment variable value "${portValue}". Falling back to 8080.`
-  );
+  console.warn(`Invalid PORT "${portValue}", fallback to 8080.`);
   PORT = 8080;
 }
 
-// Variables globales
+// --- Variables globales ---
 const PROXY = process.env.SCRAPER_PROXY || null;
 let MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
-if (!Number.isFinite(MAX_RETRIES) || MAX_RETRIES < 0) {
-  console.warn(
-    `Invalid MAX_RETRIES value "${process.env.MAX_RETRIES}". Falling back to 2.`
-  );
-  MAX_RETRIES = 2;
-}
+if (!Number.isFinite(MAX_RETRIES) || MAX_RETRIES < 0) MAX_RETRIES = 2;
 const DISABLE_PUPPETEER = process.env.DISABLE_PUPPETEER === "true";
-const CHROMIUM_OVERRIDE = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
+const CHROMIUM_OVERRIDE =
+  process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 
 let puppeteerModulePromise = null;
 let chromiumProbePromise = null;
 
+// --- Chargement lazy de Puppeteer ---
 async function loadPuppeteer() {
   if (!puppeteerModulePromise) {
     puppeteerModulePromise = import("puppeteer")
       .then((mod) => mod?.default ?? mod)
       .catch((err) => {
         puppeteerModulePromise = null;
-        console.error("Failed to load Puppeteer module:", err);
+        console.error("❌ Failed to load Puppeteer module:", err);
         throw err;
       });
   }
   return puppeteerModulePromise;
 }
 
+// --- Vérification de l'exécutable Chromium ---
 async function resolveChromiumExecutable() {
   if (!CHROMIUM_OVERRIDE) return null;
-
   if (!chromiumProbePromise) {
     chromiumProbePromise = access(CHROMIUM_OVERRIDE, fsConstants.X_OK)
       .then(() => CHROMIUM_OVERRIDE)
       .catch((err) => {
         console.error(
-          `Chromium executable declared at ${CHROMIUM_OVERRIDE} is not accessible; falling back to Puppeteer's bundled binary if available.`,
+          `⚠️ Chromium not accessible at ${CHROMIUM_OVERRIDE}, falling back.`,
           err
         );
         return null;
       });
   }
-
   return chromiumProbePromise;
 }
 
-// Arguments Puppeteer
+// --- Arguments Puppeteer ---
 const LAUNCH_ARGS = [
   "--no-sandbox",
   "--disable-setuid-sandbox",
@@ -79,10 +73,11 @@ const LAUNCH_ARGS = [
   "--disable-accelerated-2d-canvas",
   "--disable-gpu",
   "--no-zygote",
-  "--single-process"
+  "--single-process",
 ];
 if (PROXY) LAUNCH_ARGS.unshift(`--proxy-server=${PROXY}`);
 
+// --- Lancement du navigateur ---
 async function launchBrowser() {
   const puppeteer = await loadPuppeteer();
   const launchOptions = { headless: "new", args: LAUNCH_ARGS };
@@ -91,7 +86,7 @@ async function launchBrowser() {
   return puppeteer.launch(launchOptions);
 }
 
-// Normalisation des URLs d’images
+// --- Normalisation des URLs d’images ---
 function normalizeUrl(src, baseUrl) {
   if (!src) return null;
   src = src.trim();
@@ -115,19 +110,20 @@ function normalizeUrl(src, baseUrl) {
   return src;
 }
 
-// Fallback simple avec Axios
+// --- Scraping via Axios fallback ---
 async function fetchWithAxios(url) {
   const res = await axios.get(url, {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
-      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
+      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
     },
-    timeout: 20000
+    timeout: 20000,
   });
   return res.data;
 }
 
+// --- Extraction JSON-LD ---
 function extractJsonLdScriptsFromHtml(html) {
   const $ = cheerio.load(html);
   return $("script[type='application/ld+json']")
@@ -135,7 +131,7 @@ function extractJsonLdScriptsFromHtml(html) {
     .get();
 }
 
-// Parsing JSON-LD (produits)
+// --- Flatten JSON-LD ---
 function flattenJsonLd(node, seen = new Set()) {
   const result = [];
   const stack = [node];
@@ -146,40 +142,31 @@ function flattenJsonLd(node, seen = new Set()) {
     seen.add(current);
     if (!Array.isArray(current)) result.push(current);
     const values = Array.isArray(current) ? current : Object.values(current);
-    for (const value of values) if (value && typeof value === "object") stack.push(value);
+    for (const value of values)
+      if (value && typeof value === "object") stack.push(value);
   }
   return result;
 }
 
+// --- Parse JSON-LD scripts ---
 function parseJsonLdScripts(jsonLdScripts) {
   const nodes = [];
   for (const script of jsonLdScripts || []) {
     if (typeof script !== "string") continue;
     const trimmed = script.trim();
     if (!trimmed) continue;
-    const tryParse = (text) => {
-      try {
-        const parsed = JSON.parse(text);
-        nodes.push(...flattenJsonLd(parsed));
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    if (tryParse(trimmed)) continue;
-    const withoutComments = trimmed.replace(/\/\*[\s\S]*?\*\//g, "");
-    if (tryParse(withoutComments)) continue;
-    const withoutHtmlComments = withoutComments.replace(/<!--.*?-->/gs, "");
-    tryParse(withoutHtmlComments);
+    try {
+      const parsed = JSON.parse(trimmed);
+      nodes.push(...flattenJsonLd(parsed));
+    } catch {}
   }
   return nodes;
 }
 
-// Fonction principale de scraping
+// --- Scraping avec Puppeteer ---
 async function scrapeWithPuppeteer(url) {
-  if (DISABLE_PUPPETEER) {
-    throw new Error("Puppeteer usage disabled by DISABLE_PUPPETEER env var");
-  }
+  if (DISABLE_PUPPETEER)
+    throw new Error("Puppeteer disabled by env var DISABLE_PUPPETEER");
   const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
@@ -192,7 +179,6 @@ async function scrapeWithPuppeteer(url) {
       'script[type="application/ld+json"]',
       (scripts) => scripts.map((s) => s.innerText)
     );
-    await page.close();
     await browser.close();
     return { html, jsonLd };
   } catch (err) {
@@ -203,10 +189,9 @@ async function scrapeWithPuppeteer(url) {
   }
 }
 
-// Extraction HTML
+// --- Extraction depuis HTML ---
 function extractFromHtml(html, url, jsonLdScripts = null) {
   const $ = cheerio.load(html);
-  const jsonLdData = parseJsonLdScripts(jsonLdScripts || []);
   const title =
     $("meta[property='og:title']").attr("content") ||
     $("title").text() ||
@@ -228,22 +213,28 @@ function extractFromHtml(html, url, jsonLdScripts = null) {
   return { title, description, price, images };
 }
 
-// Routes Express
+// --- Routes principales ---
 app.get("/", (req, res) => {
   res.json({ ok: true, status: "feednly-scraper", uptime: process.uptime() });
 });
 
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
-  if (!url) return res.status(400).json({ error: "Missing URL parameter" });
+  if (!url)
+    return res
+      .status(400)
+      .json({ error: "Missing URL query param (?url=https://...)" });
+
   try {
     let html, jsonLdScripts;
     try {
-      const result = await pRetry(() => scrapeWithPuppeteer(url), { retries: MAX_RETRIES });
+      const result = await pRetry(() => scrapeWithPuppeteer(url), {
+        retries: MAX_RETRIES,
+      });
       html = result.html;
       jsonLdScripts = result.jsonLd;
     } catch (err) {
-      console.warn("Puppeteer scrape failed, fallback to Axios:", err.message);
+      console.warn("⚠️ Puppeteer failed, fallback to Axios:", err.message);
       html = await fetchWithAxios(url);
       jsonLdScripts = extractJsonLdScriptsFromHtml(html);
     }
@@ -255,12 +246,26 @@ app.get("/scrape", async (req, res) => {
   }
 });
 
-// Démarrage serveur
-const server = app.listen(PORT, "0.0.0.0", () =>
-  console.log(`✅ Feednly Scraper running on port ${PORT}`)
-);
+// --- Démarrage serveur ---
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Feednly Scraper running on port ${PORT}`);
+  console.log("ℹ️ Waiting for incoming requests...");
+});
 
 server.on("error", (err) => {
-  console.error("HTTP server failed to start:", err);
-  process.exitCode = 1;
+  console.error("❌ HTTP server failed to start:", err);
+  process.exit(1);
 });
+
+// --- Préchargement asynchrone de Puppeteer ---
+setTimeout(async () => {
+  try {
+    console.log("⏳ Preloading Puppeteer...");
+    const puppeteer = await import("puppeteer");
+    const browser = await puppeteer.launch({ args: ["--no-sandbox"] });
+    await browser.close();
+    console.log("✅ Puppeteer preloaded successfully!");
+  } catch (err) {
+    console.warn("⚠️ Puppeteer preload failed:", err.message);
+  }
+}, 1000);
