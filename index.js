@@ -6,7 +6,13 @@ import pRetry from "p-retry";
 
 const app = express();
 
-const PORT = process.env.PORT || 3000;
+const portValue = process.env.PORT ?? "8080";
+const PORT = Number.parseInt(portValue, 10);
+if (Number.isNaN(PORT)) {
+  throw new Error(
+    `Invalid PORT environment variable value "${portValue}". Expected a number.`
+  );
+}
 const PROXY = process.env.SCRAPER_PROXY || null;
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
 const DISABLE_PUPPETEER = process.env.DISABLE_PUPPETEER === "true";
@@ -322,6 +328,10 @@ function extractFromHtml(html, url, jsonLdScripts = null) {
 }
 
 // Route principale /scrape
+app.get("/", (req, res) => {
+  res.json({ ok: true, status: "feednly-scraper", uptime: process.uptime() });
+});
+
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url)
@@ -374,4 +384,6 @@ app.get("/scrape", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Feednly Scraper running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`✅ Feednly Scraper running on port ${PORT}`)
+);
