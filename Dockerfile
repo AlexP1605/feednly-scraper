@@ -14,17 +14,19 @@ RUN apt-get update && apt-get install -y \
 # Créer le dossier de travail
 WORKDIR /app
 
-# Copier les fichiers de config et installer les dépendances
+# Copier les fichiers de config et installer les dépendances en mode production
 COPY package*.json ./
-RUN npm install
+RUN npm install --omit=dev
 
 # Copier le reste du code
 COPY . .
 
 # Variables d'environnement
-ENV PORT=8080
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV NODE_ENV=production
+ENV PORT=8080 \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    NODE_ENV=production
+
+EXPOSE 8080
 
 # Lancer ton serveur Express
 CMD ["node", "index.js"]
