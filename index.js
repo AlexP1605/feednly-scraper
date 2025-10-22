@@ -6,7 +6,6 @@ import pRetry from "p-retry";
 
 const app = express();
 
-// Configuration
 const PORT = process.env.PORT || 3000;
 const PROXY = process.env.SCRAPER_PROXY || null;
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
@@ -22,15 +21,21 @@ const LAUNCH_ARGS = [
 ];
 if (PROXY) LAUNCH_ARGS.unshift(`--proxy-server=${PROXY}`);
 
-// ✅ Lance Chromium intégré (compatible Render)
+// ✅ Nouvelle méthode Render-friendly (compatible Puppeteer v22+)
 async function launchBrowser() {
-  const browserFetcher = puppeteer.createBrowserFetcher();
-  const revisionInfo = await browserFetcher.download('1095492'); // Version stable de Chromium
-  return await puppeteer.launch({
+  const browser = await puppeteer.launch({
     headless: true,
     args: LAUNCH_ARGS,
-    executablePath: revisionInfo.executablePath
+    // Cette ligne force Puppeteer à utiliser Chromium intégré automatiquement
+    executablePath: await puppeteer
+      .launch()
+      .then(b => {
+        const path = b.process().spawnargs.find(a => a.includes("chrome"));
+        b.close();
+        return path;
+      })
   });
+  return browser;
 }
 
 // Normalisation des URLs d’images
@@ -70,10 +75,9 @@ async function fetchWithAxios(url) {
   return res.data;
 }
 
-// Scraping via Puppeteer (chargement complet de la page)
+// Scraping via Puppeteer
 async function scrapeWithPuppeteer(url) {
   const browser = await launchBrowser();
-
   try {
     const page = await browser.newPage();
     await page.setUserAgent(
@@ -82,6 +86,7 @@ async function scrapeWithPuppeteer(url) {
     await page.setExtraHTTPHeaders({
       "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
     });
+
     await page.goto(url, { waitUntil: "networkidle2", timeout: 40000 });
     await page.waitForTimeout(500);
 
@@ -103,16 +108,14 @@ async function scrapeWithPuppeteer(url) {
   }
 }
 
-// Extraction des données depuis le HTML
+// Extraction des données
 function extractFromHtml(html, url, jsonLdText) {
   const $ = cheerio.load(html);
-
   const title =
     $("meta[property='og:title']").attr("content") ||
     $("meta[name='twitter:title']").attr("content") ||
     $("title").text() ||
     null;
-
   const description =
     $("meta[property='og:description']").attr("content") ||
     $("meta[name='description']").attr("content") ||
@@ -159,7 +162,6 @@ app.get("/scrape", async (req, res) => {
 
     const out = extractFromHtml(html, url, jsonLd);
 
-    // Fallback si aucune image
     if (!out.images || out.images.length === 0) {
       try {
         const fallbackHtml = await fetchWithAxios(url);
