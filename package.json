@@ -1,7 +1,7 @@
 {
   "name": "feednly-scraper",
   "version": "1.0.0",
-  "description": "Scraper API for Feednly",
+  "description": "Feednly scraper - title, description, price, multiple images",
   "main": "index.js",
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "axios": "^1.6.7",
     "cheerio": "^1.0.0-rc.12",
     "express": "^4.19.2",
-    "puppeteer": "^22.4.1"
+    "puppeteer": "^22.4.1",
+    "p-retry": "^4.6.2"
   }
 }
