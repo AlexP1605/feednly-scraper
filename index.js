@@ -1,15 +1,74 @@
 import express from "express";
-import puppeteer from "puppeteer";
 import * as cheerio from "cheerio";
 import axios from "axios";
 import pRetry from "p-retry";
+import { access } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 
 const app = express();
 
-const PORT = process.env.PORT || 3000;
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+});
+
+const portValue = process.env.PORT;
+let PORT = Number.parseInt(`${portValue ?? ""}`.trim(), 10);
+if (!Number.isFinite(PORT) || PORT <= 0) {
+  console.warn(
+    `Invalid PORT environment variable value "${portValue}". Falling back to 8080.`
+  );
+  PORT = 8080;
+}
 const PROXY = process.env.SCRAPER_PROXY || null;
-const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
+let MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
+if (!Number.isFinite(MAX_RETRIES) || MAX_RETRIES < 0) {
+  console.warn(
+    `Invalid MAX_RETRIES value "${process.env.MAX_RETRIES}". Falling back to 2.`
+  );
+  MAX_RETRIES = 2;
+}
 const DISABLE_PUPPETEER = process.env.DISABLE_PUPPETEER === "true";
+const CHROMIUM_OVERRIDE = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
+
+let puppeteerModulePromise = null;
+let chromiumProbePromise = null;
+
+async function loadPuppeteer() {
+  if (!puppeteerModulePromise) {
+    puppeteerModulePromise = import("puppeteer")
+      .then((mod) => mod?.default ?? mod)
+      .catch((err) => {
+        puppeteerModulePromise = null;
+        console.error("Failed to load Puppeteer module:", err);
+        throw err;
+      });
+  }
+  return puppeteerModulePromise;
+}
+
+async function resolveChromiumExecutable() {
+  if (!CHROMIUM_OVERRIDE) {
+    return null;
+  }
+
+  if (!chromiumProbePromise) {
+    chromiumProbePromise = access(CHROMIUM_OVERRIDE, fsConstants.X_OK)
+      .then(() => CHROMIUM_OVERRIDE)
+      .catch((err) => {
+        console.error(
+          `Chromium executable declared at ${CHROMIUM_OVERRIDE} is not accessible; falling back to Puppeteer's bundled binary if available.`,
+          err
+        );
+        return null;
+      });
+  }
+
+  return chromiumProbePromise;
+}
 
 const LAUNCH_ARGS = [
   "--no-sandbox",
@@ -23,13 +82,15 @@ const LAUNCH_ARGS = [
 if (PROXY) LAUNCH_ARGS.unshift(`--proxy-server=${PROXY}`);
 
 async function launchBrowser() {
+  const puppeteer = await loadPuppeteer();
   const launchOptions = {
     headless: "new",
     args: LAUNCH_ARGS
   };
 
-  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  const executablePath = await resolveChromiumExecutable();
+  if (executablePath) {
+    launchOptions.executablePath = executablePath;
   }
 
   return puppeteer.launch(launchOptions);
@@ -322,6 +383,10 @@ function extractFromHtml(html, url, jsonLdScripts = null) {
 }
 
 // Route principale /scrape
+app.get("/", (req, res) => {
+  res.json({ ok: true, status: "feednly-scraper", uptime: process.uptime() });
+});
+
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url)
@@ -374,4 +439,11 @@ app.get("/scrape", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Feednly Scraper running on port ${PORT}`));
+const server = app.listen(PORT, "0.0.0.0", () =>
+  console.log(`✅ Feednly Scraper running on port ${PORT}`)
+);
+
+server.on("error", (err) => {
+  console.error("HTTP server failed to start:", err);
+  process.exitCode = 1;
+});

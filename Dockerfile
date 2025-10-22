@@ -9,22 +9,26 @@ RUN apt-get update && apt-get install -y \
   libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 \
   libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 \
   libxrandr2 libxrender1 libxss1 libxtst6 lsb-release fonts-noto-color-emoji \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/* && \
+  chromium --version
+
+# Empêcher Puppeteer de télécharger son propre Chromium et définir le binaire système
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    NODE_ENV=production \
+    PORT=8080
 
 # Créer le dossier de travail
 WORKDIR /app
 
-# Copier les fichiers de config et installer les dépendances
+# Copier les fichiers de config et installer les dépendances en mode production
 COPY package*.json ./
-RUN npm install
+RUN npm install --omit=dev
 
 # Copier le reste du code
 COPY . .
 
-# Variables d'environnement
-ENV PORT=8080
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV NODE_ENV=production
+EXPOSE 8080
 
 # Lancer ton serveur Express
 CMD ["node", "index.js"]
