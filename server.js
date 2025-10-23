@@ -43,6 +43,11 @@ const NAVIGATION_TIMEOUT = Math.max(
 );
 const WAIT_JITTER_RATIO = 0.2;
 
+const sleep = (ms) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number.isFinite(ms) ? ms : 0));
+  });
+
 const RAW_PROXY_POOL = (process.env.SCRAPER_PROXY_POOL || "")
   .split(",")
   .map((entry) => entry.trim())
@@ -1189,7 +1194,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       await page.authenticate(proxyConfig.credentials);
     }
 
-    await page.waitForTimeout(50 + Math.floor(Math.random() * 200));
+    await sleep(50 + Math.floor(Math.random() * 200));
 
     debugLog("🌐 Navigating with Puppeteer", {
       url,
@@ -1217,7 +1222,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
     }
 
     if (effectiveWaitAfterLoad) {
-      await page.waitForTimeout(effectiveWaitAfterLoad);
+      await sleep(effectiveWaitAfterLoad);
     }
 
     const html = await page.content();
