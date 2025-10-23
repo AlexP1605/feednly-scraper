@@ -162,8 +162,42 @@ async function scrapeWithPuppeteer(url) {
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
     );
+    await page.setViewport({ width: 1280, height: 720, deviceScaleFactor: 1 });
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+      "Sec-Ch-Ua": '"Chromium";v="123", "Not:A-Brand";v="8"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"Windows"',
+      "Upgrade-Insecure-Requests": "1",
+    });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 60000 });
+    await page.waitForTimeout(750);
+
+    const consentSelectors = [
+      "#didomi-notice-agree-button",
+      "button[id*='didomi'][id*='agree']",
+      "button[class*='didomi'][class*='agree']",
+      "#onetrust-accept-btn-handler",
+      "button[id*='onetrust'][id*='accept']",
+      "button[data-testid='accept-all']",
+    ];
+    for (const selector of consentSelectors) {
+      try {
+        const handle = await page.$(selector);
+        if (handle) {
+          await handle.click().catch(() => {});
+          await page.waitForTimeout(500);
+          break;
+        }
+      } catch {}
+    }
+
+    await page.waitForTimeout(500);
 
     const html = await page.content();
     const jsonLd = await page.$$eval(
@@ -183,6 +217,18 @@ async function scrapeWithPuppeteer(url) {
   }
 }
 
+function normalizePrice(raw) {
+  if (!raw) return null;
+  if (typeof raw !== "string") raw = `${raw}`;
+  const cleaned = raw
+    .replace(/[^0-9,\.]/g, "")
+    .replace(/,(?=\d{3}(?:\D|$))/g, "")
+    .replace(/\.(?=\d{3}(?:\D|$))/g, "")
+    .replace(",", ".");
+  if (!cleaned || !/[0-9]/.test(cleaned)) return null;
+  return cleaned;
+}
+
 function extractFromHtml(html, url, jsonLdScripts = null) {
   const $ = cheerio.load(html);
   let title =
@@ -194,8 +240,9 @@ function extractFromHtml(html, url, jsonLdScripts = null) {
     $("meta[name='description']").attr("content") ||
     null;
   let price =
-    $("meta[property='product:price:amount']").attr("content") ||
-    $('[itemprop="price"]').attr("content") ||
+    normalizePrice($("meta[property='product:price:amount']").attr("content")) ||
+    normalizePrice($("[itemprop='price']").attr("content")) ||
+    normalizePrice($("[data-price-amount]").attr("data-price-amount")) ||
     null;
 
   if (title)
@@ -205,14 +252,56 @@ function extractFromHtml(html, url, jsonLdScripts = null) {
   if (!price && jsonLdScripts?.length) {
     const nodes = parseJsonLdScripts(jsonLdScripts);
     const offer = nodes.find((n) => n["@type"] === "Offer" && n.price);
-    if (offer?.price) price = offer.price;
+    if (offer?.price) price = normalizePrice(offer.price);
+    if (!price) {
+      const product = nodes.find((n) => n["@type"] === "Product" && n.offers?.price);
+      if (product?.offers?.price) price = normalizePrice(product.offers.price);
+    }
+  }
+
+  if (!price) {
+    const fnacPrice = normalizePrice(
+      $(".f-priceBox__price, [class*='price']").first().text()
+    );
+    if (fnacPrice) price = fnacPrice;
+  }
+
+  if (!price) {
+    const priceFromJsonScript = $("script[type='application/json']")
+      .map((_, el) => {
+        try {
+          return JSON.parse($(el).text());
+        } catch {
+          return null;
+        }
+      })
+      .get()
+      .map((obj) => {
+        if (!obj || typeof obj !== "object") return null;
+        if (obj.offers?.price) return normalizePrice(obj.offers.price);
+        if (obj.product?.offers?.price)
+          return normalizePrice(obj.product.offers.price);
+        return null;
+      })
+      .find((value) => !!value);
+    if (priceFromJsonScript) price = priceFromJsonScript;
   }
 
   const images = [];
+  const seenImages = new Set();
   $("img").each((i, el) => {
-    const src = $(el).attr("src");
+    const src =
+      $(el).attr("src") ||
+      $(el).attr("data-src") ||
+      ($(el).attr("data-srcset") || "").split(" ")[0] ||
+      null;
     const normalized = normalizeUrl(src, url);
-    if (normalized && !normalized.includes("data:image/svg+xml")) {
+    if (
+      normalized &&
+      !normalized.includes("data:image/svg+xml") &&
+      !seenImages.has(normalized)
+    ) {
+      seenImages.add(normalized);
       images.push(normalized);
     }
   });
