@@ -207,11 +207,11 @@ function flattenJsonLd(node, seen = new Set()) {
   return result;
 }
 
-function parseJsonLdScripts(jsonLdScripts) {␊
-  const nodes = [];␊
-  for (const script of jsonLdScripts || []) {␊
-    if (typeof script !== "string") continue;␊
-    const trimmed = script.trim();␊
+function parseJsonLdScripts(jsonLdScripts) {
+  const nodes = [];
+  for (const script of jsonLdScripts || []) {
+    if (typeof script !== "string") continue;
+    const trimmed = script.trim();
     if (!trimmed) continue;
     try {
       const parsed = JSON.parse(trimmed);
