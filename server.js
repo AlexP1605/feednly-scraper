@@ -3,9 +3,12 @@ import * as cheerio from "cheerio";
 import axios from "axios";
 import pRetry from "p-retry";
 import NodeCache from "node-cache";
+import { wrapper as applyAxiosCookieJarSupport } from "axios-cookiejar-support";
+import { CookieJar, Cookie } from "tough-cookie";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { HttpProxyAgent } from "http-proxy-agent";
 import { access } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
-import { Buffer } from "node:buffer";
 
 const app = express();
 app.set("etag", false);
@@ -19,6 +22,42 @@ function debugLog(...args) {
   if (DEBUG) {
     console.log("🪲", ...args);
   }
+}
+
+function logEvent(event, data = {}) {
+  try {
+    console.log(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event,
+        ...data,
+      })
+    );
+  } catch (err) {
+    console.log(event, data);
+  }
+}
+
+const axiosClient = applyAxiosCookieJarSupport(axios.create());
+axiosClient.defaults.withCredentials = true;
+
+const cookieJars = new Map();
+
+function getCookieJarKey(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname;
+  } catch {
+    return "default";
+  }
+}
+
+function getCookieJarForUrl(url) {
+  const key = getCookieJarKey(url);
+  if (!cookieJars.has(key)) {
+    cookieJars.set(key, new CookieJar());
+  }
+  return cookieJars.get(key);
 }
 
 const portValue = process.env.PORT;
@@ -49,10 +88,20 @@ const sleep = (ms) =>
   });
 
 const RAW_PROXY_POOL = (process.env.SCRAPER_PROXY_POOL || "")
-  .split(",")
+  .split(/[\s,]+/)
   .map((entry) => entry.trim())
   .filter(Boolean);
-const FALLBACK_PROXY = process.env.SCRAPER_PROXY || null;
+const FALLBACK_PROXY =
+  process.env.SCRAPER_PROXY_FALLBACK || process.env.SCRAPER_PROXY || null;
+const PROXY_FAILURE_COOLDOWN_MS = Math.max(
+  30_000,
+  Number.parseInt(process.env.SCRAPER_PROXY_FAILURE_COOLDOWN_MS || "120000", 10) ||
+    120_000
+);
+const PROXY_MAX_FAILURES = Math.max(
+  1,
+  Number.parseInt(process.env.SCRAPER_PROXY_MAX_FAILURES || "3", 10) || 3
+);
 
 const CACHE_TTL = Math.max(
   30,
@@ -287,23 +336,15 @@ async function resolveChromiumExecutable() {
   return undefined;
 }
 
-function normalizeProxyConfig(rawProxy) {
-  if (!rawProxy) {
-    return {
-      key: "default",
-      launchArg: null,
-      credentials: null,
-      original: null,
-      protocol: null,
-      hostname: null,
-      port: null,
-    };
+function normalizeProxyConfig(rawProxy, source = "pool") {
+  if (!rawProxy) return null;
+  let value = `${rawProxy}`.trim();
+  if (!value) return null;
+  if (!/^https?:\/\//i.test(value)) {
+    value = `http://${value}`;
   }
   try {
-    const parsed = new URL(rawProxy);
-    const launchArg = `${parsed.protocol}//${parsed.hostname}${
-      parsed.port ? `:${parsed.port}` : ""
-    }`;
+    const parsed = new URL(value);
     const credentials =
       parsed.username || parsed.password
         ? {
@@ -311,36 +352,250 @@ function normalizeProxyConfig(rawProxy) {
             password: decodeURIComponent(parsed.password),
           }
         : null;
+    const launchArg = `${parsed.protocol}//${parsed.hostname}${
+      parsed.port ? `:${parsed.port}` : ""
+    }`;
+    const proxyUrl = credentials
+      ? `${parsed.protocol}//${encodeURIComponent(
+          credentials.username
+        )}:${encodeURIComponent(credentials.password)}@${parsed.hostname}${
+          parsed.port ? `:${parsed.port}` : ""
+        }`
+      : `${parsed.protocol}//${parsed.hostname}${
+          parsed.port ? `:${parsed.port}` : ""
+        }`;
     return {
-      key: `${parsed.protocol}//${parsed.hostname}:${parsed.port || ""}@$${
-        credentials?.username || ""
-      }:${credentials?.password || ""}`.replace(/:+$/, ""),
+      key: `${parsed.protocol}//${parsed.hostname}:${parsed.port || ""}`.replace(
+        /:+$/,
+        ""
+      ),
       launchArg,
+      proxyUrl,
       credentials,
       original: rawProxy,
       protocol: parsed.protocol.replace(":", ""),
       hostname: parsed.hostname,
       port: parsed.port ? Number.parseInt(parsed.port, 10) : null,
+      source,
     };
-  } catch {
+  } catch (err) {
+    console.warn("⚠️ Invalid proxy entry skipped:", rawProxy, err.message);
+    return null;
+  }
+}
+
+class ProxyManager {
+  constructor(poolEntries, fallbackEntry) {
+    this.pool = poolEntries
+      .map((entry) => normalizeProxyConfig(entry, "pool"))
+      .filter(Boolean);
+    this.fallback = fallbackEntry
+      ? [normalizeProxyConfig(fallbackEntry, "fallback")].filter(Boolean)
+      : [];
+    this.blacklist = new Map();
+    this.stats = new Map();
+  }
+
+  _isBlacklisted(key) {
+    const now = Date.now();
+    const info = this.blacklist.get(key);
+    if (!info) return false;
+    if (info.until && info.until > now) return true;
+    this.blacklist.delete(key);
+    return false;
+  }
+
+  _touchStats(proxy) {
+    if (!proxy) return;
+    const stats = this.stats.get(proxy.key) || {
+      successes: 0,
+      failures: 0,
+      lastFailure: null,
+      lastSuccess: null,
+      lastUsed: null,
+    };
+    stats.lastUsed = Date.now();
+    this.stats.set(proxy.key, stats);
+  }
+
+  getProxy(options = {}) {
+    const { requireResidential = false, excludeKeys = new Set(), allowFallback = true } =
+      options;
+    const availablePool = this.pool.filter(
+      (proxy) => proxy && !excludeKeys.has(proxy.key) && !this._isBlacklisted(proxy.key)
+    );
+    if (availablePool.length) {
+      const choice = availablePool[Math.floor(Math.random() * availablePool.length)];
+      this._touchStats(choice);
+      return choice;
+    }
+    if (!allowFallback && requireResidential) {
+      return null;
+    }
+    const availableFallback = this.fallback.filter(
+      (proxy) => proxy && !excludeKeys.has(proxy.key) && !this._isBlacklisted(proxy.key)
+    );
+    if (availableFallback.length && (!requireResidential || allowFallback)) {
+      const choice =
+        availableFallback[Math.floor(Math.random() * availableFallback.length)];
+      this._touchStats(choice);
+      return choice;
+    }
+    return null;
+  }
+
+  hasResidentialProxy() {
+    return this.pool.length > 0 || this.fallback.length > 0;
+  }
+
+  reportSuccess(proxy) {
+    if (!proxy) return;
+    const stats = this.stats.get(proxy.key) || {
+      successes: 0,
+      failures: 0,
+      lastFailure: null,
+      lastSuccess: null,
+      lastUsed: null,
+    };
+    stats.successes += 1;
+    stats.lastSuccess = Date.now();
+    stats.failures = Math.max(0, stats.failures - 1);
+    this.stats.set(proxy.key, stats);
+    this.blacklist.delete(proxy.key);
+  }
+
+  reportFailure(proxy, reason) {
+    if (!proxy) return;
+    const stats = this.stats.get(proxy.key) || {
+      successes: 0,
+      failures: 0,
+      lastFailure: null,
+      lastSuccess: null,
+      lastUsed: null,
+    };
+    stats.failures += 1;
+    stats.lastFailure = Date.now();
+    this.stats.set(proxy.key, stats);
+    if (stats.failures >= PROXY_MAX_FAILURES || reason === "hard-fail") {
+      this.blacklist.set(proxy.key, {
+        until: Date.now() + PROXY_FAILURE_COOLDOWN_MS,
+        reason,
+      });
+    }
+  }
+
+  getDiagnostics() {
+    const now = Date.now();
+    const entries = [...this.pool, ...this.fallback].map((proxy) => {
+      const stats = this.stats.get(proxy.key) || {};
+      const blacklistInfo = this.blacklist.get(proxy.key) || null;
+      return {
+        proxy: proxy.original,
+        source: proxy.source,
+        lastUsed: stats.lastUsed || null,
+        successes: stats.successes || 0,
+        failures: stats.failures || 0,
+        blacklistedUntil:
+          blacklistInfo && blacklistInfo.until > now ? blacklistInfo.until : null,
+        lastFailureReason: blacklistInfo?.reason || null,
+      };
+    });
     return {
-      key: rawProxy,
-      launchArg: rawProxy,
-      credentials: null,
-      original: rawProxy,
-      protocol: null,
-      hostname: null,
-      port: null,
+      total: entries.length,
+      residentialPool: this.pool.length,
+      fallbackPool: this.fallback.length,
+      blacklisted: entries.filter((entry) => entry.blacklistedUntil).length,
+      entries,
     };
   }
 }
 
-function pickProxyConfig() {
-  if (RAW_PROXY_POOL.length) {
-    const raw = RAW_PROXY_POOL[Math.floor(Math.random() * RAW_PROXY_POOL.length)];
-    return normalizeProxyConfig(raw);
+const proxyManager = new ProxyManager(RAW_PROXY_POOL, FALLBACK_PROXY);
+
+function buildProxyAgents(proxyConfig) {
+  if (!proxyConfig?.proxyUrl) return {};
+  try {
+    const proxyUrl = proxyConfig.proxyUrl;
+    const agent = proxyUrl.startsWith("https://")
+      ? new HttpsProxyAgent(proxyUrl)
+      : new HttpProxyAgent(proxyUrl);
+    return { httpAgent: agent, httpsAgent: agent };
+  } catch (err) {
+    console.warn("⚠️ Failed to create proxy agent:", err.message);
+    return {};
   }
-  return normalizeProxyConfig(FALLBACK_PROXY);
+}
+
+async function jarToPuppeteerCookies(jar, targetUrl) {
+  if (!jar || !targetUrl) return [];
+  try {
+    const cookies = await jar.getCookies(targetUrl, {
+      allPaths: true,
+    });
+    return cookies.map((cookie) => ({
+      name: cookie.key,
+      value: cookie.value,
+      domain: cookie.domain || new URL(targetUrl).hostname,
+      path: cookie.path || "/",
+      expires:
+        cookie.expires && cookie.expires !== "Infinity"
+          ? Math.floor(cookie.expires.getTime() / 1000)
+          : undefined,
+      httpOnly: cookie.httpOnly,
+      secure: cookie.secure,
+      sameSite:
+        cookie.sameSite === "lax"
+          ? "Lax"
+          : cookie.sameSite === "strict"
+          ? "Strict"
+          : cookie.sameSite === "none"
+          ? "None"
+          : undefined,
+    }));
+  } catch (err) {
+    debugLog("jarToPuppeteerCookies failed:", err.message);
+    return [];
+  }
+}
+
+async function persistPuppeteerCookies(page, jar) {
+  if (!page || !jar) return;
+  try {
+    const cookies = await page.cookies();
+    let fallbackHost = null;
+    try {
+      fallbackHost = new URL(page.url()).host;
+    } catch {
+      fallbackHost = null;
+    }
+    for (const cookie of cookies) {
+      const cookieString = `${cookie.name}=${cookie.value}`;
+      const protocol = cookie.secure ? "https" : "http";
+      const domain = cookie.domain?.startsWith(".")
+        ? cookie.domain.slice(1)
+        : cookie.domain;
+      const cookieUrl = `${protocol}://${domain || fallbackHost || ""}${
+        cookie.path || "/"
+      }`;
+      const toughCookie = new Cookie({
+        key: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain || domain,
+        path: cookie.path || "/",
+        secure: cookie.secure,
+        httpOnly: cookie.httpOnly,
+        expires:
+          typeof cookie.expires === "number" && cookie.expires > 0
+            ? new Date(cookie.expires * 1000)
+            : "Infinity",
+        sameSite: cookie.sameSite?.toLowerCase?.(),
+      });
+      await jar.setCookie(toughCookie, cookieUrl);
+      debugLog("Cookie persisted", { cookie: cookieString, url: cookieUrl });
+    }
+  } catch (err) {
+    debugLog("persistPuppeteerCookies failed:", err.message);
+  }
 }
 
 async function launchBrowser(proxyConfig) {
@@ -1013,8 +1268,79 @@ function detectDynamicPage(html) {
   return false;
 }
 
-async function fetchWithAxios(url, proxyConfig) {
-  const userAgent = pickUserAgent();
+const IMPORTANT_HEADER_KEYS = [
+  "set-cookie",
+  "server",
+  "x-datadome",
+  "x-perimeterx",
+  "cf-ray",
+  "cf-chl",
+  "cf-cache-status",
+  "x-request-id",
+  "x-amzn-requestid",
+  "location",
+];
+
+function extractImportantHeaders(headers = {}) {
+  const result = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase();
+    if (
+      IMPORTANT_HEADER_KEYS.some((needle) =>
+        lower.startsWith(needle.toLowerCase())
+      )
+    ) {
+      result[lower] = value;
+    }
+  }
+  if (headers["content-type"]) {
+    result["content-type"] = headers["content-type"];
+  } else if (headers["Content-Type"]) {
+    result["content-type"] = headers["Content-Type"];
+  }
+  return result;
+}
+
+function analyzeAntiBotSignals({ html, pageUrl, documentResponses = [] }) {
+  const reasons = [];
+  const lowerHtml = typeof html === "string" ? html.toLowerCase() : "";
+  if (lowerHtml.includes("datadome")) reasons.push("datadome");
+  if (lowerHtml.includes("perimeterx")) reasons.push("perimeterx");
+  if (lowerHtml.includes("cloudflare")) reasons.push("cloudflare");
+  if (lowerHtml.includes("verify you are human")) reasons.push("human-check");
+  if (lowerHtml.includes("captcha")) reasons.push("captcha");
+  if (/<title>\s*fnac\.com\s*<\/title>/i.test(html || ""))
+    reasons.push("fnac-homepage");
+  if (/<title>\s*zara\.com\s*<\/title>/i.test(html || ""))
+    reasons.push("zara-homepage");
+  if (pageUrl && /challenge|captcha|blocked|verify/i.test(pageUrl)) {
+    reasons.push("redirect-challenge");
+  }
+  for (const response of documentResponses) {
+    if (!response) continue;
+    if ([403, 429, 503].includes(response.status)) {
+      reasons.push(`http-${response.status}`);
+    }
+    const headers = response.headers || {};
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase().includes("datadome")) {
+        reasons.push("header-datadome");
+      }
+      if (key.toLowerCase().includes("perimeterx")) {
+        reasons.push("header-perimeterx");
+      }
+      if (key.toLowerCase().includes("cf-ray")) {
+        reasons.push("header-cloudflare");
+      }
+    }
+  }
+  return { detected: reasons.length > 0, reasons: Array.from(new Set(reasons)) };
+}
+
+async function fetchWithAxios(url, options = {}) {
+  const userAgent = options.userAgent || pickUserAgent();
+  const proxyConfig = options.proxyConfig || null;
+  const jar = options.jar || getCookieJarForUrl(url);
   const secChHeaders = buildSecChUaHeaders(userAgent);
   const navigationHeaders = buildNavigationHeaders(url);
   const redirectEntries = [];
@@ -1043,6 +1369,8 @@ async function fetchWithAxios(url, proxyConfig) {
     decompress: true,
     responseType: "text",
     validateStatus: (status) => status >= 200 && status < 400,
+    jar,
+    withCredentials: true,
   };
 
   requestConfig.beforeRedirect = (_options, responseDetails) => {
@@ -1070,27 +1398,28 @@ async function fetchWithAxios(url, proxyConfig) {
     });
   };
 
-  if (proxyConfig?.protocol === "http" || proxyConfig?.protocol === "https") {
-    requestConfig.proxy = {
-      protocol: proxyConfig.protocol,
-      host: proxyConfig.hostname,
-      port: proxyConfig.port || (proxyConfig.protocol === "https" ? 443 : 80),
-    };
-    if (proxyConfig.credentials) {
-      requestConfig.proxy.auth = proxyConfig.credentials;
-    }
-  } else if (proxyConfig?.original) {
+  if (proxyConfig) {
+    const agents = buildProxyAgents(proxyConfig);
+    requestConfig.httpAgent = agents.httpAgent;
+    requestConfig.httpsAgent = agents.httpsAgent;
     requestConfig.proxy = false;
-    if (proxyConfig.credentials) {
-      requestConfig.headers["Proxy-Authorization"] =
-        "Basic " +
-        Buffer.from(
-          `${proxyConfig.credentials.username}:${proxyConfig.credentials.password}`
-        ).toString("base64");
-    }
   }
 
-  const res = await axios.get(url, requestConfig);
+  let res;
+  try {
+    res = await axiosClient.get(url, requestConfig);
+    if (proxyConfig) {
+      proxyManager.reportSuccess(proxyConfig);
+    }
+  } catch (err) {
+    const statusCode = err.response?.status;
+    if (proxyConfig && (statusCode === 403 || statusCode === 429)) {
+      proxyManager.reportFailure(proxyConfig, `status-${statusCode}`);
+    } else if (proxyConfig && err.code) {
+      proxyManager.reportFailure(proxyConfig, err.code);
+    }
+    throw err;
+  }
   const redirectCount = res.request?._redirectable?._redirectCount ?? 0;
   const finalUrl =
     res.request?.res?.responseUrl ||
@@ -1116,10 +1445,13 @@ async function fetchWithAxios(url, proxyConfig) {
     proxy: proxyConfig?.original,
   });
 
-  debugLog("Axios fetch complete", {
+  logEvent("axios_complete", {
+    url,
+    finalUrl,
     status: res.status,
-    proxy: proxyConfig?.original,
-    redirects: redirectCount,
+    redirectCount,
+    userAgent,
+    proxy: proxyConfig?.original || null,
   });
   const html = res.data;
   const jsonLdScripts = extractJsonLdScriptsFromHtml(html);
@@ -1158,20 +1490,98 @@ async function waitForSelectors(page, selectors, timeout) {
   }
 }
 
+const CONSENT_TEXT_MATCHERS = [
+  "accept",
+  "agree",
+  "accepter",
+  "j'accepte",
+  "tout accepter",
+  "accept all",
+  "allow all",
+];
+
+const CONSENT_SELECTORS = [
+  "#onetrust-accept-btn-handler",
+  "button#onetrust-accept-btn-handler",
+  "button#truste-consent-button",
+  "button[data-testid='uc-accept-all']",
+  "button[data-testid='cookie-accept-all']",
+  "button[aria-label*='accept']",
+  "button[aria-label*='Accepter']",
+  "button[aria-label*='autoriser']",
+  "button[class*='accept']",
+  "button[class*='Agree']",
+  "button[mode='primary']",
+  "button[aria-haspopup='dialog'][data-testid*='accept']",
+];
+
+async function handleConsentInterstitial(page) {
+  for (const selector of CONSENT_SELECTORS) {
+    try {
+      const element = await page.$(selector);
+      if (element) {
+        await element.click({ delay: 25 });
+        await sleep(500);
+        return { clicked: true, selector };
+      }
+    } catch (err) {
+      debugLog("Consent click failed", { selector, error: err.message });
+    }
+  }
+
+  const textMatch = await page
+    .evaluate((matchers) => {
+      const lowerMatchers = matchers.map((m) => m.toLowerCase());
+      const candidates = Array.from(
+        document.querySelectorAll(
+          "button, [role='button'], input[type='button'], input[type='submit']"
+        )
+      );
+      for (const candidate of candidates) {
+        const text = (candidate.innerText || candidate.value || "").trim();
+        if (!text) continue;
+        const lowerText = text.toLowerCase();
+        if (lowerMatchers.some((matcher) => lowerText.includes(matcher))) {
+          candidate.click();
+          return text;
+        }
+      }
+      return null;
+    }, CONSENT_TEXT_MATCHERS)
+    .catch(() => null);
+
+  if (textMatch) {
+    await sleep(750);
+    return { clicked: true, selector: `text:${textMatch}` };
+  }
+
+  return { clicked: false, selector: null };
+}
+
 async function scrapeWithPuppeteer(url, options = {}) {
   if (DISABLE_PUPPETEER)
     throw new Error("Puppeteer disabled by env var DISABLE_PUPPETEER");
 
-  const proxyConfig = pickProxyConfig();
-  const { page, key } = await browserPool.acquire(proxyConfig);
-  const userAgent = pickUserAgent();
-  const viewport = pickViewport();
-  const navigatorOverrides = pickNavigatorOverrides();
+  const proxyConfig = options.proxyConfig || null;
+  const jar = options.jar || getCookieJarForUrl(url);
+  const userAgent = options.userAgent || pickUserAgent();
+  const viewport = options.viewport || pickViewport();
+  const navigatorOverrides = options.navigatorOverrides || pickNavigatorOverrides();
   const waitSelectors = ensureArray(options.waitSelectors);
   const waitAfterLoadMs = Math.max(0, options.waitAfterLoadMs ?? DEFAULT_WAIT_AFTER_LOAD);
-  const waitJitter = Math.round(waitAfterLoadMs * WAIT_JITTER_RATIO * (Math.random() * 2 - 1));
+  const waitJitter = Math.round(
+    waitAfterLoadMs * WAIT_JITTER_RATIO * (Math.random() * 2 - 1)
+  );
   const effectiveWaitAfterLoad = Math.max(0, waitAfterLoadMs + waitJitter);
+  const dumpNetwork = options.dumpNetwork === true;
+
+  const { page, key } = await browserPool.acquire(proxyConfig);
   const networkPayloads = [];
+  const networkDebug = [];
+  const documentResponses = [];
+  const navigationChain = [];
+  const secChHeaders = buildSecChUaHeaders(userAgent);
+  let consent = { clicked: false, selector: null };
 
   try {
     if (DEBUG) {
@@ -1182,19 +1592,59 @@ async function scrapeWithPuppeteer(url, options = {}) {
       page.on("error", (err) => console.warn("⚠️ Page crashed:", err));
     }
 
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) {
+        navigationChain.push({ url: frame.url(), ts: Date.now() });
+      }
+    });
+
     page.on("response", async (response) => {
       try {
         const request = response.request();
         const resourceType = request.resourceType();
-        if (!resourceType || !["xhr", "fetch", "document"].includes(resourceType)) {
+        const headers = response.headers();
+        const normalizedHeaders = extractImportantHeaders(headers);
+        if (resourceType === "document") {
+          documentResponses.push({
+            url: response.url(),
+            status: response.status(),
+            headers: normalizedHeaders,
+          });
           return;
         }
-        const headers = response.headers();
-        const contentType = headers["content-type"] || headers["Content-Type"];
-        if (!contentType || !contentType.includes("application/json")) return;
+        if (!resourceType || !["xhr", "fetch"].includes(resourceType)) {
+          return;
+        }
+        const contentType = (
+          headers["content-type"] || headers["Content-Type"] || ""
+        ).toLowerCase();
+        if (!contentType.includes("json") && !contentType.includes("javascript")) {
+          if (dumpNetwork) {
+            const text = await response.text().catch(() => "");
+            networkDebug.push({
+              url: response.url(),
+              status: response.status(),
+              headers: normalizedHeaders,
+              bodySnippet: text ? text.slice(0, 1000) : "",
+            });
+          }
+          return;
+        }
         const text = await response.text();
         if (!text || text.length > 1_000_000) return;
-        networkPayloads.push({ url: response.url(), body: text });
+        networkPayloads.push({
+          url: response.url(),
+          body: text,
+          status: response.status(),
+        });
+        if (dumpNetwork) {
+          networkDebug.push({
+            url: response.url(),
+            status: response.status(),
+            headers: normalizedHeaders,
+            bodySnippet: text.slice(0, 2000),
+          });
+        }
       } catch (err) {
         debugLog("Failed to read network response:", err.message);
       }
@@ -1202,83 +1652,177 @@ async function scrapeWithPuppeteer(url, options = {}) {
 
     await page.setUserAgent(userAgent);
     await page.setExtraHTTPHeaders({
+      ...secChHeaders,
       "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
       "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      DNT: "1",
     });
     await page.setViewport(viewport);
+    await page.setJavaScriptEnabled(true);
     await page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT);
     await page.setDefaultTimeout(NAVIGATION_TIMEOUT);
 
-    await page.evaluateOnNewDocument((overrides) => {
-      Object.defineProperty(navigator, "languages", {
-        get: () => overrides.languages,
-      });
-      Object.defineProperty(navigator, "platform", {
-        get: () => overrides.platform,
-      });
-      Object.defineProperty(navigator, "hardwareConcurrency", {
-        get: () => overrides.hardwareConcurrency,
-      });
-      if (overrides.deviceMemory !== undefined) {
-        Object.defineProperty(navigator, "deviceMemory", {
-          get: () => overrides.deviceMemory,
-        });
-      }
-      if (overrides.maxTouchPoints !== undefined) {
-        Object.defineProperty(navigator, "maxTouchPoints", {
-          get: () => overrides.maxTouchPoints,
-        });
-      }
-      if (overrides.vendor) {
-        Object.defineProperty(navigator, "vendor", {
-          get: () => overrides.vendor,
-        });
-      }
-      if (overrides.pluginsLength) {
-        Object.defineProperty(navigator, "plugins", {
-          get: () =>
-            Array.from({ length: overrides.pluginsLength }).map((_, index) => ({
-              name: `Plugin ${index + 1}`,
-              filename: `plugin${index + 1}.dll`,
-              description: `Fake plugin ${index + 1}`,
-            })),
-        });
-      }
-      Object.defineProperty(navigator, "webdriver", {
-        get: () => false,
-      });
-      Object.defineProperty(navigator, "pdfViewerEnabled", {
-        get: () => true,
-      });
-      window.chrome = window.chrome || { runtime: {} };
-      try {
-        const originalQuery = window.navigator.permissions?.query;
-        if (originalQuery) {
-          window.navigator.permissions.query = (parameters) => {
-            if (parameters && parameters.name === "notifications") {
-              const state =
-                typeof Notification !== "undefined" && Notification.permission
-                  ? Notification.permission
-                  : "default";
-              return Promise.resolve({ state });
-            }
-            return originalQuery(parameters);
+    await page.evaluateOnNewDocument(
+      ({ overrides, ua }) => {
+        try {
+          Object.defineProperty(navigator, "languages", {
+            get: () => overrides.languages,
+          });
+          Object.defineProperty(navigator, "platform", {
+            get: () => overrides.platform,
+          });
+          Object.defineProperty(navigator, "hardwareConcurrency", {
+            get: () => overrides.hardwareConcurrency,
+          });
+          if (overrides.deviceMemory !== undefined) {
+            Object.defineProperty(navigator, "deviceMemory", {
+              get: () => overrides.deviceMemory,
+            });
+          }
+          if (overrides.maxTouchPoints !== undefined) {
+            Object.defineProperty(navigator, "maxTouchPoints", {
+              get: () => overrides.maxTouchPoints,
+            });
+          }
+          if (overrides.vendor) {
+            Object.defineProperty(navigator, "vendor", {
+              get: () => overrides.vendor,
+            });
+          }
+          Object.defineProperty(navigator, "webdriver", {
+            get: () => false,
+          });
+          Object.defineProperty(navigator, "pdfViewerEnabled", {
+            get: () => true,
+          });
+          Object.defineProperty(navigator, "userAgent", {
+            get: () => ua,
+          });
+          if (!window.chrome) {
+            Object.defineProperty(window, "chrome", {
+              value: { runtime: {} },
+            });
+          }
+          if (!navigator.plugins || navigator.plugins.length === 0) {
+            const length = overrides.pluginsLength || 3;
+            Object.defineProperty(navigator, "plugins", {
+              get: () =>
+                Array.from({ length }).map((_, index) => ({
+                  name: `Plugin ${index + 1}`,
+                  filename: `plugin${index + 1}.so`,
+                  description: `Fake plugin ${index + 1}`,
+                })),
+            });
+          }
+          const originalPermissions = navigator.permissions?.query;
+          if (originalPermissions) {
+            navigator.permissions.query = (parameters) => {
+              if (parameters && parameters.name === "notifications") {
+                const state =
+                  typeof Notification !== "undefined" && Notification.permission
+                    ? Notification.permission
+                    : "default";
+                return Promise.resolve({ state });
+              }
+              return originalPermissions(parameters);
+            };
+          }
+          if (!navigator.userAgentData) {
+            Object.defineProperty(navigator, "userAgentData", {
+              get: () => ({
+                brands: [
+                  { brand: "Chromium", version: "123" },
+                  { brand: "Google Chrome", version: "123" },
+                  { brand: "Not=A?Brand", version: "8" },
+                ],
+                mobile: false,
+                getHighEntropyValues: async () => ({
+                  platform: overrides.platform,
+                  platformVersion: "15.0.0",
+                  architecture: "x86",
+                  model: "",
+                  uaFullVersion: (ua.match(/Chrome\/([\d.]+)/) || [])[1] || "123.0.0.0",
+                }),
+              }),
+            });
+          }
+          const patchCanvas = () => {
+            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function (...args) {
+              const context = this.getContext("2d");
+              if (context) {
+                const shift = 0.000001;
+                context.fillStyle = `rgba(0,0,0,${shift})`;
+                context.fillRect(0, 0, 1, 1);
+              }
+              return originalToDataURL.apply(this, args);
+            };
+            const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = function (...args) {
+              const data = originalGetImageData.apply(this, args);
+              return data;
+            };
           };
+          const patchWebGL = () => {
+            const proto = WebGLRenderingContext?.prototype;
+            if (!proto) return;
+            const originalGetParameter = proto.getParameter;
+            proto.getParameter = function (parameter) {
+              if (parameter === 37445) return "Intel Inc.";
+              if (parameter === 37446) return "Intel Iris OpenGL";
+              return originalGetParameter.call(this, parameter);
+            };
+          };
+          const patchAudio = () => {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            const audioProto = AudioCtx.prototype;
+            const originalCreateAnalyser = audioProto.createAnalyser;
+            audioProto.createAnalyser = function (...args) {
+              const analyser = originalCreateAnalyser.apply(this, args);
+              const originalGetFloatFrequencyData = analyser.getFloatFrequencyData;
+              analyser.getFloatFrequencyData = function (array) {
+                const result = originalGetFloatFrequencyData.call(this, array);
+                for (let i = 0; i < array.length; i += 100) {
+                  array[i] = array[i] + Math.random() * 0.0001;
+                }
+                return result;
+              };
+              return analyser;
+            };
+          };
+          patchCanvas();
+          patchWebGL();
+          patchAudio();
+        } catch (err) {
+          console.debug("init script error", err);
         }
-      } catch (err) {
-        void err;
-      }
-    }, navigatorOverrides);
+      },
+      { overrides: navigatorOverrides, ua: userAgent }
+    );
 
     if (proxyConfig?.credentials) {
       await page.authenticate(proxyConfig.credentials);
     }
 
+    const preloadCookies = await jarToPuppeteerCookies(jar, url);
+    if (preloadCookies.length) {
+      try {
+        await page.setCookie(...preloadCookies);
+      } catch (err) {
+        debugLog("Failed to set initial cookies:", err.message);
+      }
+    }
+
     await sleep(50 + Math.floor(Math.random() * 200));
 
-    debugLog("🌐 Navigating with Puppeteer", {
+    logEvent("puppeteer_navigate", {
       url,
-      proxy: proxyConfig?.original,
+      proxy: proxyConfig?.original || null,
       userAgent,
       viewport,
     });
@@ -1298,7 +1842,23 @@ async function scrapeWithPuppeteer(url, options = {}) {
     }
 
     if (waitSelectors.length) {
-      await waitForSelectors(page, waitSelectors, Math.min(NAVIGATION_TIMEOUT, 30000));
+      await waitForSelectors(
+        page,
+        waitSelectors,
+        Math.min(NAVIGATION_TIMEOUT, 30000)
+      );
+    }
+
+    consent = await handleConsentInterstitial(page);
+    if (consent.clicked) {
+      try {
+        await page.waitForNetworkIdle({
+          idleTime: 750,
+          timeout: Math.min(NAVIGATION_TIMEOUT, 15000),
+        });
+      } catch (err) {
+        debugLog("Consent reload wait skipped:", err.message);
+      }
     }
 
     if (effectiveWaitAfterLoad) {
@@ -1306,8 +1866,6 @@ async function scrapeWithPuppeteer(url, options = {}) {
     }
 
     const pageUrl = page.url();
-    debugLog("Puppeteer final page URL", { requestedUrl: url, pageUrl });
-
     const html = await page.content();
     const jsonLd = await page.$$eval(
       'script[type="application/ld+json"]',
@@ -1342,20 +1900,20 @@ async function scrapeWithPuppeteer(url, options = {}) {
       })
       .catch(() => null);
 
-    const antiBotDetected =
-      /datadome/i.test(html) || /verify you are human/i.test(html);
-
-    if (/<title>\s*fnac\.com\s*<\/title>/i.test(html)) {
-      console.warn("⚠️ Redirected to homepage");
-    }
-
-    debugLog("✅ Puppeteer page loaded", {
-      url,
-      userAgent,
-      waitAfter: effectiveWaitAfterLoad,
-      proxy: proxyConfig?.original,
+    const antiBotAnalysis = analyzeAntiBotSignals({
+      html,
       pageUrl,
-      antiBotDetected,
+      documentResponses,
+    });
+
+    logEvent("puppeteer_complete", {
+      url,
+      pageUrl,
+      proxy: proxyConfig?.original || null,
+      userAgent,
+      antiBotDetected: antiBotAnalysis.detected,
+      antiBotReasons: antiBotAnalysis.reasons,
+      networkPayloads: networkPayloads.length,
     });
 
     return {
@@ -1363,30 +1921,52 @@ async function scrapeWithPuppeteer(url, options = {}) {
       jsonLd,
       nextData: nextDataPayload,
       networkPayloads,
-      antiBotDetected,
+      networkDebug: dumpNetwork ? networkDebug : undefined,
+      documentResponses,
+      navigationChain,
+      consent,
+      antiBotDetected: antiBotAnalysis.detected,
+      antiBotReasons: antiBotAnalysis.reasons,
       meta: {
         userAgent,
         viewport,
-        proxy: proxyConfig?.original,
+        proxy: proxyConfig?.original || null,
         waitAfter: effectiveWaitAfterLoad,
         pageUrl,
-        antiBotDetected,
+        antiBotDetected: antiBotAnalysis.detected,
+        antiBotReasons: antiBotAnalysis.reasons,
+        consent,
+        documentResponses,
+        navigationChain,
       },
     };
   } catch (err) {
     console.error("❌ Puppeteer scraping error:", err);
     throw err;
   } finally {
+    try {
+      await persistPuppeteerCookies(page, jar);
+    } catch (err) {
+      debugLog("Cookie persist failed:", err.message);
+    }
     await browserPool.release(key, page);
   }
 }
 
-async function scrapeProduct(url, options) {
-  const cacheEntry = cache.get(url);
-  if (cacheEntry) {
-    debugLog("Cache hit", { url });
-    return { ...cacheEntry, cached: true };
+async function scrapeProduct(url, options = {}) {
+  const dumpNetwork = options.dumpNetwork === true;
+  if (!dumpNetwork) {
+    const cacheEntry = cache.get(url);
+    if (cacheEntry) {
+      debugLog("Cache hit", { url });
+      return { ...cacheEntry, cached: true };
+    }
   }
+
+  const jar = getCookieJarForUrl(url);
+  const sessionUserAgent = pickUserAgent();
+  const sessionViewport = pickViewport();
+  const sessionNavigator = pickNavigatorOverrides();
 
   let axiosExtraction = createEmptyProduct();
   let puppeteerExtraction = createEmptyProduct();
@@ -1397,18 +1977,31 @@ async function scrapeProduct(url, options) {
   let dynamicHint = false;
   let axiosDiagnostics = null;
   let puppeteerDiagnostics = null;
+  let networkDebugDump = null;
 
-  const proxyForAxios = pickProxyConfig();
+  const attempts = { axios: [], puppeteer: [] };
 
+  const runAxios = async (proxyConfig) => {
+    const result = await pRetry(
+      () =>
+        fetchWithAxios(url, {
+          proxyConfig,
+          userAgent: sessionUserAgent,
+          jar,
+        }),
+      { retries: MAX_RETRIES }
+    );
+    return result;
+  };
+
+  let axiosAntiBot = { detected: false, reasons: [] };
   try {
-    const axiosResult = await pRetry(() => fetchWithAxios(url, proxyForAxios), {
-      retries: MAX_RETRIES,
-    });
+    const axiosResult = await runAxios(null);
     axiosDiagnostics = axiosResult;
     dynamicHint = axiosResult.isLikelyDynamic;
     axiosMeta = {
-      userAgent: axiosResult.userAgent,
-      proxy: proxyForAxios?.original,
+      userAgent: sessionUserAgent,
+      proxy: null,
       redirectCount: axiosResult.redirectCount ?? 0,
       finalUrl: axiosResult.finalUrl ?? null,
       visitedUrls: axiosResult.visitedUrls ?? null,
@@ -1419,23 +2012,108 @@ async function scrapeProduct(url, options) {
       axiosResult.jsonLdScripts,
       axiosResult.nextDataPayload
     );
+    axiosAntiBot = analyzeAntiBotSignals({
+      html: axiosResult.html,
+      pageUrl: axiosResult.finalUrl,
+    });
+    axiosMeta.antiBotDetected = axiosAntiBot.detected;
+    axiosMeta.antiBotReasons = axiosAntiBot.reasons;
+    attempts.axios.push({
+      proxy: null,
+      success: true,
+      antiBotDetected: axiosAntiBot.detected,
+      reasons: axiosAntiBot.reasons,
+      finalUrl: axiosResult.finalUrl ?? null,
+    });
   } catch (err) {
     axiosError = err;
-    console.warn("⚠️ Axios failed:", err.message);
+    logEvent("axios_error", {
+      url,
+      error: err.message,
+      proxy: null,
+    });
+    attempts.axios.push({ proxy: null, success: false, error: err.message });
+  }
+
+  if (
+    proxyManager.hasResidentialProxy() &&
+    (axiosError || axiosAntiBot.detected)
+  ) {
+    const proxyConfig = proxyManager.getProxy({ requireResidential: true });
+    if (proxyConfig) {
+      try {
+        const axiosResult = await runAxios(proxyConfig);
+        axiosDiagnostics = axiosResult;
+        dynamicHint = axiosResult.isLikelyDynamic;
+        axiosMeta = {
+          userAgent: sessionUserAgent,
+          proxy: proxyConfig.original,
+          redirectCount: axiosResult.redirectCount ?? 0,
+          finalUrl: axiosResult.finalUrl ?? null,
+          visitedUrls: axiosResult.visitedUrls ?? null,
+        };
+        axiosExtraction = extractFromHtml(
+          axiosResult.html,
+          url,
+          axiosResult.jsonLdScripts,
+          axiosResult.nextDataPayload
+        );
+        axiosAntiBot = analyzeAntiBotSignals({
+          html: axiosResult.html,
+          pageUrl: axiosResult.finalUrl,
+        });
+        axiosMeta.antiBotDetected = axiosAntiBot.detected;
+        axiosMeta.antiBotReasons = axiosAntiBot.reasons;
+        attempts.axios.push({
+          proxy: proxyConfig.original,
+          success: true,
+          antiBotDetected: axiosAntiBot.detected,
+          reasons: axiosAntiBot.reasons,
+          finalUrl: axiosResult.finalUrl ?? null,
+        });
+        axiosError = null;
+      } catch (err) {
+        axiosError = err;
+        logEvent("axios_proxy_error", {
+          url,
+          error: err.message,
+          proxy: proxyConfig.original,
+        });
+        attempts.axios.push({
+          proxy: proxyConfig.original,
+          success: false,
+          error: err.message,
+        });
+      }
+    }
   }
 
   const shouldUsePuppeteer =
     !DISABLE_PUPPETEER &&
-    (dynamicHint || axiosError || !hasProductSignals(axiosExtraction));
-  const attemptedPuppeteer = shouldUsePuppeteer;
+    (dynamicHint || axiosError || !hasProductSignals(axiosExtraction) || axiosAntiBot.detected);
 
   if (shouldUsePuppeteer) {
     try {
-      const puppeteerResult = await pRetry(() => scrapeWithPuppeteer(url, options), {
-        retries: MAX_RETRIES,
-      });
+      const puppeteerResult = await pRetry(
+        () =>
+          scrapeWithPuppeteer(url, {
+            ...options,
+            waitSelectors: options.waitSelectors,
+            waitAfterLoadMs: options.waitAfterLoadMs,
+            proxyConfig: null,
+            userAgent: sessionUserAgent,
+            viewport: sessionViewport,
+            navigatorOverrides: sessionNavigator,
+            jar,
+            dumpNetwork,
+          }),
+        { retries: Math.min(1, MAX_RETRIES) }
+      );
       puppeteerDiagnostics = puppeteerResult;
-      puppeteerMeta = puppeteerResult.meta;
+      puppeteerMeta = {
+        ...puppeteerResult.meta,
+        proxy: null,
+      };
       const htmlExtraction = extractFromHtml(
         puppeteerResult.html,
         url,
@@ -1446,9 +2124,102 @@ async function scrapeProduct(url, options) {
         puppeteerResult.networkPayloads
       );
       puppeteerExtraction = mergeProductData(htmlExtraction, networkExtraction);
+      attempts.puppeteer.push({
+        proxy: null,
+        success: true,
+        antiBotDetected: puppeteerResult.antiBotDetected,
+        reasons: puppeteerResult.antiBotReasons,
+        pageUrl: puppeteerResult.meta?.pageUrl ?? null,
+      });
+      if (dumpNetwork && puppeteerResult.networkDebug) {
+        networkDebugDump = puppeteerResult.networkDebug.slice(0);
+      }
     } catch (err) {
       puppeteerError = err;
-      console.warn("⚠️ Puppeteer failed:", err.message);
+      logEvent("puppeteer_error", {
+        url,
+        error: err.message,
+        proxy: null,
+      });
+      attempts.puppeteer.push({
+        proxy: null,
+        success: false,
+        error: err.message,
+      });
+    }
+
+    const needProxyRetry =
+      proxyManager.hasResidentialProxy() &&
+      (puppeteerError || puppeteerDiagnostics?.antiBotDetected);
+
+    if (needProxyRetry) {
+      const proxyConfig = proxyManager.getProxy({ requireResidential: true });
+      if (proxyConfig) {
+        try {
+          const proxiedResult = await pRetry(
+            () =>
+              scrapeWithPuppeteer(url, {
+                ...options,
+                proxyConfig,
+                userAgent: sessionUserAgent,
+                viewport: sessionViewport,
+                navigatorOverrides: sessionNavigator,
+                jar,
+                dumpNetwork,
+              }),
+            { retries: Math.min(1, MAX_RETRIES) }
+          );
+          puppeteerDiagnostics = proxiedResult;
+          puppeteerMeta = {
+            ...proxiedResult.meta,
+            proxy: proxyConfig.original,
+          };
+          const htmlExtraction = extractFromHtml(
+            proxiedResult.html,
+            url,
+            proxiedResult.jsonLd,
+            proxiedResult.nextData
+          );
+          const networkExtraction = extractFromNetworkPayloads(
+            proxiedResult.networkPayloads
+          );
+          puppeteerExtraction = mergeProductData(
+            puppeteerExtraction,
+            mergeProductData(htmlExtraction, networkExtraction)
+          );
+          puppeteerError = null;
+          attempts.puppeteer.push({
+            proxy: proxyConfig.original,
+            success: true,
+            antiBotDetected: proxiedResult.antiBotDetected,
+            reasons: proxiedResult.antiBotReasons,
+            pageUrl: proxiedResult.meta?.pageUrl ?? null,
+          });
+          if (proxiedResult.antiBotDetected) {
+            proxyManager.reportFailure(proxyConfig, "anti-bot");
+          } else {
+            proxyManager.reportSuccess(proxyConfig);
+          }
+          if (dumpNetwork && proxiedResult.networkDebug) {
+            networkDebugDump = (networkDebugDump || []).concat(
+              proxiedResult.networkDebug
+            );
+          }
+        } catch (err) {
+          puppeteerError = err;
+          proxyManager.reportFailure(proxyConfig, err.name || "puppeteer-error");
+          logEvent("puppeteer_proxy_error", {
+            url,
+            error: err.message,
+            proxy: proxyConfig.original,
+          });
+          attempts.puppeteer.push({
+            proxy: proxyConfig.original,
+            success: false,
+            error: err.message,
+          });
+        }
+      }
     }
   }
 
@@ -1464,18 +2235,29 @@ async function scrapeProduct(url, options) {
   } else {
     finalProduct = mergeProductData(axiosExtraction, puppeteerExtraction);
     if (!hasProductSignals(finalProduct)) {
-      if (axiosError && attemptedPuppeteer && puppeteerError) {
+      if (axiosError && puppeteerError) {
         throw puppeteerError || axiosError;
       }
-      if (axiosError && !attemptedPuppeteer) {
+      if (axiosError && !shouldUsePuppeteer) {
         throw axiosError;
       }
-      if (!axiosError && attemptedPuppeteer && puppeteerError && !hasProductSignals(axiosExtraction)) {
+      if (!axiosError && puppeteerError && !hasProductSignals(axiosExtraction)) {
         throw puppeteerError;
       }
     }
-    source = attemptedPuppeteer && !puppeteerError ? "puppeteer" : "axios";
+    source = !puppeteerError ? "puppeteer" : "axios";
   }
+
+  const antiBotDetected =
+    puppeteerDiagnostics?.antiBotDetected ||
+    puppeteerMeta?.antiBotDetected ||
+    axiosMeta?.antiBotDetected ||
+    false;
+  const antiBotReasons =
+    puppeteerDiagnostics?.antiBotReasons ||
+    puppeteerMeta?.antiBotReasons ||
+    axiosMeta?.antiBotReasons ||
+    [];
 
   const payload = {
     ok: true,
@@ -1483,22 +2265,46 @@ async function scrapeProduct(url, options) {
     source,
     fetchedAt: Date.now(),
     meta: {
-      axios: axiosMeta,
-      puppeteer: puppeteerMeta,
+      axios: { ...(axiosMeta || {}), attempts: attempts.axios },
+      puppeteer: { ...(puppeteerMeta || {}), attempts: attempts.puppeteer },
       axiosError: axiosError ? axiosError.message : null,
       puppeteerError: puppeteerError ? puppeteerError.message : null,
       redirectCount: axiosDiagnostics?.redirectCount ?? null,
       finalUrl: axiosDiagnostics?.finalUrl ?? null,
-      antiBotDetected:
-        puppeteerDiagnostics?.antiBotDetected ??
-        puppeteerMeta?.antiBotDetected ??
-        null,
+      antiBotDetected,
+      antiBotReasons,
       pageUrl: puppeteerMeta?.pageUrl ?? null,
     },
+    diagnostics: dumpNetwork
+      ? {
+          axios: {
+            finalUrl: axiosDiagnostics?.finalUrl ?? null,
+            redirectCount: axiosDiagnostics?.redirectCount ?? null,
+            visitedUrls: axiosDiagnostics?.visitedUrls ?? null,
+            antiBot: axiosMeta?.antiBotReasons ?? [],
+          },
+          puppeteer: {
+            pageUrl: puppeteerMeta?.pageUrl ?? null,
+            antiBotDetected: puppeteerMeta?.antiBotDetected ?? null,
+            antiBotReasons: puppeteerMeta?.antiBotReasons ?? [],
+            documentResponses: puppeteerDiagnostics?.documentResponses ?? [],
+            navigationChain: puppeteerDiagnostics?.navigationChain ?? [],
+          },
+          network: (puppeteerDiagnostics?.networkPayloads || []).map((entry) => ({
+            url: entry.url,
+            status: entry.status ?? null,
+            length: entry.body?.length ?? 0,
+            body: entry.body,
+          })),
+          networkDebug: networkDebugDump || [],
+        }
+      : undefined,
     cached: false,
   };
 
-  cache.set(url, payload);
+  if (!dumpNetwork) {
+    cache.set(url, payload);
+  }
   return payload;
 }
 
@@ -1513,7 +2319,25 @@ app.get("/health", (req, res) => {
     ok: true,
     browser: browserHealth,
     cache: cacheStats,
+    proxies: proxyManager.getDiagnostics(),
+    cookies: { stores: cookieJars.size },
     uptime: process.uptime(),
+  });
+});
+
+app.get("/debug", (req, res) => {
+  res.json({
+    ok: true,
+    browser: browserPool.getHealth(),
+    cache: cache.getStats(),
+    proxies: proxyManager.getDiagnostics(),
+    cookies: { stores: cookieJars.size },
+    config: {
+      disablePuppeteer: DISABLE_PUPPETEER,
+      maxRetries: MAX_RETRIES,
+      navigationTimeout: NAVIGATION_TIMEOUT,
+      proxyPoolSize: RAW_PROXY_POOL.length,
+    },
   });
 });
 
@@ -1541,10 +2365,14 @@ app.get("/scrape", async (req, res) => {
     Number.parseInt(req.query.waitAfterLoadMs ?? "", 10) || DEFAULT_WAIT_AFTER_LOAD
   );
 
+  const dumpNetwork =
+    req.query.dumpNetwork === "1" || req.query.dumpNetwork === "true";
+
   try {
     const result = await scrapeProduct(url, {
       waitSelectors: trimmedSelectors,
       waitAfterLoadMs,
+      dumpNetwork,
     });
     res.json(result);
   } catch (err) {
@@ -1583,8 +2411,8 @@ setTimeout(async () => {
   }
   try {
     console.log("⏳ Preloading Puppeteer...");
-    const proxyConfig = pickProxyConfig();
-    const { page, key } = await browserPool.acquire(proxyConfig);
+    const preloadProxy = proxyManager.getProxy();
+    const { page, key } = await browserPool.acquire(preloadProxy);
     await browserPool.release(key, page);
     console.log("✅ Puppeteer preloaded successfully!");
   } catch (err) {
