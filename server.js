@@ -8,12 +8,8 @@ import { constants as fsConstants } from "node:fs";
 const app = express();
 
 // --- Gestion globale des erreurs ---
-process.on("uncaughtException", (err) => {
-  console.error("❌ Uncaught exception:", err);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("⚠️ Unhandled rejection:", reason);
-});
+process.on("uncaughtException", (err) => console.error("❌ Uncaught exception:", err));
+process.on("unhandledRejection", (reason) => console.error("⚠️ Unhandled rejection:", reason));
 
 // --- Vérification du PORT (Cloud Run) ---
 const portValue = process.env.PORT;
@@ -28,8 +24,7 @@ const PROXY = process.env.SCRAPER_PROXY || null;
 let MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
 if (!Number.isFinite(MAX_RETRIES) || MAX_RETRIES < 0) MAX_RETRIES = 2;
 const DISABLE_PUPPETEER = process.env.DISABLE_PUPPETEER === "true";
-const CHROMIUM_OVERRIDE =
-  process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
+const CHROMIUM_OVERRIDE = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 
 let puppeteerModulePromise = null;
 let chromiumProbePromise = null;
@@ -54,13 +49,7 @@ async function resolveChromiumExecutable() {
   if (!chromiumProbePromise) {
     chromiumProbePromise = access(CHROMIUM_OVERRIDE, fsConstants.X_OK)
       .then(() => CHROMIUM_OVERRIDE)
-      .catch((err) => {
-        console.error(
-          `⚠️ Chromium not accessible at ${CHROMIUM_OVERRIDE}, falling back.`,
-          err
-        );
-        return null;
-      });
+      .catch(() => null);
   }
   return chromiumProbePromise;
 }
@@ -68,7 +57,6 @@ async function resolveChromiumExecutable() {
 // --- Lancement du navigateur ---
 async function launchBrowser() {
   const puppeteer = await loadPuppeteer();
-
   const launchOptions = {
     headless: true,
     args: [
@@ -80,18 +68,10 @@ async function launchBrowser() {
       "--no-zygote",
       "--single-process",
       "--hide-scrollbars",
-      "--mute-audio",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
     ],
     executablePath: "/usr/bin/chromium",
   };
-
-  console.log("🚀 Launching Chromium...");
-  const browser = await puppeteer.launch(launchOptions);
-  console.log("✅ Chromium started successfully!");
-  return browser;
+  return puppeteer.launch(launchOptions);
 }
 
 // --- Normalisation des URLs d’images ---
@@ -161,10 +141,8 @@ function parseJsonLdScripts(jsonLdScripts) {
   const nodes = [];
   for (const script of jsonLdScripts || []) {
     if (typeof script !== "string") continue;
-    const trimmed = script.trim();
-    if (!trimmed) continue;
     try {
-      const parsed = JSON.parse(trimmed);
+      const parsed = JSON.parse(script.trim());
       nodes.push(...flattenJsonLd(parsed));
     } catch {}
   }
@@ -175,29 +153,21 @@ function parseJsonLdScripts(jsonLdScripts) {
 async function scrapeWithPuppeteer(url) {
   if (DISABLE_PUPPETEER)
     throw new Error("Puppeteer disabled by env var DISABLE_PUPPETEER");
-
-  console.log("🌐 Scraping with Puppeteer:", url);
-
   const browser = await launchBrowser();
   try {
     const page = await browser.newPage();
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
     );
-
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-
     const html = await page.content();
     const jsonLd = await page.$$eval(
       'script[type="application/ld+json"]',
       (scripts) => scripts.map((s) => s.innerText)
     );
-
-    console.log("✅ Page loaded successfully!");
     await browser.close();
     return { html, jsonLd };
   } catch (err) {
-    console.error("❌ Puppeteer scraping error:", err);
     try {
       await browser.close();
     } catch {}
@@ -205,27 +175,51 @@ async function scrapeWithPuppeteer(url) {
   }
 }
 
-// --- Extraction depuis HTML ---
+// --- Extraction depuis HTML + JSON-LD ---
 function extractFromHtml(html, url, jsonLdScripts = null) {
   const $ = cheerio.load(html);
-  const title =
+
+  let title =
     $("meta[property='og:title']").attr("content") ||
     $("title").text() ||
     null;
-  const description =
+  let description =
     $("meta[property='og:description']").attr("content") ||
     $("meta[name='description']").attr("content") ||
     null;
-  const price =
+  let price =
     $("meta[property='product:price:amount']").attr("content") ||
     $('[itemprop="price"]').attr("content") ||
     null;
+
+  // --- 🧹 Nettoyage du titre ---
+  if (title)
+    title = title
+      .replace(/Prix Fnac/gi, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+
+  // --- 🔍 Extraction du prix depuis JSON-LD ---
+  if (!price && jsonLdScripts?.length) {
+    const nodes = parseJsonLdScripts(jsonLdScripts);
+    const offer = nodes.find((n) => n["@type"] === "Offer" && n.price);
+    if (offer?.price) price = offer.price;
+  }
+
+  // --- 🖼️ Images filtrées ---
   const images = [];
   $("img").each((i, el) => {
     const src = $(el).attr("src");
     const normalized = normalizeUrl(src, url);
-    if (normalized) images.push(normalized);
+    if (
+      normalized &&
+      !normalized.includes("data:image/svg+xml") &&
+      !normalized.endsWith(".svg")
+    ) {
+      images.push(normalized);
+    }
   });
+
   return { title, description, price, images };
 }
 
@@ -237,9 +231,7 @@ app.get("/", (req, res) => {
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url)
-    return res
-      .status(400)
-      .json({ error: "Missing URL query param (?url=https://...)" });
+    return res.status(400).json({ error: "Missing URL query param (?url=https://...)" });
 
   try {
     let html, jsonLdScripts;
@@ -273,7 +265,7 @@ server.on("error", (err) => {
   process.exit(1);
 });
 
-// --- Préchargement asynchrone de Puppeteer (version Codex optimisée) ---
+// --- Préchargement asynchrone de Puppeteer ---
 setTimeout(async () => {
   if (DISABLE_PUPPETEER) {
     console.log("⏭️ Puppeteer preload skipped (disabled via env).");
