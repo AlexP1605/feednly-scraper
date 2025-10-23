@@ -125,6 +125,11 @@ function cleanHeaders(headers) {
   return result;
 }
 
+function normalizeHeaderArray(value) {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
 function buildSecChUaHeaders(userAgent) {
   const ua = `${userAgent || ""}`;
   const lower = ua.toLowerCase();
@@ -1012,6 +1017,8 @@ async function fetchWithAxios(url, proxyConfig) {
   const userAgent = pickUserAgent();
   const secChHeaders = buildSecChUaHeaders(userAgent);
   const navigationHeaders = buildNavigationHeaders(url);
+  const redirectEntries = [];
+  const visitedUrls = [url];
   const requestConfig = {
     headers: {
       "User-Agent": userAgent,
@@ -1038,6 +1045,31 @@ async function fetchWithAxios(url, proxyConfig) {
     validateStatus: (status) => status >= 200 && status < 400,
   };
 
+  requestConfig.beforeRedirect = (_options, responseDetails) => {
+    const fromUrl = responseDetails?.responseUrl || null;
+    const statusCode = responseDetails?.statusCode;
+    const locationHeader = normalizeHeaderArray(responseDetails?.headers?.location);
+    const setCookieHeader = normalizeHeaderArray(
+      responseDetails?.headers?.["set-cookie"]
+    );
+
+    if (fromUrl) {
+      visitedUrls.push(fromUrl);
+    }
+    for (const location of locationHeader) {
+      if (location) {
+        visitedUrls.push(location);
+      }
+    }
+
+    redirectEntries.push({
+      fromUrl,
+      statusCode,
+      location: locationHeader,
+      setCookie: setCookieHeader,
+    });
+  };
+
   if (proxyConfig?.protocol === "http" || proxyConfig?.protocol === "https") {
     requestConfig.proxy = {
       protocol: proxyConfig.protocol,
@@ -1060,6 +1092,30 @@ async function fetchWithAxios(url, proxyConfig) {
 
   const res = await axios.get(url, requestConfig);
   const redirectCount = res.request?._redirectable?._redirectCount ?? 0;
+  const finalUrl =
+    res.request?.res?.responseUrl ||
+    res.request?.responseURL ||
+    res.request?._redirectable?._currentUrl ||
+    url;
+  const finalSetCookie = normalizeHeaderArray(res.headers?.["set-cookie"]);
+  const finalLocation = normalizeHeaderArray(res.headers?.location);
+  const uniqueVisitedUrls = Array.from(
+    new Set([...visitedUrls, finalUrl].filter(Boolean))
+  );
+
+  debugLog("Axios redirect diagnostics", {
+    requestedUrl: url,
+    finalUrl,
+    redirectCount,
+    visitedUrls: uniqueVisitedUrls,
+    hops: redirectEntries,
+    finalHeaders: {
+      setCookie: finalSetCookie,
+      location: finalLocation,
+    },
+    proxy: proxyConfig?.original,
+  });
+
   debugLog("Axios fetch complete", {
     status: res.status,
     proxy: proxyConfig?.original,
@@ -1069,7 +1125,21 @@ async function fetchWithAxios(url, proxyConfig) {
   const jsonLdScripts = extractJsonLdScriptsFromHtml(html);
   const nextDataPayload = extractInlineNextData(html);
   const dynamic = detectDynamicPage(html);
-  return { html, jsonLdScripts, nextDataPayload, userAgent, isLikelyDynamic: dynamic };
+  const result = {
+    html,
+    jsonLdScripts,
+    nextDataPayload,
+    userAgent,
+    isLikelyDynamic: dynamic,
+    redirectCount,
+    visitedUrls: uniqueVisitedUrls,
+  };
+
+  if (finalUrl && finalUrl !== url) {
+    result.finalUrl = finalUrl;
+  }
+
+  return result;
 }
 
 async function waitForSelectors(page, selectors, timeout) {
@@ -1235,6 +1305,9 @@ async function scrapeWithPuppeteer(url, options = {}) {
       await sleep(effectiveWaitAfterLoad);
     }
 
+    const pageUrl = page.url();
+    debugLog("Puppeteer final page URL", { requestedUrl: url, pageUrl });
+
     const html = await page.content();
     const jsonLd = await page.$$eval(
       'script[type="application/ld+json"]',
@@ -1269,11 +1342,20 @@ async function scrapeWithPuppeteer(url, options = {}) {
       })
       .catch(() => null);
 
+    const antiBotDetected =
+      /datadome/i.test(html) || /verify you are human/i.test(html);
+
+    if (/<title>\s*fnac\.com\s*<\/title>/i.test(html)) {
+      console.warn("⚠️ Redirected to homepage");
+    }
+
     debugLog("✅ Puppeteer page loaded", {
       url,
       userAgent,
       waitAfter: effectiveWaitAfterLoad,
       proxy: proxyConfig?.original,
+      pageUrl,
+      antiBotDetected,
     });
 
     return {
@@ -1281,11 +1363,14 @@ async function scrapeWithPuppeteer(url, options = {}) {
       jsonLd,
       nextData: nextDataPayload,
       networkPayloads,
+      antiBotDetected,
       meta: {
         userAgent,
         viewport,
         proxy: proxyConfig?.original,
         waitAfter: effectiveWaitAfterLoad,
+        pageUrl,
+        antiBotDetected,
       },
     };
   } catch (err) {
@@ -1310,6 +1395,8 @@ async function scrapeProduct(url, options) {
   let puppeteerMeta = null;
   let axiosMeta = null;
   let dynamicHint = false;
+  let axiosDiagnostics = null;
+  let puppeteerDiagnostics = null;
 
   const proxyForAxios = pickProxyConfig();
 
@@ -1317,8 +1404,15 @@ async function scrapeProduct(url, options) {
     const axiosResult = await pRetry(() => fetchWithAxios(url, proxyForAxios), {
       retries: MAX_RETRIES,
     });
+    axiosDiagnostics = axiosResult;
     dynamicHint = axiosResult.isLikelyDynamic;
-    axiosMeta = { userAgent: axiosResult.userAgent, proxy: proxyForAxios?.original };
+    axiosMeta = {
+      userAgent: axiosResult.userAgent,
+      proxy: proxyForAxios?.original,
+      redirectCount: axiosResult.redirectCount ?? 0,
+      finalUrl: axiosResult.finalUrl ?? null,
+      visitedUrls: axiosResult.visitedUrls ?? null,
+    };
     axiosExtraction = extractFromHtml(
       axiosResult.html,
       url,
@@ -1340,6 +1434,7 @@ async function scrapeProduct(url, options) {
       const puppeteerResult = await pRetry(() => scrapeWithPuppeteer(url, options), {
         retries: MAX_RETRIES,
       });
+      puppeteerDiagnostics = puppeteerResult;
       puppeteerMeta = puppeteerResult.meta;
       const htmlExtraction = extractFromHtml(
         puppeteerResult.html,
@@ -1392,6 +1487,13 @@ async function scrapeProduct(url, options) {
       puppeteer: puppeteerMeta,
       axiosError: axiosError ? axiosError.message : null,
       puppeteerError: puppeteerError ? puppeteerError.message : null,
+      redirectCount: axiosDiagnostics?.redirectCount ?? null,
+      finalUrl: axiosDiagnostics?.finalUrl ?? null,
+      antiBotDetected:
+        puppeteerDiagnostics?.antiBotDetected ??
+        puppeteerMeta?.antiBotDetected ??
+        null,
+      pageUrl: puppeteerMeta?.pageUrl ?? null,
     },
     cached: false,
   };
