@@ -1788,6 +1788,9 @@ async function scrapeWithPuppeteer(url, options = {}) {
   const effectiveWaitAfterLoad = Math.max(0, waitAfterLoadMs + waitJitter);
   const dumpNetwork = options.dumpNetwork === true;
 
+  const puppeteerModule = await loadPuppeteer();
+  const TimeoutError = puppeteerModule?.errors?.TimeoutError || null;
+
   const { page, key } = await browserPool.acquire(proxyConfig, acquisitionLanguage);
   const networkPayloads = [];
   const networkDebug = [];
@@ -2043,10 +2046,38 @@ async function scrapeWithPuppeteer(url, options = {}) {
       viewport,
     });
 
-    await page.goto(url, {
-      waitUntil: ["domcontentloaded", "networkidle2"],
-      timeout: NAVIGATION_TIMEOUT,
-    });
+    try {
+      await page.goto(url, {
+        waitUntil: ["domcontentloaded", "networkidle2"],
+        timeout: NAVIGATION_TIMEOUT,
+      });
+    } catch (err) {
+      const isTimeoutError =
+        (TimeoutError && err instanceof TimeoutError) ||
+        err?.name === "TimeoutError" ||
+        /timeout/i.test(err?.message || "");
+
+      if (!isTimeoutError) {
+        throw err;
+      }
+
+      debugLog(
+        "Navigation timed out waiting for network idle, retrying with domcontentloaded",
+        err.message
+      );
+      logEvent("puppeteer_navigate_retry", {
+        url,
+        proxy: proxyConfig?.original || null,
+        userAgent,
+        viewport,
+        reason: err.message,
+      });
+
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: NAVIGATION_TIMEOUT,
+      });
+    }
 
     try {
       await page.waitForNetworkIdle({
