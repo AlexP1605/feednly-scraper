@@ -60,6 +60,11 @@ const CACHE_TTL = Math.max(
 );
 const cache = new NodeCache({ stdTTL: CACHE_TTL, checkperiod: 120, useClones: false });
 
+const MAX_AXIOS_REDIRECTS = Math.max(
+  0,
+  Number.parseInt(process.env.SCRAPER_AXIOS_MAX_REDIRECTS || "10", 10) || 10
+);
+
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
@@ -1027,7 +1032,7 @@ async function fetchWithAxios(url, proxyConfig) {
       "Sec-Fetch-User": "?1",
     },
     timeout: 30000,
-    maxRedirects: 5,
+    maxRedirects: MAX_AXIOS_REDIRECTS,
     decompress: true,
     responseType: "text",
     validateStatus: (status) => status >= 200 && status < 400,
@@ -1054,7 +1059,12 @@ async function fetchWithAxios(url, proxyConfig) {
   }
 
   const res = await axios.get(url, requestConfig);
-  debugLog("Axios fetch complete", { status: res.status, proxy: proxyConfig?.original });
+  const redirectCount = res.request?._redirectable?._redirectCount ?? 0;
+  debugLog("Axios fetch complete", {
+    status: res.status,
+    proxy: proxyConfig?.original,
+    redirects: redirectCount,
+  });
   const html = res.data;
   const jsonLdScripts = extractJsonLdScriptsFromHtml(html);
   const nextDataPayload = extractInlineNextData(html);
