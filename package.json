@@ -13,6 +13,8 @@
     "express": "^4.19.2",
     "node-cache": "^5.1.2",
     "puppeteer": "^22.4.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "p-retry": "^4.6.2"
   }
 }
