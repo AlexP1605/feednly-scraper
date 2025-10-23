@@ -89,11 +89,72 @@ function pickNavigatorOverrides() {
   ];
   const platforms = ["Win32", "MacIntel", "Linux x86_64"];
   const hardwarePool = [4, 6, 8];
+  const deviceMemoryPool = [4, 8, 16];
+  const maxTouchPointsPool = [0, 1, 2];
+  const vendorPool = ["Google Inc.", "Apple Computer, Inc.", "Mozilla Foundation"];
+  const pluginsPool = [2, 3, 4, 5];
   return {
     languages: languagesPool[Math.floor(Math.random() * languagesPool.length)],
     platform: platforms[Math.floor(Math.random() * platforms.length)],
     hardwareConcurrency: hardwarePool[Math.floor(Math.random() * hardwarePool.length)],
+    deviceMemory: deviceMemoryPool[Math.floor(Math.random() * deviceMemoryPool.length)],
+    maxTouchPoints:
+      maxTouchPointsPool[Math.floor(Math.random() * maxTouchPointsPool.length)],
+    vendor: vendorPool[Math.floor(Math.random() * vendorPool.length)],
+    pluginsLength: pluginsPool[Math.floor(Math.random() * pluginsPool.length)],
   };
+}
+
+function cleanHeaders(headers) {
+  const result = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (value !== undefined && value !== null && `${value}`.length > 0) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function buildSecChUaHeaders(userAgent) {
+  const ua = `${userAgent || ""}`;
+  const lower = ua.toLowerCase();
+  const headers = {};
+  if (lower.includes("chrome/")) {
+    const chromeMatch = ua.match(/Chrome\/(\d+)/i);
+    const version = chromeMatch?.[1] || "123";
+    const platform = lower.includes("mac os")
+      ? '"macOS"'
+      : lower.includes("linux")
+      ? '"Linux"'
+      : '"Windows"';
+    headers["Sec-CH-UA"] = `"Chromium";v="${version}", "Google Chrome";v="${version}", "Not=A?Brand";v="8"`;
+    headers["Sec-CH-UA-Mobile"] = "?0";
+    headers["Sec-CH-UA-Platform"] = platform;
+    headers["Sec-CH-UA-Full-Version-List"] = `"Chromium";v="${version}.0.0.0", "Google Chrome";v="${version}.0.0.0", "Not=A?Brand";v="8.0.0.0"`;
+    if (platform === '"Windows"') {
+      headers["Sec-CH-UA-Platform-Version"] = '"15.0.0"';
+    }
+  } else if (lower.includes("safari") && lower.includes("mac os")) {
+    headers["Sec-CH-UA"] = '"Not/A)Brand";v="99", "Safari";v="16", "Chromium";v="118"';
+    headers["Sec-CH-UA-Mobile"] = "?0";
+    headers["Sec-CH-UA-Platform"] = '"macOS"';
+  } else if (lower.includes("firefox/")) {
+    headers["Sec-CH-UA"] = '"Not/A)Brand";v="99", "Firefox";v="125", "Chromium";v="118"';
+    headers["Sec-CH-UA-Mobile"] = "?0";
+    headers["Sec-CH-UA-Platform"] = lower.includes("linux") ? '"Linux"' : '"Windows"';
+  }
+  return cleanHeaders(headers);
+}
+
+function buildNavigationHeaders(url) {
+  try {
+    const target = new URL(url);
+    return {
+      Referer: `${target.origin}/`,
+    };
+  } catch {
+    return {};
+  }
 }
 
 const CHROMIUM_CANDIDATES = [
@@ -112,18 +173,52 @@ const executableChecks = new Map();
 
 async function loadPuppeteer() {
   if (!puppeteerModulePromise) {
-    puppeteerModulePromise = import("puppeteer")
-      .then((mod) => mod?.default ?? mod)
-      .catch(async (err) => {
-        console.warn("⚠️ Failed to load puppeteer, trying puppeteer-core:", err.message);
-        return import("puppeteer-core")
+    puppeteerModulePromise = (async () => {
+      async function loadVanillaPuppeteer() {
+        return import("puppeteer")
           .then((mod) => mod?.default ?? mod)
-          .catch((innerErr) => {
-            puppeteerModulePromise = null;
-            console.error("❌ Unable to load Puppeteer module:", innerErr);
-            throw innerErr;
+          .catch(async (err) => {
+            console.warn(
+              "⚠️ Failed to load puppeteer, trying puppeteer-core:",
+              err.message
+            );
+            return import("puppeteer-core")
+              .then((mod) => mod?.default ?? mod)
+              .catch((innerErr) => {
+                puppeteerModulePromise = null;
+                console.error("❌ Unable to load Puppeteer module:", innerErr);
+                throw innerErr;
+              });
           });
-      });
+      }
+
+      try {
+        const puppeteerExtra = await import("puppeteer-extra").then(
+          (mod) => mod?.default ?? mod
+        );
+        try {
+          const stealthFactory = await import(
+            "puppeteer-extra-plugin-stealth"
+          ).then((mod) => mod?.default ?? mod);
+          if (stealthFactory && typeof puppeteerExtra.use === "function") {
+            puppeteerExtra.use(stealthFactory());
+            debugLog("Stealth plugin enabled for Puppeteer");
+          }
+        } catch (pluginErr) {
+          console.warn(
+            "⚠️ Puppeteer stealth plugin unavailable:",
+            pluginErr.message
+          );
+        }
+        return puppeteerExtra;
+      } catch (extraErr) {
+        console.warn(
+          "⚠️ Failed to load puppeteer-extra, falling back to puppeteer:",
+          extraErr.message
+        );
+        return loadVanillaPuppeteer();
+      }
+    })();
   }
   return puppeteerModulePromise;
 }
@@ -249,6 +344,10 @@ async function launchBrowser(proxyConfig) {
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    "--disable-blink-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--lang=fr-FR,fr",
   ];
 
   if (proxyConfig?.launchArg) {
@@ -901,12 +1000,26 @@ function detectDynamicPage(html) {
 
 async function fetchWithAxios(url, proxyConfig) {
   const userAgent = pickUserAgent();
+  const secChHeaders = buildSecChUaHeaders(userAgent);
+  const navigationHeaders = buildNavigationHeaders(url);
   const requestConfig = {
     headers: {
       "User-Agent": userAgent,
+      ...secChHeaders,
+      ...navigationHeaders,
+      "Accept-Encoding": "gzip, deflate, br",
       "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
       Accept:
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+      DNT: "1",
+      Connection: "keep-alive",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
     },
     timeout: 30000,
     maxRedirects: 5,
@@ -1021,9 +1134,55 @@ async function scrapeWithPuppeteer(url, options = {}) {
       Object.defineProperty(navigator, "hardwareConcurrency", {
         get: () => overrides.hardwareConcurrency,
       });
+      if (overrides.deviceMemory !== undefined) {
+        Object.defineProperty(navigator, "deviceMemory", {
+          get: () => overrides.deviceMemory,
+        });
+      }
+      if (overrides.maxTouchPoints !== undefined) {
+        Object.defineProperty(navigator, "maxTouchPoints", {
+          get: () => overrides.maxTouchPoints,
+        });
+      }
+      if (overrides.vendor) {
+        Object.defineProperty(navigator, "vendor", {
+          get: () => overrides.vendor,
+        });
+      }
+      if (overrides.pluginsLength) {
+        Object.defineProperty(navigator, "plugins", {
+          get: () =>
+            Array.from({ length: overrides.pluginsLength }).map((_, index) => ({
+              name: `Plugin ${index + 1}`,
+              filename: `plugin${index + 1}.dll`,
+              description: `Fake plugin ${index + 1}`,
+            })),
+        });
+      }
       Object.defineProperty(navigator, "webdriver", {
         get: () => false,
       });
+      Object.defineProperty(navigator, "pdfViewerEnabled", {
+        get: () => true,
+      });
+      window.chrome = window.chrome || { runtime: {} };
+      try {
+        const originalQuery = window.navigator.permissions?.query;
+        if (originalQuery) {
+          window.navigator.permissions.query = (parameters) => {
+            if (parameters && parameters.name === "notifications") {
+              const state =
+                typeof Notification !== "undefined" && Notification.permission
+                  ? Notification.permission
+                  : "default";
+              return Promise.resolve({ state });
+            }
+            return originalQuery(parameters);
+          };
+        }
+      } catch (err) {
+        void err;
+      }
     }, navigatorOverrides);
 
     if (proxyConfig?.credentials) {
