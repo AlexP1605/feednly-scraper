@@ -87,6 +87,35 @@ const sleep = (ms) =>
     setTimeout(resolve, Math.max(0, Number.isFinite(ms) ? ms : 0));
   });
 
+function buildNavigatorLanguages(preferredLanguage) {
+  const primary = `${preferredLanguage || "en-US"}`.trim() || "en-US";
+  const normalizedPrimary = primary.replace("_", "-");
+  const [baseLanguage] = normalizedPrimary.split("-");
+  const fallbacks = [normalizedPrimary];
+  if (baseLanguage && baseLanguage.length && baseLanguage.toLowerCase() !== normalizedPrimary.toLowerCase()) {
+    fallbacks.push(baseLanguage.toLowerCase());
+  }
+  if (!fallbacks.includes("en-US")) {
+    fallbacks.push("en-US");
+  }
+  if (!fallbacks.includes("en")) {
+    fallbacks.push("en");
+  }
+  return fallbacks;
+}
+
+function buildAcceptLanguageHeader(preferredLanguage) {
+  const languages = buildNavigatorLanguages(preferredLanguage);
+  return languages
+    .map((lang, index) => {
+      if (index === 0) return lang;
+      const weight = Math.max(0, 1 - index * 0.1);
+      const clampedWeight = weight > 0 ? weight : 0.1;
+      return `${lang};q=${clampedWeight.toFixed(1)}`;
+    })
+    .join(",");
+}
+
 const RAW_PROXY_POOL = (process.env.SCRAPER_PROXY_POOL || "")
   .split(/[\s,]+/)
   .map((entry) => entry.trim())
@@ -139,13 +168,8 @@ function pickViewport() {
   return { width, height, deviceScaleFactor };
 }
 
-function pickNavigatorOverrides() {
-  const languagesPool = [
-    ["en-US", "en"],
-    ["fr-FR", "fr", "en"],
-    ["es-ES", "es", "en"],
-    ["de-DE", "de", "en"],
-  ];
+function pickNavigatorOverrides(preferredLanguage) {
+  const languages = buildNavigatorLanguages(preferredLanguage);
   const platforms = ["Win32", "MacIntel", "Linux x86_64"];
   const hardwarePool = [4, 6, 8];
   const deviceMemoryPool = [4, 8, 16];
@@ -153,7 +177,8 @@ function pickNavigatorOverrides() {
   const vendorPool = ["Google Inc.", "Apple Computer, Inc.", "Mozilla Foundation"];
   const pluginsPool = [2, 3, 4, 5];
   return {
-    languages: languagesPool[Math.floor(Math.random() * languagesPool.length)],
+    languages,
+    primaryLanguage: languages[0] || "en-US",
     platform: platforms[Math.floor(Math.random() * platforms.length)],
     hardwareConcurrency: hardwarePool[Math.floor(Math.random() * hardwarePool.length)],
     deviceMemory: deviceMemoryPool[Math.floor(Math.random() * deviceMemoryPool.length)],
@@ -336,6 +361,19 @@ async function resolveChromiumExecutable() {
   return undefined;
 }
 
+function extractCountryCodeFromProxy(rawProxy, credentials) {
+  const samples = [];
+  if (credentials?.username) samples.push(credentials.username);
+  if (rawProxy) samples.push(rawProxy);
+  for (const sample of samples) {
+    const match = /-cc-([a-z]{2})/i.exec(sample);
+    if (match) {
+      return match[1].toUpperCase();
+    }
+  }
+  return null;
+}
+
 function normalizeProxyConfig(rawProxy, source = "pool") {
   if (!rawProxy) return null;
   let value = `${rawProxy}`.trim();
@@ -364,6 +402,7 @@ function normalizeProxyConfig(rawProxy, source = "pool") {
       : `${parsed.protocol}//${parsed.hostname}${
           parsed.port ? `:${parsed.port}` : ""
         }`;
+    const countryCode = extractCountryCodeFromProxy(rawProxy, credentials);
     return {
       key: `${parsed.protocol}//${parsed.hostname}:${parsed.port || ""}`.replace(
         /:+$/,
@@ -376,6 +415,7 @@ function normalizeProxyConfig(rawProxy, source = "pool") {
       protocol: parsed.protocol.replace(":", ""),
       hostname: parsed.hostname,
       port: parsed.port ? Number.parseInt(parsed.port, 10) : null,
+      countryCode,
       source,
     };
   } catch (err) {
@@ -419,27 +459,50 @@ class ProxyManager {
   }
 
   getProxy(options = {}) {
-    const { requireResidential = false, excludeKeys = new Set(), allowFallback = true } =
-      options;
-    const availablePool = this.pool.filter(
-      (proxy) => proxy && !excludeKeys.has(proxy.key) && !this._isBlacklisted(proxy.key)
-    );
-    if (availablePool.length) {
-      const choice = availablePool[Math.floor(Math.random() * availablePool.length)];
+    const {
+      requireResidential = false,
+      excludeKeys = new Set(),
+      allowFallback = true,
+      countryCode = null,
+    } = options;
+    const normalizedCountry = countryCode ? `${countryCode}`.trim().toUpperCase() : null;
+
+    const isUsable = (proxy) =>
+      proxy && !excludeKeys.has(proxy.key) && !this._isBlacklisted(proxy.key);
+
+    const pickFromList = (list) => {
+      if (!list.length) return null;
+      const choice = list[Math.floor(Math.random() * list.length)];
       this._touchStats(choice);
       return choice;
+    };
+
+    const filterByCountry = (collection) => {
+      const usable = collection.filter(isUsable);
+      if (!usable.length) return [];
+      if (!normalizedCountry) return usable;
+      const countryMatches = usable.filter(
+        (proxy) => proxy.countryCode && proxy.countryCode === normalizedCountry
+      );
+      if (countryMatches.length) {
+        return countryMatches;
+      }
+      return usable;
+    };
+
+    const availablePool = filterByCountry(this.pool);
+    const poolChoice = pickFromList(availablePool);
+    if (poolChoice) {
+      return poolChoice;
     }
+
     if (!allowFallback && requireResidential) {
       return null;
     }
-    const availableFallback = this.fallback.filter(
-      (proxy) => proxy && !excludeKeys.has(proxy.key) && !this._isBlacklisted(proxy.key)
-    );
+
+    const availableFallback = filterByCountry(this.fallback);
     if (availableFallback.length && (!requireResidential || allowFallback)) {
-      const choice =
-        availableFallback[Math.floor(Math.random() * availableFallback.length)];
-      this._touchStats(choice);
-      return choice;
+      return pickFromList(availableFallback);
     }
     return null;
   }
@@ -511,6 +574,134 @@ class ProxyManager {
 }
 
 const proxyManager = new ProxyManager(RAW_PROXY_POOL, FALLBACK_PROXY);
+
+const COUNTRY_LANGUAGE_MAP = {
+  FR: "fr-FR",
+  DE: "de-DE",
+  ES: "es-ES",
+  US: "en-US",
+};
+
+const KNOWN_DOMAIN_COUNTRY_MAP = new Map(
+  Object.entries({
+    "fnac.com": "FR",
+    "darty.com": "FR",
+    "amazon.com": "US",
+    "walmart.com": "US",
+    "target.com": "US",
+    "otto.de": "DE",
+    "mediamarkt.de": "DE",
+  })
+);
+
+const PATH_COUNTRY_MAP = {
+  "fr": "FR",
+  "fr-fr": "FR",
+  "de": "DE",
+  "de-de": "DE",
+  "es": "ES",
+  "es-es": "ES",
+  "us": "US",
+  "en-us": "US",
+};
+
+const DEFAULT_LANGUAGE = "en-US";
+
+function normalizeHostname(hostname) {
+  const lower = `${hostname || ""}`.toLowerCase();
+  return lower.startsWith("www.") ? lower.slice(4) : lower;
+}
+
+function detectCountryFromKnownDomain(hostname) {
+  const normalized = normalizeHostname(hostname);
+  for (const [domain, country] of KNOWN_DOMAIN_COUNTRY_MAP.entries()) {
+    if (normalized === domain || normalized.endsWith(`.${domain}`)) {
+      return country;
+    }
+  }
+  return null;
+}
+
+function detectCountryFromPath(pathname) {
+  if (!pathname) return null;
+  const segments = pathname
+    .split("/")
+    .map((segment) => segment.trim().toLowerCase())
+    .filter(Boolean);
+  if (!segments.length) return null;
+  const candidates = segments.slice(0, 2);
+  for (const segment of candidates) {
+    if (PATH_COUNTRY_MAP[segment]) {
+      return PATH_COUNTRY_MAP[segment];
+    }
+  }
+  return null;
+}
+
+function detectCountryFromTld(hostname) {
+  const normalized = normalizeHostname(hostname);
+  const parts = normalized.split(".");
+  if (!parts.length) return null;
+  const lastPart = parts[parts.length - 1];
+  if (lastPart.length === 2) {
+    const tldCountry = lastPart.toUpperCase();
+    if (COUNTRY_LANGUAGE_MAP[tldCountry]) {
+      return tldCountry;
+    }
+  }
+  return null;
+}
+
+function determineCountryAndLanguage(url) {
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname;
+    const pathname = parsed.pathname || "/";
+    const countryFromDomain = detectCountryFromKnownDomain(hostname);
+    const countryFromPath = detectCountryFromPath(pathname);
+    const countryFromTld = detectCountryFromTld(hostname);
+    const countryCode = countryFromDomain || countryFromPath || countryFromTld || null;
+    const language = COUNTRY_LANGUAGE_MAP[countryCode] || DEFAULT_LANGUAGE;
+    return { countryCode, language };
+  } catch {
+    return { countryCode: null, language: DEFAULT_LANGUAGE };
+  }
+}
+
+function pickProxyAndLangForUrl(url) {
+  const detection = determineCountryAndLanguage(url);
+  let proxyConfig = null;
+  if (proxyManager.hasResidentialProxy()) {
+    if (detection.countryCode) {
+      proxyConfig = proxyManager.getProxy({
+        requireResidential: true,
+        countryCode: detection.countryCode,
+      });
+    }
+    if (!proxyConfig) {
+      proxyConfig = proxyManager.getProxy({ requireResidential: true });
+    }
+    if (!proxyConfig) {
+      proxyConfig = proxyManager.getProxy();
+    }
+  }
+
+  const countryCode = detection.countryCode || null;
+  const language = detection.language || COUNTRY_LANGUAGE_MAP[countryCode] || DEFAULT_LANGUAGE;
+
+  const selection = {
+    proxyUrl: proxyConfig?.proxyUrl || null,
+    countryCode,
+    language,
+  };
+
+  if (proxyConfig) {
+    selection.proxyConfig = proxyConfig;
+    selection.proxyCountryCode = proxyConfig.countryCode || null;
+  }
+
+  return selection;
+}
 
 function buildProxyAgents(proxyConfig) {
   if (!proxyConfig?.proxyUrl) return {};
@@ -598,9 +789,17 @@ async function persistPuppeteerCookies(page, jar) {
   }
 }
 
-async function launchBrowser(proxyConfig) {
+async function launchBrowser(proxyConfig, language = DEFAULT_LANGUAGE) {
   const puppeteer = await loadPuppeteer();
   const executablePath = await resolveChromiumExecutable();
+  const normalizedLanguage = `${language || DEFAULT_LANGUAGE}`.replace("_", "-");
+  const navigatorLanguages = buildNavigatorLanguages(normalizedLanguage);
+  const primaryLanguage = navigatorLanguages[0] || "en-US";
+  const baseLanguage = primaryLanguage.split("-")[0] || primaryLanguage;
+  const langArgument =
+    baseLanguage && baseLanguage.toLowerCase() !== primaryLanguage.toLowerCase()
+      ? `${primaryLanguage},${baseLanguage}`
+      : primaryLanguage;
   const args = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -617,7 +816,7 @@ async function launchBrowser(proxyConfig) {
     "--disable-blink-features=AutomationControlled",
     "--no-first-run",
     "--no-default-browser-check",
-    "--lang=fr-FR,fr",
+    `--lang=${langArgument}`,
   ];
 
   if (proxyConfig?.launchArg) {
@@ -646,15 +845,17 @@ class BrowserPool {
     this.cleanupTimer.unref?.();
   }
 
-  async acquire(proxyConfig) {
-    const key = proxyConfig?.key || "default";
+  async acquire(proxyConfig, language = DEFAULT_LANGUAGE) {
+    const normalizedLanguage = `${language || DEFAULT_LANGUAGE}`.replace("_", "-");
+    const key = `${proxyConfig?.key || "default"}|${normalizedLanguage}`;
     let entry = this.pool.get(key);
     if (!entry) {
       entry = {
-        browserPromise: launchBrowser(proxyConfig),
+        browserPromise: launchBrowser(proxyConfig, normalizedLanguage),
         activePages: 0,
         lastUsed: Date.now(),
         proxyConfig,
+        language: normalizedLanguage,
       };
       this.pool.set(key, entry);
     }
@@ -706,6 +907,7 @@ class BrowserPool {
         proxy: entry.proxyConfig?.original || null,
         activePages: entry.activePages,
         lastUsed: entry.lastUsed,
+        language: entry.language || DEFAULT_LANGUAGE,
       });
     }
     return {
@@ -1343,6 +1545,7 @@ async function fetchWithAxios(url, options = {}) {
   const jar = options.jar || getCookieJarForUrl(url);
   const secChHeaders = buildSecChUaHeaders(userAgent);
   const navigationHeaders = buildNavigationHeaders(url);
+  const acceptLanguage = options.acceptLanguage || buildAcceptLanguageHeader(options.language);
   const redirectEntries = [];
   const visitedUrls = [url];
   const requestConfig = {
@@ -1351,7 +1554,7 @@ async function fetchWithAxios(url, options = {}) {
       ...secChHeaders,
       ...navigationHeaders,
       "Accept-Encoding": "gzip, deflate, br",
-      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept-Language": acceptLanguage,
       Accept:
         "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
       "Cache-Control": "no-cache",
@@ -1566,7 +1769,17 @@ async function scrapeWithPuppeteer(url, options = {}) {
   const jar = options.jar || getCookieJarForUrl(url);
   const userAgent = options.userAgent || pickUserAgent();
   const viewport = options.viewport || pickViewport();
-  const navigatorOverrides = options.navigatorOverrides || pickNavigatorOverrides();
+  const preferredLanguage = options.preferredLanguage || "en-US";
+  const acceptLanguage = options.acceptLanguage || buildAcceptLanguageHeader(preferredLanguage);
+  const navigatorOverrides =
+    options.navigatorOverrides || pickNavigatorOverrides(preferredLanguage);
+  if (!navigatorOverrides.languages) {
+    navigatorOverrides.languages = buildNavigatorLanguages(preferredLanguage);
+  }
+  if (!navigatorOverrides.primaryLanguage) {
+    navigatorOverrides.primaryLanguage = navigatorOverrides.languages[0] || preferredLanguage;
+  }
+  const acquisitionLanguage = navigatorOverrides.primaryLanguage || preferredLanguage;
   const waitSelectors = ensureArray(options.waitSelectors);
   const waitAfterLoadMs = Math.max(0, options.waitAfterLoadMs ?? DEFAULT_WAIT_AFTER_LOAD);
   const waitJitter = Math.round(
@@ -1575,7 +1788,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
   const effectiveWaitAfterLoad = Math.max(0, waitAfterLoadMs + waitJitter);
   const dumpNetwork = options.dumpNetwork === true;
 
-  const { page, key } = await browserPool.acquire(proxyConfig);
+  const { page, key } = await browserPool.acquire(proxyConfig, acquisitionLanguage);
   const networkPayloads = [];
   const networkDebug = [];
   const documentResponses = [];
@@ -1653,7 +1866,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
     await page.setUserAgent(userAgent);
     await page.setExtraHTTPHeaders({
       ...secChHeaders,
-      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept-Language": acceptLanguage,
       "Upgrade-Insecure-Requests": "1",
       "Sec-Fetch-Dest": "document",
       "Sec-Fetch-Mode": "navigate",
@@ -1671,6 +1884,9 @@ async function scrapeWithPuppeteer(url, options = {}) {
         try {
           Object.defineProperty(navigator, "languages", {
             get: () => overrides.languages,
+          });
+          Object.defineProperty(navigator, "language", {
+            get: () => overrides.primaryLanguage || overrides.languages?.[0] || "en-US",
           });
           Object.defineProperty(navigator, "platform", {
             get: () => overrides.platform,
@@ -1964,9 +2180,21 @@ async function scrapeProduct(url, options = {}) {
   }
 
   const jar = getCookieJarForUrl(url);
+  const localeSelection = pickProxyAndLangForUrl(url);
+  const selectedProxyConfig = localeSelection.proxyConfig || null;
+  const usedProxyKeys = new Set();
+  if (selectedProxyConfig?.key) {
+    usedProxyKeys.add(selectedProxyConfig.key);
+  }
   const sessionUserAgent = pickUserAgent();
   const sessionViewport = pickViewport();
-  const sessionNavigator = pickNavigatorOverrides();
+  const sessionNavigator = pickNavigatorOverrides(localeSelection.language);
+  const acceptLanguageHeader = buildAcceptLanguageHeader(localeSelection.language);
+
+  const countryLabel = (localeSelection.countryCode || "RANDOM")
+    .toString()
+    .toUpperCase();
+  console.log(`🌍 Using proxy ${countryLabel} | Lang ${localeSelection.language} | URL ${url}`);
 
   let axiosExtraction = createEmptyProduct();
   let puppeteerExtraction = createEmptyProduct();
@@ -1988,6 +2216,8 @@ async function scrapeProduct(url, options = {}) {
           proxyConfig,
           userAgent: sessionUserAgent,
           jar,
+          acceptLanguage: acceptLanguageHeader,
+          language: localeSelection.language,
         }),
       { retries: MAX_RETRIES }
     );
@@ -1996,12 +2226,13 @@ async function scrapeProduct(url, options = {}) {
 
   let axiosAntiBot = { detected: false, reasons: [] };
   try {
-    const axiosResult = await runAxios(null);
+    const axiosResult = await runAxios(selectedProxyConfig);
+    const initialProxyOriginal = selectedProxyConfig?.original || null;
     axiosDiagnostics = axiosResult;
     dynamicHint = axiosResult.isLikelyDynamic;
     axiosMeta = {
       userAgent: sessionUserAgent,
-      proxy: null,
+      proxy: initialProxyOriginal,
       redirectCount: axiosResult.redirectCount ?? 0,
       finalUrl: axiosResult.finalUrl ?? null,
       visitedUrls: axiosResult.visitedUrls ?? null,
@@ -2019,7 +2250,7 @@ async function scrapeProduct(url, options = {}) {
     axiosMeta.antiBotDetected = axiosAntiBot.detected;
     axiosMeta.antiBotReasons = axiosAntiBot.reasons;
     attempts.axios.push({
-      proxy: null,
+      proxy: initialProxyOriginal,
       success: true,
       antiBotDetected: axiosAntiBot.detected,
       reasons: axiosAntiBot.reasons,
@@ -2027,20 +2258,32 @@ async function scrapeProduct(url, options = {}) {
     });
   } catch (err) {
     axiosError = err;
+    const initialProxyOriginal = selectedProxyConfig?.original || null;
     logEvent("axios_error", {
       url,
       error: err.message,
-      proxy: null,
+      proxy: initialProxyOriginal,
     });
-    attempts.axios.push({ proxy: null, success: false, error: err.message });
+    attempts.axios.push({
+      proxy: initialProxyOriginal,
+      success: false,
+      error: err.message,
+    });
   }
 
   if (
     proxyManager.hasResidentialProxy() &&
     (axiosError || axiosAntiBot.detected)
   ) {
-    const proxyConfig = proxyManager.getProxy({ requireResidential: true });
+    const proxyConfig = proxyManager.getProxy({
+      requireResidential: true,
+      countryCode: localeSelection.countryCode,
+      excludeKeys: usedProxyKeys,
+    });
     if (proxyConfig) {
+      if (proxyConfig?.key) {
+        usedProxyKeys.add(proxyConfig.key);
+      }
       try {
         const axiosResult = await runAxios(proxyConfig);
         axiosDiagnostics = axiosResult;
@@ -2100,10 +2343,12 @@ async function scrapeProduct(url, options = {}) {
             ...options,
             waitSelectors: options.waitSelectors,
             waitAfterLoadMs: options.waitAfterLoadMs,
-            proxyConfig: null,
+            proxyConfig: selectedProxyConfig,
             userAgent: sessionUserAgent,
             viewport: sessionViewport,
             navigatorOverrides: sessionNavigator,
+            preferredLanguage: localeSelection.language,
+            acceptLanguage: acceptLanguageHeader,
             jar,
             dumpNetwork,
           }),
@@ -2125,7 +2370,7 @@ async function scrapeProduct(url, options = {}) {
       );
       puppeteerExtraction = mergeProductData(htmlExtraction, networkExtraction);
       attempts.puppeteer.push({
-        proxy: null,
+        proxy: selectedProxyConfig?.original || null,
         success: true,
         antiBotDetected: puppeteerResult.antiBotDetected,
         reasons: puppeteerResult.antiBotReasons,
@@ -2139,10 +2384,10 @@ async function scrapeProduct(url, options = {}) {
       logEvent("puppeteer_error", {
         url,
         error: err.message,
-        proxy: null,
+        proxy: selectedProxyConfig?.original || null,
       });
       attempts.puppeteer.push({
-        proxy: null,
+        proxy: selectedProxyConfig?.original || null,
         success: false,
         error: err.message,
       });
@@ -2153,8 +2398,15 @@ async function scrapeProduct(url, options = {}) {
       (puppeteerError || puppeteerDiagnostics?.antiBotDetected);
 
     if (needProxyRetry) {
-      const proxyConfig = proxyManager.getProxy({ requireResidential: true });
+      const proxyConfig = proxyManager.getProxy({
+        requireResidential: true,
+        countryCode: localeSelection.countryCode,
+        excludeKeys: usedProxyKeys,
+      });
       if (proxyConfig) {
+        if (proxyConfig?.key) {
+          usedProxyKeys.add(proxyConfig.key);
+        }
         try {
           const proxiedResult = await pRetry(
             () =>
@@ -2164,6 +2416,8 @@ async function scrapeProduct(url, options = {}) {
                 userAgent: sessionUserAgent,
                 viewport: sessionViewport,
                 navigatorOverrides: sessionNavigator,
+                preferredLanguage: localeSelection.language,
+                acceptLanguage: acceptLanguageHeader,
                 jar,
                 dumpNetwork,
               }),
@@ -2412,7 +2666,7 @@ setTimeout(async () => {
   try {
     console.log("⏳ Preloading Puppeteer...");
     const preloadProxy = proxyManager.getProxy();
-    const { page, key } = await browserPool.acquire(preloadProxy);
+    const { page, key } = await browserPool.acquire(preloadProxy, DEFAULT_LANGUAGE);
     await browserPool.release(key, page);
     console.log("✅ Puppeteer preloaded successfully!");
   } catch (err) {
