@@ -80,12 +80,42 @@ const NAVIGATION_TIMEOUT = Math.max(
 );
 const WAIT_JITTER_RATIO = 0.2;
 
+const ALLOWED_RESOURCE_TYPES = new Set([
+  "document",
+  "xhr",
+  "fetch",
+  "script",
+  "image",
+]);
+
 const BLOCKED_RESOURCE_TYPES = new Set([
   "font",
   "stylesheet",
   "media",
   "manifest",
+  "eventsource",
+  "beacon",
+  "imageset",
+  "other",
+  "websocket",
 ]);
+
+const BLOCKED_URL_KEYWORDS = [
+  "analytics",
+  "tracking",
+  "track",
+  "doubleclick",
+  "googletagmanager",
+  "tagmanager",
+  "facebook",
+  "pixel",
+  "beacon",
+  "gtm.js",
+  "optimizely",
+  "segment.io",
+  "sentry",
+  "appdynamics",
+];
 
 const BLOCKED_IMAGE_KEYWORDS = [
   "logo",
@@ -114,9 +144,23 @@ const PRODUCT_IMAGE_KEYWORDS = [
   "zoom",
   "gallery",
   "img/",
+  "/p/",
+  "/photo/",
+  "/images/",
 ];
 
-const JSON_SIGNAL_KEYWORDS = ["product", "price", "image", "variants"];
+const PRODUCT_IMAGE_JSON_KEYS = new Set([
+  "image",
+  "images",
+  "media",
+  "gallery",
+  "thumbnail",
+  "thumbnails",
+  "src",
+  "srcset",
+  "url",
+  "urls",
+]);
 
 function urlContainsKeyword(url, keywords) {
   if (!url) return false;
@@ -1209,12 +1253,18 @@ function collectImagesFromNode(node) {
   const imageFields = [
     node.image,
     node.images,
+    node.media,
+    node.gallery,
+    node.assets,
+    node.photos,
     node.imageUrl,
     node.photo,
-    node.photos,
     node.thumbnailUrl,
     node.thumbnail,
     node.contentUrl,
+    node.src,
+    node.srcset,
+    node.url,
   ];
   const urls = [];
   for (const field of imageFields) {
@@ -1339,11 +1389,13 @@ function flattenObjectDeep(value, seen = new Set()) {
 }
 
 function parseNextData(raw) {
-  if (!raw || typeof raw !== "string") return null;
+  if (!raw) return null;
+  if (typeof raw === "object") return raw;
+  if (typeof raw !== "string") return null;
   try {
     return JSON.parse(raw);
   } catch (err) {
-    debugLog("Unable to parse __NEXT_DATA__ payload:", err.message);
+    debugLog("Unable to parse state payload:", err.message);
     return null;
   }
 }
@@ -1485,7 +1537,24 @@ function extractInlineNextData(html) {
   return null;
 }
 
-function extractFromHtml(html, url, jsonLdScripts = null, nextDataPayload = null) {
+function extractInlineWindowState(html, variableName) {
+  if (!html || !variableName) return null;
+  const pattern = new RegExp(
+    `window\\.${variableName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&")}\\s*=\\s*(\\{.*?\\})<\\/`,
+    "s"
+  );
+  const match = html.match(pattern);
+  if (match) return match[1];
+  return null;
+}
+
+function extractFromHtml(
+  html,
+  url,
+  jsonLdScripts = null,
+  nextDataPayload = null,
+  additionalStatePayloads = []
+) {
   if (!html) return createEmptyProduct();
   const $ = cheerio.load(html);
   let title =
@@ -1508,6 +1577,23 @@ function extractFromHtml(html, url, jsonLdScripts = null, nextDataPayload = null
     nextDataPayload || extractInlineNextData(html) || $("#__NEXT_DATA__").html() || $("#__NUXT__").html();
   const nextData = parseNextData(inlineNextData);
   const nextDataExtraction = extractFromNextData(nextData);
+
+  const inlinePreloadedState = extractInlineWindowState(html, "__PRELOADED_STATE__");
+  const inlineInitialProps = extractInlineWindowState(html, "__INITIAL_PROPS__");
+
+  const stateExtractions = [];
+  const payloadsToProcess = [
+    inlinePreloadedState,
+    inlineInitialProps,
+    ...ensureArray(additionalStatePayloads),
+  ].filter(Boolean);
+  for (const payload of payloadsToProcess) {
+    const parsedState = parseNextData(payload);
+    if (parsedState) {
+      stateExtractions.push(extractFromNextData(parsedState));
+    }
+  }
+  const combinedStateExtraction = mergeProductData(...stateExtractions);
 
   if (!title) title = jsonLdExtraction.title || nextDataExtraction.title || title;
   if (!description)
@@ -1567,14 +1653,30 @@ function extractFromHtml(html, url, jsonLdScripts = null, nextDataPayload = null
       .map((img) => normalizeUrl(img, url))
       .filter((img) => img && isProductImageUrl(img))
   );
+  images.push(
+    ...ensureArray(combinedStateExtraction.images)
+      .map((img) => normalizeUrl(img, url))
+      .filter((img) => img && isProductImageUrl(img))
+  );
 
   const cleanedImages = filterProductImageList(images.filter(Boolean)).slice(0, 150);
   const variants = dedupeVariants([
     ...ensureArray(jsonLdExtraction.variants),
     ...ensureArray(nextDataExtraction.variants),
+    ...ensureArray(combinedStateExtraction.variants),
   ]);
 
-  return { title, description, price, images: cleanedImages, variants };
+  const merged = mergeProductData(jsonLdExtraction, nextDataExtraction, combinedStateExtraction);
+  if (!merged.title && title) merged.title = title;
+  if (!merged.description && description) merged.description = description;
+  if (!merged.price && price) merged.price = price;
+  merged.images = filterProductImageList([...(merged.images || []), ...cleanedImages]).slice(
+    0,
+    150
+  );
+  merged.variants = dedupeVariants([...(merged.variants || []), ...variants]);
+
+  return merged;
 }
 
 function safeJsonParse(body) {
@@ -1586,13 +1688,49 @@ function safeJsonParse(body) {
   }
 }
 
+function jsonContainsProductImageSignals(value, depth = 0, visited = new Set()) {
+  if (!value || typeof value !== "object" || visited.has(value) || depth > 50) {
+    return false;
+  }
+  visited.add(value);
+  if (!Array.isArray(value)) {
+    for (const key of Object.keys(value)) {
+      if (PRODUCT_IMAGE_JSON_KEYS.has(key.toLowerCase())) {
+        return true;
+      }
+    }
+  }
+  const entries = Array.isArray(value) ? value : Object.values(value);
+  for (const entry of entries) {
+    if (jsonContainsProductImageSignals(entry, depth + 1, visited)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasEssentialProductData(product) {
+  if (!product) return false;
+  const hasTitle = Boolean(product.title && product.title.trim());
+  const hasDescription = Boolean(product.description && product.description.trim());
+  const hasPrice = Boolean(product.price && `${product.price}`.trim());
+  const hasImages = Array.isArray(product.images) && product.images.length > 0;
+  return hasTitle && hasDescription && hasPrice && hasImages;
+}
+
 function extractFromNetworkPayloads(payloads) {
   if (!payloads?.length) return createEmptyProduct();
   let merged = createEmptyProduct();
   for (const payload of payloads) {
-    const parsed = safeJsonParse(payload?.body);
-    if (!parsed) continue;
-    const extraction = extractFromNextData(parsed);
+    let extraction = null;
+    if (payload?.product) {
+      extraction = payload.product;
+    } else {
+      const parsed = payload?.parsed || safeJsonParse(payload?.body);
+      if (!parsed) continue;
+      extraction = extractFromNextData(parsed);
+    }
+    if (!extraction) continue;
     merged = mergeProductData(merged, extraction);
   }
   return merged;
@@ -1830,11 +1968,15 @@ async function fetchWithAxios(url, options = {}) {
   const html = res.data;
   const jsonLdScripts = extractJsonLdScriptsFromHtml(html);
   const nextDataPayload = extractInlineNextData(html);
+  const preloadedStatePayload = extractInlineWindowState(html, "__PRELOADED_STATE__");
+  const initialPropsPayload = extractInlineWindowState(html, "__INITIAL_PROPS__");
+  const windowStates = [preloadedStatePayload, initialPropsPayload].filter(Boolean);
   const dynamic = detectDynamicPage(html);
   const result = {
     html,
     jsonLdScripts,
     nextDataPayload,
+    windowStates,
     userAgent,
     isLikelyDynamic: dynamic,
     redirectCount,
@@ -1970,11 +2112,14 @@ async function scrapeWithPuppeteer(url, options = {}) {
   const secChHeaders = buildSecChUaHeaders(userAgent);
   let consent = { clicked: false, selector: null };
   const requestStats = {
+    interceptedRequests: 0,
     allowedRequests: 0,
     blockedRequests: 0,
     transferredBytes: 0,
   };
   let documentBytesRecorded = false;
+  let networkProductSnapshot = createEmptyProduct();
+  let earlyCompletionTriggered = false;
 
   try {
     if (DEBUG) {
@@ -1992,24 +2137,25 @@ async function scrapeWithPuppeteer(url, options = {}) {
     });
 
     page.on("request", (request) => {
+      requestStats.interceptedRequests += 1;
       try {
         const resourceType = request.resourceType();
         const requestUrl = request.url();
-        let allow = true;
+        const lowerUrl = requestUrl.toLowerCase();
+        let allow = ALLOWED_RESOURCE_TYPES.has(resourceType) &&
+          !BLOCKED_RESOURCE_TYPES.has(resourceType);
 
-        if (BLOCKED_RESOURCE_TYPES.has(resourceType)) {
+        if (allow && BLOCKED_URL_KEYWORDS.some((keyword) => lowerUrl.includes(keyword))) {
           allow = false;
-        } else if (resourceType === "image") {
-          const lowerUrl = requestUrl.toLowerCase();
-          const allowedImage = urlContainsKeyword(lowerUrl, PRODUCT_IMAGE_KEYWORDS);
+        }
+
+        if (allow && resourceType === "image") {
+          const allowedImage = isProductImageUrl(requestUrl);
           const blockedImage = urlContainsKeyword(lowerUrl, BLOCKED_IMAGE_KEYWORDS);
           allow = allowedImage && !blockedImage;
-        } else if (![
-          "document",
-          "xhr",
-          "fetch",
-          "script",
-        ].includes(resourceType)) {
+        }
+
+        if (earlyCompletionTriggered && resourceType !== "document") {
           allow = false;
         }
 
@@ -2023,7 +2169,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       } catch (err) {
         debugLog("Request interception fallback:", err.message);
         try {
-          request.continue();
+          request.abort();
         } catch {}
       }
     });
@@ -2070,17 +2216,32 @@ async function scrapeWithPuppeteer(url, options = {}) {
         }
         const text = await response.text();
         if (!text || text.length > 1_000_000) return;
-        const lowerText = text.toLowerCase();
-        if (!JSON_SIGNAL_KEYWORDS.some((keyword) => lowerText.includes(keyword))) {
+        const parsed = safeJsonParse(text);
+        if (!parsed || !jsonContainsProductImageSignals(parsed)) {
           return;
         }
         if (!Number.isFinite(parsedLength)) {
           requestStats.transferredBytes += Buffer.byteLength(text, "utf8");
         }
+        const extraction = extractFromNextData(parsed);
+        if (extraction && hasProductSignals(extraction)) {
+          networkProductSnapshot = mergeProductData(networkProductSnapshot, extraction);
+          if (!earlyCompletionTriggered && hasEssentialProductData(networkProductSnapshot)) {
+            earlyCompletionTriggered = true;
+            page.evaluate(() => {
+              try {
+                if (typeof window !== "undefined" && window.stop) {
+                  window.stop();
+                }
+              } catch {}
+            }).catch(() => {});
+          }
+        }
         networkPayloads.push({
           url: response.url(),
-          body: text,
           status: response.status(),
+          product: extraction,
+          body: dumpNetwork ? text : undefined,
         });
         if (dumpNetwork) {
           networkDebug.push({
@@ -2309,16 +2470,18 @@ async function scrapeWithPuppeteer(url, options = {}) {
       });
     }
 
-    try {
-      await page.waitForNetworkIdle({
-        idleTime: 750,
-        timeout: Math.min(NAVIGATION_TIMEOUT, 20000),
-      });
-    } catch (err) {
-      debugLog("Network idle wait skipped:", err.message);
+    if (!earlyCompletionTriggered) {
+      try {
+        await page.waitForNetworkIdle({
+          idleTime: 750,
+          timeout: Math.min(NAVIGATION_TIMEOUT, 20000),
+        });
+      } catch (err) {
+        debugLog("Network idle wait skipped:", err.message);
+      }
     }
 
-    if (waitSelectors.length) {
+    if (!earlyCompletionTriggered && waitSelectors.length) {
       await waitForSelectors(
         page,
         waitSelectors,
@@ -2326,8 +2489,10 @@ async function scrapeWithPuppeteer(url, options = {}) {
       );
     }
 
-    consent = await handleConsentInterstitial(page);
-    if (consent.clicked) {
+    if (!earlyCompletionTriggered) {
+      consent = await handleConsentInterstitial(page);
+    }
+    if (!earlyCompletionTriggered && consent.clicked) {
       try {
         await page.waitForNetworkIdle({
           idleTime: 750,
@@ -2338,7 +2503,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       }
     }
 
-    if (effectiveWaitAfterLoad) {
+    if (!earlyCompletionTriggered && effectiveWaitAfterLoad) {
       await sleep(effectiveWaitAfterLoad);
     }
 
@@ -2352,33 +2517,50 @@ async function scrapeWithPuppeteer(url, options = {}) {
       (scripts) => scripts.map((s) => s.innerText)
     );
 
-    const nextDataPayload = await page
+    const windowPayloads = await page
       .evaluate(() => {
-        const nextScript = document.querySelector("#__NEXT_DATA__");
-        if (nextScript?.textContent) {
-          return nextScript.textContent;
-        }
-        if (typeof window !== "undefined" && window.__NEXT_DATA__) {
+        const safeSerialize = (value) => {
+          if (!value) return null;
           try {
-            return JSON.stringify(window.__NEXT_DATA__);
-          } catch {
+            return JSON.stringify(value);
+          } catch (err) {
             return null;
           }
+        };
+        const payload = {};
+        const nextScript = document.querySelector("#__NEXT_DATA__");
+        if (nextScript?.textContent) {
+          payload.nextData = nextScript.textContent;
+        } else if (typeof window !== "undefined" && window.__NEXT_DATA__) {
+          payload.nextData = safeSerialize(window.__NEXT_DATA__);
         }
         const nuxtScript = document.querySelector("#__NUXT__");
         if (nuxtScript?.textContent) {
-          return nuxtScript.textContent;
+          payload.nextData = payload.nextData || nuxtScript.textContent;
+        } else if (typeof window !== "undefined" && window.__NUXT__) {
+          payload.nextData = payload.nextData || safeSerialize(window.__NUXT__);
         }
-        if (typeof window !== "undefined" && window.__NUXT__) {
-          try {
-            return JSON.stringify(window.__NUXT__);
-          } catch {
-            return null;
-          }
+        const preloadedScript = document.querySelector("#__PRELOADED_STATE__");
+        if (preloadedScript?.textContent) {
+          payload.preloadedState = preloadedScript.textContent;
+        } else if (typeof window !== "undefined" && window.__PRELOADED_STATE__) {
+          payload.preloadedState = safeSerialize(window.__PRELOADED_STATE__);
         }
-        return null;
+        const initialPropsScript = document.querySelector("#__INITIAL_PROPS__");
+        if (initialPropsScript?.textContent) {
+          payload.initialProps = initialPropsScript.textContent;
+        } else if (typeof window !== "undefined" && window.__INITIAL_PROPS__) {
+          payload.initialProps = safeSerialize(window.__INITIAL_PROPS__);
+        }
+        return payload;
       })
-      .catch(() => null);
+      .catch(() => ({}));
+
+    const nextDataPayload = windowPayloads?.nextData || null;
+    const additionalWindowStates = [
+      windowPayloads?.preloadedState || null,
+      windowPayloads?.initialProps || null,
+    ].filter(Boolean);
 
     const antiBotAnalysis = analyzeAntiBotSignals({
       html,
@@ -2400,6 +2582,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       html,
       jsonLd,
       nextData: nextDataPayload,
+      windowStates: additionalWindowStates,
       networkPayloads,
       networkDebug: dumpNetwork ? networkDebug : undefined,
       documentResponses,
@@ -2425,6 +2608,13 @@ async function scrapeWithPuppeteer(url, options = {}) {
     console.error("❌ Puppeteer scraping error:", err);
     throw err;
   } finally {
+    try {
+      page.removeAllListeners("request");
+      page.removeAllListeners("response");
+      page.removeAllListeners("requestfailed");
+      page.removeAllListeners("requestfinished");
+      await page.setRequestInterception(false).catch(() => {});
+    } catch {}
     try {
       await persistPuppeteerCookies(page, jar);
     } catch (err) {
@@ -2479,7 +2669,8 @@ async function scrapeProduct(url, options = {}) {
       axiosResult.html,
       url,
       axiosResult.jsonLdScripts,
-      axiosResult.nextDataPayload
+      axiosResult.nextDataPayload,
+      axiosResult.windowStates
     );
     axiosAntiBot = analyzeAntiBotSignals({
       html: axiosResult.html,
@@ -2529,7 +2720,8 @@ async function scrapeProduct(url, options = {}) {
         puppeteerResult.html,
         url,
         puppeteerResult.jsonLd,
-        puppeteerResult.nextData
+        puppeteerResult.nextData,
+        puppeteerResult.windowStates
       );
       const networkExtraction = extractFromNetworkPayloads(
         puppeteerResult.networkPayloads
@@ -2567,11 +2759,8 @@ async function scrapeProduct(url, options = {}) {
     images: finalProduct.images || [],
   };
 
-  if (!dumpNetwork) {
-    cache.set(url, payload);
-  }
-
-  const totalRequests = (puppeteerStats?.allowedRequests || 0) + (axiosSuccess ? 1 : 0);
+  const interceptedRequests =
+    (puppeteerStats?.interceptedRequests || 0) + (axiosSuccess ? 1 : 0);
   const totalBytes = (puppeteerStats?.transferredBytes || 0) + axiosBytes;
   const proxyCountry = selectedProxyConfig?.countryCode
     ? String(selectedProxyConfig.countryCode).toUpperCase()
@@ -2579,19 +2768,21 @@ async function scrapeProduct(url, options = {}) {
   const proxyLabel = selectedProxyConfig
     ? `${proxyCountry} Proxy`.trim() || "Proxy"
     : "Direct";
-  let domainLabel;
-  try {
-    domainLabel = new URL(url).hostname || url;
-  } catch {
-    domainLabel = url;
-  }
   const durationSeconds = (Date.now() - scrapeStartedAt) / 1000;
-  const megabytes = totalBytes / (1024 * 1024);
-  console.log(
-    `🧭 [${proxyLabel}] ${totalRequests} requests, ${megabytes.toFixed(1)} MB transferred for ${domainLabel} (${durationSeconds.toFixed(
-      1
-    )}s)`
-  );
+  const transferMB = Number((totalBytes / (1024 * 1024)).toFixed(3));
+  payload.meta = {
+    ...(payload.meta || {}),
+    network: {
+      requests: interceptedRequests,
+      transferMB,
+      durationSeconds,
+      proxy: proxyLabel,
+    },
+  };
+
+  if (!dumpNetwork) {
+    cache.set(url, payload);
+  }
 
   return payload;
 }
@@ -2662,10 +2853,12 @@ app.get("/scrape", async (req, res) => {
       waitAfterLoadMs,
       dumpNetwork,
     });
-    res.json(result);
+    return res.json(result);
   } catch (err) {
     console.error("Scrape error:", err);
-    res.status(500).json({ ok: false, error: err.message || "Scrape failed" });
+    return res
+      .status(500)
+      .json({ ok: false, error: err.message || "Scrape failed" });
   }
 });
 
