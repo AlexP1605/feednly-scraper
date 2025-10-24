@@ -850,6 +850,43 @@ async function persistPuppeteerCookies(page, jar) {
   }
 }
 
+const CHROMIUM_LAUNCH_BASE_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-accelerated-2d-canvas",
+  "--disable-gpu",
+  "--disable-software-rasterizer",
+  "--disable-background-networking",
+  "--disable-background-timer-throttling",
+  "--disable-backgrounding-occluded-windows",
+  "--disable-breakpad",
+  "--disable-client-side-phishing-detection",
+  "--disable-component-update",
+  "--disable-default-apps",
+  "--disable-domain-reliability",
+  "--disable-hang-monitor",
+  "--disable-ipc-flooding-protection",
+  "--disable-popup-blocking",
+  "--disable-prompt-on-repost",
+  "--disable-renderer-backgrounding",
+  "--disable-sync",
+  "--no-first-run",
+  "--no-default-browser-check",
+  "--metrics-recording-only",
+  "--force-color-profile=srgb",
+  "--hide-scrollbars",
+  "--mute-audio",
+  "--no-zygote",
+  "--single-process",
+  "--ignore-certificate-errors",
+  "--disable-extensions",
+  "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+  "--disable-blink-features=AutomationControlled",
+  "--password-store=basic",
+  "--use-mock-keychain",
+];
+
 async function launchBrowser(proxyConfig, language = DEFAULT_LANGUAGE) {
   const puppeteer = await loadPuppeteer();
   const executablePath = await resolveChromiumExecutable();
@@ -861,34 +898,18 @@ async function launchBrowser(proxyConfig, language = DEFAULT_LANGUAGE) {
     baseLanguage && baseLanguage.toLowerCase() !== primaryLanguage.toLowerCase()
       ? `${primaryLanguage},${baseLanguage}`
       : primaryLanguage;
-  const args = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-accelerated-2d-canvas",
-    "--disable-gpu",
-    "--no-zygote",
-    "--single-process",
-    "--hide-scrollbars",
-    "--mute-audio",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-blink-features=AutomationControlled",
-    "--no-first-run",
-    "--no-default-browser-check",
-    `--lang=${langArgument}`,
-  ];
+  const args = [...CHROMIUM_LAUNCH_BASE_ARGS, `--lang=${langArgument}`];
 
   if (proxyConfig?.launchArg) {
     args.push(`--proxy-server=${proxyConfig.launchArg}`);
   }
 
   const launchOptions = {
-    headless: true,
+    headless: "new",
     args,
     executablePath,
     ignoreHTTPSErrors: true,
+    dumpio: false,
   };
 
   debugLog("Launching Chromium", { executablePath, proxy: proxyConfig?.original });
@@ -906,25 +927,73 @@ class BrowserPool {
     this.cleanupTimer.unref?.();
   }
 
-  async acquire(proxyConfig, language = DEFAULT_LANGUAGE) {
+  _attachBrowserLifecycle(key, entry) {
+    entry.browserPromise
+      .then((browser) => {
+        browser.once("disconnected", () => {
+          console.warn("⚠️ Browser disconnected, recycling", { key });
+          this.markUnhealthy(key).catch((err) =>
+            console.warn("⚠️ Failed to recycle browser after disconnect:", err.message)
+          );
+        });
+      })
+      .catch((err) => {
+        console.error("❌ Browser launch failed:", err.message);
+        this.pool.delete(key);
+      });
+  }
+
+  _createEntry(key, proxyConfig, language) {
+    const entry = {
+      browserPromise: launchBrowser(proxyConfig, language),
+      activePages: 0,
+      lastUsed: Date.now(),
+      proxyConfig,
+      language,
+    };
+
+    this._attachBrowserLifecycle(key, entry);
+
+    this.pool.set(key, entry);
+    return entry;
+  }
+
+  async acquire(proxyConfig, language = DEFAULT_LANGUAGE, attempt = 0) {
+    if (attempt > 3) {
+      throw new Error("Unable to acquire Puppeteer page after multiple attempts");
+    }
+
     const normalizedLanguage = `${language || DEFAULT_LANGUAGE}`.replace("_", "-");
     const key = `${proxyConfig?.key || "default"}|${normalizedLanguage}`;
-    let entry = this.pool.get(key);
-    if (!entry) {
-      entry = {
-        browserPromise: launchBrowser(proxyConfig, normalizedLanguage),
-        activePages: 0,
-        lastUsed: Date.now(),
-        proxyConfig,
-        language: normalizedLanguage,
-      };
-      this.pool.set(key, entry);
+    let entry = this.pool.get(key) || this._createEntry(key, proxyConfig, normalizedLanguage);
+
+    try {
+      const browser = await entry.browserPromise;
+      if (!browser?.isConnected?.()) {
+        throw new Error("Browser disconnected");
+      }
+
+      const page = await browser.newPage();
+      page.once("close", () => {
+        const latestEntry = this.pool.get(key);
+        if (latestEntry) {
+          latestEntry.activePages = Math.max(0, latestEntry.activePages - 1);
+          latestEntry.lastUsed = Date.now();
+        }
+      });
+      page.on("error", (err) => {
+        console.warn("⚠️ Puppeteer page error, recycling browser:", err.message);
+        this.markUnhealthy(key).catch(() => {});
+      });
+
+      entry.activePages += 1;
+      entry.lastUsed = Date.now();
+      return { page, browser, key, entry };
+    } catch (err) {
+      console.warn("⚠️ Failed to acquire page, restarting browser:", err.message);
+      await this.markUnhealthy(key).catch(() => {});
+      return this.acquire(proxyConfig, language, attempt + 1);
     }
-    const browser = await entry.browserPromise;
-    const page = await browser.newPage();
-    entry.activePages += 1;
-    entry.lastUsed = Date.now();
-    return { page, browser, key, entry };
   }
 
   async release(key, page) {
@@ -937,9 +1006,35 @@ class BrowserPool {
       console.warn("⚠️ Failed to close Puppeteer page:", err.message);
     }
     if (entry) {
-      entry.activePages = Math.max(0, entry.activePages - 1);
       entry.lastUsed = Date.now();
     }
+  }
+
+  async markUnhealthy(key) {
+    const entry = this.pool.get(key);
+    if (!entry) return;
+    if (entry.restarting) return entry.restarting;
+
+    entry.restarting = (async () => {
+      try {
+        const browser = await entry.browserPromise.catch(() => null);
+        if (browser) {
+          try {
+            await browser.close();
+          } catch (closeErr) {
+            debugLog("Browser close error during restart:", closeErr.message);
+          }
+        }
+      } finally {
+        entry.browserPromise = launchBrowser(entry.proxyConfig, entry.language);
+        this._attachBrowserLifecycle(key, entry);
+        entry.lastUsed = Date.now();
+        entry.restarting = null;
+      }
+      return entry.browserPromise;
+    })();
+
+    return entry.restarting;
   }
 
   async cleanup() {
@@ -969,6 +1064,7 @@ class BrowserPool {
         activePages: entry.activePages,
         lastUsed: entry.lastUsed,
         language: entry.language || DEFAULT_LANGUAGE,
+        restarting: Boolean(entry.restarting),
       });
     }
     return {
