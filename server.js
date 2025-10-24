@@ -38,8 +38,31 @@ function logBrowserClosed() {
   console.log("🧹 Browser closed");
 }
 
-function scheduleShutdown() {
-  const timer = setTimeout(() => process.exit(0), 1000);
+let serverClosing = false;
+let shutdownTimer = null;
+
+const RESPONSE_DRAIN_DELAY_MS = 3000;
+
+function cancelScheduledShutdown() {
+  serverClosing = false;
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = null;
+  }
+}
+
+function scheduleShutdown(delayMs = 5000) {
+  serverClosing = true;
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+  }
+  const timer = setTimeout(() => {
+    if (!serverClosing) {
+      return;
+    }
+    process.exit(0);
+  }, delayMs);
+  shutdownTimer = timer;
   if (typeof timer?.unref === "function") {
     timer.unref();
   }
@@ -892,7 +915,6 @@ async function persistPuppeteerCookies(page, jar) {
         sameSite: cookie.sameSite?.toLowerCase?.(),
       });
       await jar.setCookie(toughCookie, cookieUrl);
-      debugLog("Cookie persisted", { cookie: cookieString, url: cookieUrl });
     }
   } catch (err) {
     debugLog("persistPuppeteerCookies failed:", err.message);
@@ -1967,9 +1989,13 @@ async function scrapeWithPuppeteer(url, options = {}) {
 
   try {
     if (DEBUG) {
-      page.on("console", (msg) =>
-        console.log(`🖥️ [browser:${msg.type()}]`, msg.text())
-      );
+      page.on("console", (msg) => {
+        const text = msg.text();
+        if (text.includes("Failed to load resource") || text.includes("Cookie persisted")) {
+          return;
+        }
+        console.log(`🖥️ [browser:${msg.type()}]`, text);
+      });
       page.on("pageerror", (err) => debugLog("Page error", err));
       page.on("error", (err) => debugLog("Page crashed", err));
     }
@@ -2096,7 +2122,11 @@ async function scrapeWithPuppeteer(url, options = {}) {
           });
         }
       } catch (err) {
-        debugLog("Failed to read network response:", err.message);
+        const message = err?.message || "";
+        if (message.includes("net::ERR_FAILED")) {
+          return;
+        }
+        debugLog("Failed to read network response:", message);
       }
     });
 
@@ -2676,12 +2706,14 @@ app.get("/debug", (req, res) => {
 });
 
 app.get("/scrape", async (req, res) => {
+  cancelScheduledShutdown();
   res.set("Cache-Control", "no-store");
   const url = req.query.url;
   if (!url) {
     res
       .status(400)
       .json({ ok: false, error: "Missing URL query param (?url=https://...)" });
+    await sleep(RESPONSE_DRAIN_DELAY_MS);
     scheduleShutdown();
     return;
   }
@@ -2711,12 +2743,14 @@ app.get("/scrape", async (req, res) => {
       dumpNetwork,
     });
     res.json(result);
+    await sleep(RESPONSE_DRAIN_DELAY_MS);
     scheduleShutdown();
     return;
   } catch (err) {
     res
       .status(500)
       .json({ ok: false, error: err.message || "Scrape failed" });
+    await sleep(RESPONSE_DRAIN_DELAY_MS);
     scheduleShutdown();
     return;
   }
@@ -2732,7 +2766,17 @@ server.on("error", (err) => {
 });
 
 async function gracefulShutdown() {
-  server.close(() => process.exit(0));
+  serverClosing = true;
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = null;
+  }
+  server.close(() => {
+    if (!serverClosing) {
+      return;
+    }
+    process.exit(0);
+  });
 }
 
 process.on("SIGINT", gracefulShutdown);
