@@ -2006,7 +2006,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       }
     });
 
-    page.on("request", (request) => {
+    page.on("request", async (request) => {
       requestStats.interceptedRequests += 1;
       try {
         const resourceType = request.resourceType();
@@ -2031,15 +2031,19 @@ async function scrapeWithPuppeteer(url, options = {}) {
 
         if (allow) {
           requestStats.allowedRequests += 1;
-          request.continue();
+          await request.continue().catch((err) => {
+            debugLog("Request continue failed:", err?.message || err);
+          });
         } else {
           requestStats.blockedRequests += 1;
-          request.abort();
+          await request.abort().catch((err) => {
+            debugLog("Request abort failed:", err?.message || err);
+          });
         }
       } catch (err) {
         debugLog("Request interception fallback:", err.message);
         try {
-          request.abort();
+          await request.abort().catch(() => {});
         } catch {}
       }
     });
