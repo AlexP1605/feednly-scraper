@@ -193,6 +193,91 @@ const PRODUCT_IMAGE_JSON_KEYS = new Set([
   "urls",
 ]);
 
+const ZARA_HOSTNAME_REGEX = /(?:^|\.)zara\.com$/i;
+const ZARA_PLACEHOLDER_KEYWORDS = ["transparent-background", "stdstatic"];
+
+function isZaraHostname(hostname) {
+  if (!hostname) return false;
+  try {
+    const normalized = hostname.trim().toLowerCase();
+    return ZARA_HOSTNAME_REGEX.test(normalized);
+  } catch {
+    return false;
+  }
+}
+
+function isZaraUrl(candidate) {
+  if (!candidate) return false;
+  try {
+    const parsed = new URL(candidate);
+    return isZaraHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function filterZaraImageUrls(images) {
+  const prepared = ensureArray(images)
+    .map((url) => `${url}`.trim())
+    .filter((url) => {
+      if (!url) return false;
+      const lower = url.toLowerCase();
+      if (!lower.includes(".jpg")) return false;
+      return !ZARA_PLACEHOLDER_KEYWORDS.some((keyword) => lower.includes(keyword));
+    });
+  return dedupeImages(prepared);
+}
+
+async function extractZaraImagesFromPage(page, timeoutMs = 15000) {
+  if (!page) return [];
+  try {
+    await page.waitForFunction(
+      () => {
+        const media = window.zara?.product?.detail?.media;
+        if (!media || !Array.isArray(media.images)) {
+          return false;
+        }
+        return media.images.some((image) => {
+          const path = image?.path || image?.url || image?.src;
+          return typeof path === "string" && path.trim().length > 0;
+        });
+      },
+      { timeout: Math.max(1000, Math.min(timeoutMs, NAVIGATION_TIMEOUT)) }
+    );
+  } catch (err) {
+    debugLog("Zara waitForFunction skipped:", err?.message || err);
+  }
+
+  const urls = await page
+    .evaluate(() => {
+      const detail = window.zara?.product?.detail;
+      if (!detail?.media?.images) return [];
+      const toAbsoluteUrl = (raw) => {
+        if (!raw || typeof raw !== "string") return null;
+        const trimmed = raw.trim();
+        if (!trimmed) return null;
+        if (/^https?:\/\//i.test(trimmed)) return trimmed;
+        if (trimmed.startsWith("//")) return `https:${trimmed}`;
+        try {
+          return new URL(trimmed, window.location.href).toString();
+        } catch (err) {
+          try {
+            return new URL(trimmed, window.location.origin).toString();
+          } catch {
+            return trimmed;
+          }
+        }
+      };
+      return detail.media.images
+        .map((image) => image?.path || image?.url || image?.src || null)
+        .map(toAbsoluteUrl)
+        .filter(Boolean);
+    })
+    .catch(() => []);
+
+  return filterZaraImageUrls(urls);
+}
+
 function urlContainsKeyword(url, keywords) {
   if (!url) return false;
   const value = typeof url === "string" ? url : `${url}`;
@@ -1986,6 +2071,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
   let documentBytesRecorded = false;
   let networkProductSnapshot = createEmptyProduct();
   let earlyCompletionTriggered = false;
+  let zaraImages = [];
 
   try {
     if (DEBUG) {
@@ -2385,7 +2471,16 @@ async function scrapeWithPuppeteer(url, options = {}) {
       await sleep(effectiveWaitAfterLoad);
     }
 
-    const pageUrl = page.url();
+    const currentUrl = page.url();
+    if (isZaraUrl(currentUrl) || isZaraUrl(url)) {
+      try {
+        zaraImages = await extractZaraImagesFromPage(page);
+      } catch (err) {
+        debugLog("Failed to extract Zara images:", err?.message || err);
+      }
+    }
+
+    const pageUrl = currentUrl;
     const html = await page.content();
     if (!documentBytesRecorded) {
       requestStats.transferredBytes += Buffer.byteLength(html || "", "utf8");
@@ -2457,6 +2552,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       navigationChain,
       consent,
       requestStats,
+      zaraImages,
       antiBotDetected: antiBotAnalysis.detected,
       antiBotReasons: antiBotAnalysis.reasons,
       meta: {
@@ -2540,6 +2636,7 @@ async function scrapeProduct(url, options = {}) {
     let axiosBytes = 0;
     let axiosSuccess = false;
     let dynamicHint = false;
+    let axiosFinalUrl = null;
 
     try {
       const axiosResult = await fetchWithAxios(url, {
@@ -2549,6 +2646,7 @@ async function scrapeProduct(url, options = {}) {
         acceptLanguage: acceptLanguageHeader,
         language: localeSelection.language,
       });
+      axiosFinalUrl = axiosResult.finalUrl || null;
       axiosBytes = Buffer.byteLength(axiosResult.html || "", "utf8");
       axiosExtraction = extractFromHtml(
         axiosResult.html,
@@ -2584,10 +2682,13 @@ async function scrapeProduct(url, options = {}) {
     let puppeteerExtraction = createEmptyProduct();
     let puppeteerStats = null;
     let puppeteerError = null;
+    let puppeteerResult = null;
+    let puppeteerZaraImages = [];
+    let puppeteerPageUrl = null;
 
     if (shouldUsePuppeteer) {
       try {
-        const puppeteerResult = await scrapeWithPuppeteer(url, {
+        puppeteerResult = await scrapeWithPuppeteer(url, {
           ...options,
           waitSelectors: options.waitSelectors,
           waitAfterLoadMs: options.waitAfterLoadMs,
@@ -2601,6 +2702,8 @@ async function scrapeProduct(url, options = {}) {
           dumpNetwork,
         });
         puppeteerStats = puppeteerResult.requestStats || null;
+        puppeteerZaraImages = ensureArray(puppeteerResult.zaraImages);
+        puppeteerPageUrl = puppeteerResult?.meta?.pageUrl || null;
         const htmlExtraction = extractFromHtml(
           puppeteerResult.html,
           url,
@@ -2623,6 +2726,23 @@ async function scrapeProduct(url, options = {}) {
     }
 
     const finalProduct = mergeProductData(axiosExtraction, puppeteerExtraction);
+
+    const zaraContextUrl =
+      (puppeteerPageUrl && isZaraUrl(puppeteerPageUrl) ? puppeteerPageUrl : null) ||
+      (axiosFinalUrl && isZaraUrl(axiosFinalUrl) ? axiosFinalUrl : null) ||
+      (isZaraUrl(url) ? url : null);
+
+    if (zaraContextUrl) {
+      const combinedZaraImages = filterZaraImageUrls([
+        ...puppeteerZaraImages,
+        ...ensureArray(finalProduct.images),
+      ]);
+      if (combinedZaraImages.length) {
+        finalProduct.images = combinedZaraImages;
+      } else {
+        finalProduct.images = filterZaraImageUrls(finalProduct.images);
+      }
+    }
 
     if (!hasProductSignals(finalProduct)) {
       if (axiosError && puppeteerError) {
@@ -2664,6 +2784,8 @@ async function scrapeProduct(url, options = {}) {
         proxy: proxyLabel,
       },
     };
+
+    payload.meta.imagesFound = ensureArray(finalProduct.images).length;
 
     if (!dumpNetwork) {
       cache.set(url, payload);
