@@ -12,9 +12,6 @@ import { constants as fsConstants } from "node:fs";
 const app = express();
 app.set("etag", false);
 
-process.on("uncaughtException", (err) => console.error("❌ Uncaught exception:", err));
-process.on("unhandledRejection", (reason) => console.error("⚠️ Unhandled rejection:", reason));
-
 const DEBUG = process.env.DEBUG === "true";
 
 function debugLog(...args) {
@@ -23,17 +20,28 @@ function debugLog(...args) {
   }
 }
 
-function logEvent(event, data = {}) {
-  try {
-    console.log(
-      JSON.stringify({
-        timestamp: new Date().toISOString(),
-        event,
-        ...data,
-      })
-    );
-  } catch (err) {
-    console.log(event, data);
+function logEvent() {}
+
+function logStart(url) {
+  console.log(`🪲 Starting scrape for URL ${url}`);
+}
+
+function logSuccess() {
+  console.log("✅ success");
+}
+
+function logErrorMessage(message) {
+  console.log(`❌ error: ${message}`);
+}
+
+function logBrowserClosed() {
+  console.log("🧹 Browser closed");
+}
+
+function scheduleShutdown() {
+  const timer = setTimeout(() => process.exit(0), 1000);
+  if (typeof timer?.unref === "function") {
+    timer.unref();
   }
 }
 
@@ -62,7 +70,7 @@ function getCookieJarForUrl(url) {
 const portValue = process.env.PORT;
 let PORT = Number.parseInt(`${portValue ?? ""}`.trim(), 10);
 if (!Number.isFinite(PORT) || PORT <= 0) {
-  console.warn(`Invalid PORT "${portValue}", fallback to 8080.`);
+  debugLog(`Invalid PORT "${portValue}", fallback to 8080.`);
   PORT = 8080;
 }
 
@@ -372,15 +380,15 @@ async function loadPuppeteer() {
         return import("puppeteer")
           .then((mod) => mod?.default ?? mod)
           .catch(async (err) => {
-            console.warn(
-              "⚠️ Failed to load puppeteer, trying puppeteer-core:",
+            debugLog(
+              "Failed to load puppeteer, trying puppeteer-core:",
               err.message
             );
             return import("puppeteer-core")
               .then((mod) => mod?.default ?? mod)
               .catch((innerErr) => {
                 puppeteerModulePromise = null;
-                console.error("❌ Unable to load Puppeteer module:", innerErr);
+                debugLog("Unable to load Puppeteer module:", innerErr);
                 throw innerErr;
               });
           });
@@ -399,15 +407,12 @@ async function loadPuppeteer() {
             debugLog("Stealth plugin enabled for Puppeteer");
           }
         } catch (pluginErr) {
-          console.warn(
-            "⚠️ Puppeteer stealth plugin unavailable:",
-            pluginErr.message
-          );
+          debugLog("Puppeteer stealth plugin unavailable:", pluginErr.message);
         }
         return puppeteerExtra;
       } catch (extraErr) {
-        console.warn(
-          "⚠️ Failed to load puppeteer-extra, falling back to puppeteer:",
+        debugLog(
+          "Failed to load puppeteer-extra, falling back to puppeteer:",
           extraErr.message
         );
         return loadVanillaPuppeteer();
@@ -524,7 +529,7 @@ function normalizeProxyConfig(rawProxy, source = "pool") {
       source,
     };
   } catch (err) {
-    console.warn("⚠️ Invalid proxy entry skipped:", rawProxy, err.message);
+    debugLog("Invalid proxy entry skipped:", rawProxy, err.message);
     return null;
   }
 }
@@ -817,7 +822,7 @@ function buildProxyAgents(proxyConfig) {
       : new HttpProxyAgent(proxyUrl);
     return { httpAgent: agent, httpsAgent: agent };
   } catch (err) {
-    console.warn("⚠️ Failed to create proxy agent:", err.message);
+    debugLog("Failed to create proxy agent:", err.message);
     return {};
   }
 }
@@ -961,178 +966,6 @@ async function launchBrowser(proxyConfig, language = DEFAULT_LANGUAGE) {
   debugLog("Chromium launched");
   return browser;
 }
-
-class BrowserPool {
-  constructor() {
-    this.pool = new Map();
-    this.cleanupTimer = setInterval(() => {
-      this.cleanup().catch((err) => console.warn("⚠️ Browser cleanup failed:", err.message));
-    }, 60000);
-    this.cleanupTimer.unref?.();
-  }
-
-  _attachBrowserLifecycle(key, entry) {
-    entry.browserPromise
-      .then((browser) => {
-        browser.once("disconnected", () => {
-          console.warn("⚠️ Browser disconnected, recycling", { key });
-          this.markUnhealthy(key).catch((err) =>
-            console.warn("⚠️ Failed to recycle browser after disconnect:", err.message)
-          );
-        });
-      })
-      .catch((err) => {
-        console.error("❌ Browser launch failed:", err.message);
-        this.pool.delete(key);
-      });
-  }
-
-  _createEntry(key, proxyConfig, language) {
-    const entry = {
-      browserPromise: launchBrowser(proxyConfig, language),
-      activePages: 0,
-      lastUsed: Date.now(),
-      proxyConfig,
-      language,
-    };
-
-    this._attachBrowserLifecycle(key, entry);
-
-    this.pool.set(key, entry);
-    return entry;
-  }
-
-  async acquire(proxyConfig, language = DEFAULT_LANGUAGE, attempt = 0) {
-    if (attempt > 3) {
-      throw new Error("Unable to acquire Puppeteer page after multiple attempts");
-    }
-
-    const normalizedLanguage = `${language || DEFAULT_LANGUAGE}`.replace("_", "-");
-    const key = `${proxyConfig?.key || "default"}|${normalizedLanguage}`;
-    let entry = this.pool.get(key) || this._createEntry(key, proxyConfig, normalizedLanguage);
-
-    try {
-      const browser = await entry.browserPromise;
-      if (!browser?.isConnected?.()) {
-        throw new Error("Browser disconnected");
-      }
-
-      const page = await browser.newPage();
-      page.once("close", () => {
-        const latestEntry = this.pool.get(key);
-        if (latestEntry) {
-          latestEntry.activePages = Math.max(0, latestEntry.activePages - 1);
-          latestEntry.lastUsed = Date.now();
-        }
-      });
-      page.on("error", (err) => {
-        console.warn("⚠️ Puppeteer page error, recycling browser:", err.message);
-        this.markUnhealthy(key).catch(() => {});
-      });
-
-      entry.activePages += 1;
-      entry.lastUsed = Date.now();
-      return { page, browser, key, entry };
-    } catch (err) {
-      console.warn("⚠️ Failed to acquire page, restarting browser:", err.message);
-      await this.markUnhealthy(key).catch(() => {});
-      return this.acquire(proxyConfig, language, attempt + 1);
-    }
-  }
-
-  async release(key, page) {
-    const entry = this.pool.get(key);
-    try {
-      if (page && !page.isClosed()) {
-        await page.close();
-      }
-    } catch (err) {
-      console.warn("⚠️ Failed to close Puppeteer page:", err.message);
-    }
-    if (entry) {
-      entry.lastUsed = Date.now();
-    }
-  }
-
-  async markUnhealthy(key) {
-    const entry = this.pool.get(key);
-    if (!entry) return;
-    if (entry.restarting) return entry.restarting;
-
-    entry.restarting = (async () => {
-      try {
-        const browser = await entry.browserPromise.catch(() => null);
-        if (browser) {
-          try {
-            await browser.close();
-          } catch (closeErr) {
-            debugLog("Browser close error during restart:", closeErr.message);
-          }
-        }
-      } finally {
-        entry.browserPromise = launchBrowser(entry.proxyConfig, entry.language);
-        this._attachBrowserLifecycle(key, entry);
-        entry.lastUsed = Date.now();
-        entry.restarting = null;
-      }
-      return entry.browserPromise;
-    })();
-
-    return entry.restarting;
-  }
-
-  async cleanup() {
-    const now = Date.now();
-    for (const [key, entry] of this.pool.entries()) {
-      if (!entry) continue;
-      if (entry.activePages === 0 && now - entry.lastUsed > 2 * 60 * 1000) {
-        try {
-          const browser = await entry.browserPromise;
-          await browser.close();
-        } catch (err) {
-          debugLog("Browser close error during cleanup:", err.message);
-        }
-        this.pool.delete(key);
-      }
-    }
-  }
-
-  getHealth() {
-    const summary = [];
-    let totalActivePages = 0;
-    for (const entry of this.pool.values()) {
-      if (!entry) continue;
-      totalActivePages += entry.activePages;
-      summary.push({
-        proxy: entry.proxyConfig?.original || null,
-        activePages: entry.activePages,
-        lastUsed: entry.lastUsed,
-        language: entry.language || DEFAULT_LANGUAGE,
-        restarting: Boolean(entry.restarting),
-      });
-    }
-    return {
-      openBrowsers: summary.length,
-      totalActivePages,
-      instances: summary,
-    };
-  }
-
-  async shutdown() {
-    clearInterval(this.cleanupTimer);
-    for (const entry of this.pool.values()) {
-      try {
-        const browser = await entry.browserPromise;
-        await browser.close();
-      } catch (err) {
-        debugLog("Browser close error during shutdown:", err.message);
-      }
-    }
-    this.pool.clear();
-  }
-}
-
-const browserPool = new BrowserPool();
 
 function createEmptyProduct() {
   return {
@@ -2001,7 +1834,7 @@ async function waitForSelectors(page, selectors, timeout) {
         await page.waitForSelector(selector, { timeout });
       }
     } catch (err) {
-      console.warn(`⚠️ Timeout waiting for selector "${selector}":`, err.message);
+      debugLog(`Timeout waiting for selector "${selector}":`, err.message);
     }
   }
 }
@@ -2104,7 +1937,18 @@ async function scrapeWithPuppeteer(url, options = {}) {
   const puppeteerModule = await loadPuppeteer();
   const TimeoutError = puppeteerModule?.errors?.TimeoutError || null;
 
-  const { page, key } = await browserPool.acquire(proxyConfig, acquisitionLanguage);
+  let browser = null;
+  let page = null;
+  try {
+    browser = await launchBrowser(proxyConfig, acquisitionLanguage);
+    page = await browser.newPage();
+  } catch (err) {
+    debugLog("Browser setup failed:", err);
+    try {
+      await browser?.close?.();
+    } catch {}
+    throw err;
+  }
   const networkPayloads = [];
   const networkDebug = [];
   const documentResponses = [];
@@ -2126,8 +1970,8 @@ async function scrapeWithPuppeteer(url, options = {}) {
       page.on("console", (msg) =>
         console.log(`🖥️ [browser:${msg.type()}]`, msg.text())
       );
-      page.on("pageerror", (err) => console.warn("⚠️ Page error:", err));
-      page.on("error", (err) => console.warn("⚠️ Page crashed:", err));
+      page.on("pageerror", (err) => debugLog("Page error", err));
+      page.on("error", (err) => debugLog("Page crashed", err));
     }
 
     page.on("framenavigated", (frame) => {
@@ -2568,16 +2412,6 @@ async function scrapeWithPuppeteer(url, options = {}) {
       documentResponses,
     });
 
-    logEvent("puppeteer_complete", {
-      url,
-      pageUrl,
-      proxy: proxyConfig?.original || null,
-      userAgent,
-      antiBotDetected: antiBotAnalysis.detected,
-      antiBotReasons: antiBotAnalysis.reasons,
-      networkPayloads: networkPayloads.length,
-    });
-
     return {
       html,
       jsonLd,
@@ -2605,186 +2439,208 @@ async function scrapeWithPuppeteer(url, options = {}) {
       },
     };
   } catch (err) {
-    console.error("❌ Puppeteer scraping error:", err);
+    debugLog("Puppeteer scraping error:", err);
     throw err;
   } finally {
-    try {
-      page.removeAllListeners("request");
-      page.removeAllListeners("response");
-      page.removeAllListeners("requestfailed");
-      page.removeAllListeners("requestfinished");
-      await page.setRequestInterception(false).catch(() => {});
-    } catch {}
     try {
       await persistPuppeteerCookies(page, jar);
     } catch (err) {
       debugLog("Cookie persist failed:", err.message);
     }
-    await browserPool.release(key, page);
+    try {
+      page.removeAllListeners?.();
+      await page.setRequestInterception?.(false).catch(() => {});
+    } catch {}
+    try {
+      if (page && !page.isClosed()) {
+        await page.close({ runBeforeUnload: false }).catch(() => page.close().catch(() => {}));
+      }
+    } catch (err) {
+      debugLog("Page close failed:", err.message);
+    }
+    try {
+      browser?.removeAllListeners?.();
+    } catch {}
+    try {
+      if (browser) {
+        await browser.close();
+      }
+    } catch (err) {
+      debugLog("Browser close failed:", err.message);
+    }
+    try {
+      browser?.disconnect?.();
+    } catch {}
+    if (browser) {
+      logBrowserClosed();
+    }
   }
 }
 
 async function scrapeProduct(url, options = {}) {
+  logStart(url);
   const scrapeStartedAt = Date.now();
-  const dumpNetwork = options.dumpNetwork === true;
-  if (!dumpNetwork) {
-    const cacheEntry = cache.get(url);
-    if (cacheEntry) {
-      debugLog("Cache hit", { url });
-      return cacheEntry;
-    }
-  }
-
-  const jar = getCookieJarForUrl(url);
-  const localeSelection = pickProxyAndLangForUrl(url);
-  const selectedProxyConfig = localeSelection.proxyConfig || null;
-  const sessionUserAgent = pickUserAgent();
-  const sessionViewport = pickViewport();
-  const sessionNavigator = pickNavigatorOverrides(localeSelection.language);
-  const acceptLanguageHeader = buildAcceptLanguageHeader(localeSelection.language);
-
-  const countryLabel = (localeSelection.countryCode || "RANDOM")
-    .toString()
-    .toUpperCase();
-  console.log(`🌍 Using proxy ${countryLabel} | Lang ${localeSelection.language} | URL ${url}`);
-
-  let axiosExtraction = createEmptyProduct();
-  let axiosError = null;
-  let axiosAntiBot = { detected: false, reasons: [] };
-  let axiosHasStructuredData = false;
-  let axiosBytes = 0;
-  let axiosSuccess = false;
-  let dynamicHint = false;
-
   try {
-    const axiosResult = await fetchWithAxios(url, {
-      proxyConfig: selectedProxyConfig,
-      userAgent: sessionUserAgent,
-      jar,
-      acceptLanguage: acceptLanguageHeader,
-      language: localeSelection.language,
-    });
-    axiosBytes = Buffer.byteLength(axiosResult.html || "", "utf8");
-    axiosExtraction = extractFromHtml(
-      axiosResult.html,
-      url,
-      axiosResult.jsonLdScripts,
-      axiosResult.nextDataPayload,
-      axiosResult.windowStates
-    );
-    axiosAntiBot = analyzeAntiBotSignals({
-      html: axiosResult.html,
-      pageUrl: axiosResult.finalUrl,
-    });
-    axiosHasStructuredData = Boolean(
-      (axiosResult.jsonLdScripts && axiosResult.jsonLdScripts.length > 0) ||
-        axiosResult.nextDataPayload
-    );
-    dynamicHint = Boolean(axiosResult.isLikelyDynamic);
-    axiosSuccess = true;
-  } catch (err) {
-    axiosError = err;
-    logEvent("axios_error", {
-      url,
-      error: err.message,
-      proxy: selectedProxyConfig?.original || null,
-    });
-  }
+    const dumpNetwork = options.dumpNetwork === true;
+    if (!dumpNetwork) {
+      const cacheEntry = cache.get(url);
+      if (cacheEntry) {
+        debugLog("Cache hit", { url });
+        logSuccess();
+        return cacheEntry;
+      }
+    }
 
-  const shouldUsePuppeteer =
-    !DISABLE_PUPPETEER &&
-    !axiosHasStructuredData &&
-    (axiosError || !hasProductSignals(axiosExtraction) || axiosAntiBot.detected || dynamicHint);
+    const jar = getCookieJarForUrl(url);
+    const localeSelection = pickProxyAndLangForUrl(url);
+    const selectedProxyConfig = localeSelection.proxyConfig || null;
+    const sessionUserAgent = pickUserAgent();
+    const sessionViewport = pickViewport();
+    const sessionNavigator = pickNavigatorOverrides(localeSelection.language);
+    const acceptLanguageHeader = buildAcceptLanguageHeader(localeSelection.language);
 
-  let puppeteerExtraction = createEmptyProduct();
-  let puppeteerStats = null;
-  let puppeteerError = null;
+    let axiosExtraction = createEmptyProduct();
+    let axiosError = null;
+    let axiosAntiBot = { detected: false, reasons: [] };
+    let axiosHasStructuredData = false;
+    let axiosBytes = 0;
+    let axiosSuccess = false;
+    let dynamicHint = false;
 
-  if (shouldUsePuppeteer) {
     try {
-      const puppeteerResult = await scrapeWithPuppeteer(url, {
-        ...options,
-        waitSelectors: options.waitSelectors,
-        waitAfterLoadMs: options.waitAfterLoadMs,
+      const axiosResult = await fetchWithAxios(url, {
         proxyConfig: selectedProxyConfig,
         userAgent: sessionUserAgent,
-        viewport: sessionViewport,
-        navigatorOverrides: sessionNavigator,
-        preferredLanguage: localeSelection.language,
-        acceptLanguage: acceptLanguageHeader,
         jar,
-        dumpNetwork,
+        acceptLanguage: acceptLanguageHeader,
+        language: localeSelection.language,
       });
-      puppeteerStats = puppeteerResult.requestStats || null;
-      const htmlExtraction = extractFromHtml(
-        puppeteerResult.html,
+      axiosBytes = Buffer.byteLength(axiosResult.html || "", "utf8");
+      axiosExtraction = extractFromHtml(
+        axiosResult.html,
         url,
-        puppeteerResult.jsonLd,
-        puppeteerResult.nextData,
-        puppeteerResult.windowStates
+        axiosResult.jsonLdScripts,
+        axiosResult.nextDataPayload,
+        axiosResult.windowStates
       );
-      const networkExtraction = extractFromNetworkPayloads(
-        puppeteerResult.networkPayloads
+      axiosAntiBot = analyzeAntiBotSignals({
+        html: axiosResult.html,
+        pageUrl: axiosResult.finalUrl,
+      });
+      axiosHasStructuredData = Boolean(
+        (axiosResult.jsonLdScripts && axiosResult.jsonLdScripts.length > 0) ||
+          axiosResult.nextDataPayload
       );
-      puppeteerExtraction = mergeProductData(htmlExtraction, networkExtraction);
+      dynamicHint = Boolean(axiosResult.isLikelyDynamic);
+      axiosSuccess = true;
     } catch (err) {
-      puppeteerError = err;
-      logEvent("puppeteer_error", {
+      axiosError = err;
+      logEvent("axios_error", {
         url,
         error: err.message,
         proxy: selectedProxyConfig?.original || null,
       });
     }
-  }
 
-  const finalProduct = mergeProductData(axiosExtraction, puppeteerExtraction);
+    const shouldUsePuppeteer =
+      !DISABLE_PUPPETEER &&
+      !axiosHasStructuredData &&
+      (axiosError || !hasProductSignals(axiosExtraction) || axiosAntiBot.detected || dynamicHint);
 
-  if (!hasProductSignals(finalProduct)) {
-    if (axiosError && puppeteerError) {
-      throw puppeteerError || axiosError;
+    let puppeteerExtraction = createEmptyProduct();
+    let puppeteerStats = null;
+    let puppeteerError = null;
+
+    if (shouldUsePuppeteer) {
+      try {
+        const puppeteerResult = await scrapeWithPuppeteer(url, {
+          ...options,
+          waitSelectors: options.waitSelectors,
+          waitAfterLoadMs: options.waitAfterLoadMs,
+          proxyConfig: selectedProxyConfig,
+          userAgent: sessionUserAgent,
+          viewport: sessionViewport,
+          navigatorOverrides: sessionNavigator,
+          preferredLanguage: localeSelection.language,
+          acceptLanguage: acceptLanguageHeader,
+          jar,
+          dumpNetwork,
+        });
+        puppeteerStats = puppeteerResult.requestStats || null;
+        const htmlExtraction = extractFromHtml(
+          puppeteerResult.html,
+          url,
+          puppeteerResult.jsonLd,
+          puppeteerResult.nextData,
+          puppeteerResult.windowStates
+        );
+        const networkExtraction = extractFromNetworkPayloads(
+          puppeteerResult.networkPayloads
+        );
+        puppeteerExtraction = mergeProductData(htmlExtraction, networkExtraction);
+      } catch (err) {
+        puppeteerError = err;
+        logEvent("puppeteer_error", {
+          url,
+          error: err.message,
+          proxy: selectedProxyConfig?.original || null,
+        });
+      }
     }
-    if (axiosError && !shouldUsePuppeteer) {
-      throw axiosError;
+
+    const finalProduct = mergeProductData(axiosExtraction, puppeteerExtraction);
+
+    if (!hasProductSignals(finalProduct)) {
+      if (axiosError && puppeteerError) {
+        throw puppeteerError || axiosError;
+      }
+      if (axiosError && !shouldUsePuppeteer) {
+        throw axiosError;
+      }
+      if (puppeteerError) {
+        throw puppeteerError;
+      }
     }
-    if (puppeteerError) {
-      throw puppeteerError;
+
+    const payload = {
+      ok: true,
+      title: finalProduct.title || null,
+      description: finalProduct.description || null,
+      price: finalProduct.price || null,
+      images: finalProduct.images || [],
+    };
+
+    const interceptedRequests =
+      (puppeteerStats?.interceptedRequests || 0) + (axiosSuccess ? 1 : 0);
+    const totalBytes = (puppeteerStats?.transferredBytes || 0) + axiosBytes;
+    const proxyCountry = selectedProxyConfig?.countryCode
+      ? String(selectedProxyConfig.countryCode).toUpperCase()
+      : "";
+    const proxyLabel = selectedProxyConfig
+      ? `${proxyCountry} Proxy`.trim() || "Proxy"
+      : "Direct";
+    const durationSeconds = (Date.now() - scrapeStartedAt) / 1000;
+    const transferMB = Number((totalBytes / (1024 * 1024)).toFixed(3));
+    payload.meta = {
+      ...(payload.meta || {}),
+      network: {
+        requests: interceptedRequests,
+        transferMB,
+        durationSeconds,
+        proxy: proxyLabel,
+      },
+    };
+
+    if (!dumpNetwork) {
+      cache.set(url, payload);
     }
+
+    logSuccess();
+    return payload;
+  } catch (err) {
+    logErrorMessage(err?.message || "scrape failed");
+    throw err;
   }
-
-  const payload = {
-    ok: true,
-    title: finalProduct.title || null,
-    description: finalProduct.description || null,
-    price: finalProduct.price || null,
-    images: finalProduct.images || [],
-  };
-
-  const interceptedRequests =
-    (puppeteerStats?.interceptedRequests || 0) + (axiosSuccess ? 1 : 0);
-  const totalBytes = (puppeteerStats?.transferredBytes || 0) + axiosBytes;
-  const proxyCountry = selectedProxyConfig?.countryCode
-    ? String(selectedProxyConfig.countryCode).toUpperCase()
-    : "";
-  const proxyLabel = selectedProxyConfig
-    ? `${proxyCountry} Proxy`.trim() || "Proxy"
-    : "Direct";
-  const durationSeconds = (Date.now() - scrapeStartedAt) / 1000;
-  const transferMB = Number((totalBytes / (1024 * 1024)).toFixed(3));
-  payload.meta = {
-    ...(payload.meta || {}),
-    network: {
-      requests: interceptedRequests,
-      transferMB,
-      durationSeconds,
-      proxy: proxyLabel,
-    },
-  };
-
-  if (!dumpNetwork) {
-    cache.set(url, payload);
-  }
-
-  return payload;
 }
 
 app.get("/", (req, res) => {
@@ -2792,11 +2648,10 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  const browserHealth = browserPool.getHealth();
   const cacheStats = cache.getStats();
   res.json({
     ok: true,
-    browser: browserHealth,
+    browser: { openBrowsers: 0, totalActivePages: 0, instances: [] },
     cache: cacheStats,
     proxies: proxyManager.getDiagnostics(),
     cookies: { stores: cookieJars.size },
@@ -2807,7 +2662,7 @@ app.get("/health", (req, res) => {
 app.get("/debug", (req, res) => {
   res.json({
     ok: true,
-    browser: browserPool.getHealth(),
+    browser: { openBrowsers: 0, totalActivePages: 0, instances: [] },
     cache: cache.getStats(),
     proxies: proxyManager.getDiagnostics(),
     cookies: { stores: cookieJars.size },
@@ -2824,9 +2679,11 @@ app.get("/scrape", async (req, res) => {
   res.set("Cache-Control", "no-store");
   const url = req.query.url;
   if (!url) {
-    return res
+    res
       .status(400)
       .json({ ok: false, error: "Missing URL query param (?url=https://...)" });
+    scheduleShutdown();
+    return;
   }
 
   const waitForParam = req.query.waitFor;
@@ -2853,50 +2710,30 @@ app.get("/scrape", async (req, res) => {
       waitAfterLoadMs,
       dumpNetwork,
     });
-    return res.json(result);
+    res.json(result);
+    scheduleShutdown();
+    return;
   } catch (err) {
-    console.error("Scrape error:", err);
-    return res
+    res
       .status(500)
       .json({ ok: false, error: err.message || "Scrape failed" });
+    scheduleShutdown();
+    return;
   }
 });
 
 const server = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ Feednly Scraper running on port ${PORT}`);
-  console.log("ℹ️ Waiting for incoming requests...");
+  debugLog(`Feednly Scraper listening on port ${PORT}`);
 });
 
 server.on("error", (err) => {
-  console.error("❌ HTTP server failed to start:", err);
+  debugLog("HTTP server error:", err);
   process.exit(1);
 });
 
 async function gracefulShutdown() {
-  console.log("⏬ Shutting down scraper...");
-  try {
-    await browserPool.shutdown();
-  } catch (err) {
-    console.warn("⚠️ Browser pool shutdown error:", err.message);
-  }
   server.close(() => process.exit(0));
 }
 
 process.on("SIGINT", gracefulShutdown);
 process.on("SIGTERM", gracefulShutdown);
-
-setTimeout(async () => {
-  if (DISABLE_PUPPETEER) {
-    console.log("⏭️ Puppeteer preload skipped (disabled via env).");
-    return;
-  }
-  try {
-    console.log("⏳ Preloading Puppeteer...");
-    const preloadProxy = proxyManager.getProxy();
-    const { page, key } = await browserPool.acquire(preloadProxy, DEFAULT_LANGUAGE);
-    await browserPool.release(key, page);
-    console.log("✅ Puppeteer preloaded successfully!");
-  } catch (err) {
-    console.warn("⚠️ Puppeteer preload failed:", err.message);
-  }
-}, 1000);
