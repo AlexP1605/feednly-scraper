@@ -1,7 +1,6 @@
 import express from "express";
 import * as cheerio from "cheerio";
 import axios from "axios";
-import pRetry from "p-retry";
 import NodeCache from "node-cache";
 import { wrapper as applyAxiosCookieJarSupport } from "axios-cookiejar-support";
 import { CookieJar, Cookie } from "tough-cookie";
@@ -67,8 +66,7 @@ if (!Number.isFinite(PORT) || PORT <= 0) {
   PORT = 8080;
 }
 
-let MAX_RETRIES = Number.parseInt(process.env.MAX_RETRIES || "2", 10);
-if (!Number.isFinite(MAX_RETRIES) || MAX_RETRIES < 0) MAX_RETRIES = 2;
+const MAX_RETRIES = 0;
 const DISABLE_PUPPETEER = process.env.DISABLE_PUPPETEER === "true";
 
 const DEFAULT_WAIT_AFTER_LOAD = Math.max(
@@ -81,6 +79,69 @@ const NAVIGATION_TIMEOUT = Math.max(
     60000
 );
 const WAIT_JITTER_RATIO = 0.2;
+
+const BLOCKED_RESOURCE_TYPES = new Set([
+  "font",
+  "stylesheet",
+  "media",
+  "manifest",
+]);
+
+const BLOCKED_IMAGE_KEYWORDS = [
+  "logo",
+  "icon",
+  "banner",
+  "promo",
+  "adservice",
+  "analytics",
+  "datadome",
+  "kameleoon",
+  "optimizely",
+  "google",
+  "doubleclick",
+  "pixel",
+  "tracker",
+  "badge",
+  "header",
+  "footer",
+];
+
+const PRODUCT_IMAGE_KEYWORDS = [
+  "product",
+  "media",
+  "item",
+  "pdp",
+  "zoom",
+  "gallery",
+  "img/",
+];
+
+const JSON_SIGNAL_KEYWORDS = ["product", "price", "image", "variants"];
+
+function urlContainsKeyword(url, keywords) {
+  if (!url) return false;
+  const value = typeof url === "string" ? url : `${url}`;
+  if (!value) return false;
+  const lower = value.toLowerCase();
+  return keywords.some((keyword) => lower.includes(keyword));
+}
+
+function isBlockedImageUrl(url) {
+  return urlContainsKeyword(url, BLOCKED_IMAGE_KEYWORDS);
+}
+
+function isProductImageUrl(url) {
+  if (!url) return false;
+  if (isBlockedImageUrl(url)) return false;
+  return urlContainsKeyword(url, PRODUCT_IMAGE_KEYWORDS);
+}
+
+function filterProductImageList(images) {
+  const prepared = (images || [])
+    .map((img) => (typeof img === "string" ? img.trim() : `${img}`.trim()))
+    .filter((img) => img && isProductImageUrl(img));
+  return dedupeImages(prepared);
+}
 
 const sleep = (ms) =>
   new Promise((resolve) => {
@@ -1063,11 +1124,20 @@ function collectImagesFromNode(node) {
   for (const field of imageFields) {
     for (const value of ensureArray(field)) {
       if (typeof value === "string" && value.trim()) {
-        urls.push(value.trim());
+        const trimmed = value.trim();
+        if (isProductImageUrl(trimmed)) {
+          urls.push(trimmed);
+        }
       } else if (value && typeof value === "object") {
-        if (typeof value.url === "string") urls.push(value.url.trim());
-        if (typeof value.contentUrl === "string") urls.push(value.contentUrl.trim());
-        if (typeof value.imageUrl === "string") urls.push(value.imageUrl.trim());
+        const candidates = [value.url, value.contentUrl, value.imageUrl];
+        for (const candidate of candidates) {
+          if (typeof candidate === "string" && candidate.trim()) {
+            const normalized = candidate.trim();
+            if (isProductImageUrl(normalized)) {
+              urls.push(normalized);
+            }
+          }
+        }
       }
     }
   }
@@ -1291,7 +1361,7 @@ function collectMetaImages($, url) {
       const $el = $(element);
       const attr = $el.attr("content") || $el.attr("href");
       const normalized = normalizeUrl(attr, url);
-      if (normalized) images.push(normalized);
+      if (normalized && isProductImageUrl(normalized)) images.push(normalized);
     }
   }
   return images;
@@ -1369,12 +1439,12 @@ function extractFromHtml(html, url, jsonLdScripts = null, nextDataPayload = null
     ];
     for (const src of srcAttributes) {
       const normalized = normalizeUrl(src, url);
-      if (normalized) images.push(normalized);
+      if (normalized && isProductImageUrl(normalized)) images.push(normalized);
     }
     for (const srcset of srcsetAttributes) {
       for (const candidate of parseSrcSet(srcset)) {
         const normalized = normalizeUrl(candidate, url);
-        if (normalized) images.push(normalized);
+        if (normalized && isProductImageUrl(normalized)) images.push(normalized);
       }
     }
   });
@@ -1387,18 +1457,22 @@ function extractFromHtml(html, url, jsonLdScripts = null, nextDataPayload = null
       const urlMatch = match.match(/url\((['"]?)(.*?)\1\)/i);
       const candidate = urlMatch?.[2];
       const normalized = normalizeUrl(candidate, url);
-      if (normalized) images.push(normalized);
+      if (normalized && isProductImageUrl(normalized)) images.push(normalized);
     }
   });
 
   images.push(
-    ...ensureArray(jsonLdExtraction.images).map((img) => normalizeUrl(img, url))
+    ...ensureArray(jsonLdExtraction.images)
+      .map((img) => normalizeUrl(img, url))
+      .filter((img) => img && isProductImageUrl(img))
   );
   images.push(
-    ...ensureArray(nextDataExtraction.images).map((img) => normalizeUrl(img, url))
+    ...ensureArray(nextDataExtraction.images)
+      .map((img) => normalizeUrl(img, url))
+      .filter((img) => img && isProductImageUrl(img))
   );
 
-  const cleanedImages = dedupeImages(images.filter(Boolean)).slice(0, 150);
+  const cleanedImages = filterProductImageList(images.filter(Boolean)).slice(0, 150);
   const variants = dedupeVariants([
     ...ensureArray(jsonLdExtraction.variants),
     ...ensureArray(nextDataExtraction.variants),
@@ -1443,6 +1517,7 @@ function mergeProductData(...sources) {
       result.variants = dedupeVariants([...result.variants, ...source.variants]);
     }
   }
+  result.images = filterProductImageList(result.images).slice(0, 150);
   return result;
 }
 
@@ -1798,6 +1873,12 @@ async function scrapeWithPuppeteer(url, options = {}) {
   const navigationChain = [];
   const secChHeaders = buildSecChUaHeaders(userAgent);
   let consent = { clicked: false, selector: null };
+  const requestStats = {
+    allowedRequests: 0,
+    blockedRequests: 0,
+    transferredBytes: 0,
+  };
+  let documentBytesRecorded = false;
 
   try {
     if (DEBUG) {
@@ -1814,18 +1895,63 @@ async function scrapeWithPuppeteer(url, options = {}) {
       }
     });
 
+    page.on("request", (request) => {
+      try {
+        const resourceType = request.resourceType();
+        const requestUrl = request.url();
+        let allow = true;
+
+        if (BLOCKED_RESOURCE_TYPES.has(resourceType)) {
+          allow = false;
+        } else if (resourceType === "image") {
+          const lowerUrl = requestUrl.toLowerCase();
+          const allowedImage = urlContainsKeyword(lowerUrl, PRODUCT_IMAGE_KEYWORDS);
+          const blockedImage = urlContainsKeyword(lowerUrl, BLOCKED_IMAGE_KEYWORDS);
+          allow = allowedImage && !blockedImage;
+        } else if (![
+          "document",
+          "xhr",
+          "fetch",
+          "script",
+        ].includes(resourceType)) {
+          allow = false;
+        }
+
+        if (allow) {
+          requestStats.allowedRequests += 1;
+          request.continue();
+        } else {
+          requestStats.blockedRequests += 1;
+          request.abort();
+        }
+      } catch (err) {
+        debugLog("Request interception fallback:", err.message);
+        try {
+          request.continue();
+        } catch {}
+      }
+    });
+
     page.on("response", async (response) => {
       try {
         const request = response.request();
         const resourceType = request.resourceType();
         const headers = response.headers();
         const normalizedHeaders = extractImportantHeaders(headers);
+        const lengthHeader = headers["content-length"] || headers["Content-Length"];
+        const parsedLength = lengthHeader ? Number.parseInt(lengthHeader, 10) : NaN;
+        if (Number.isFinite(parsedLength)) {
+          requestStats.transferredBytes += parsedLength;
+        }
         if (resourceType === "document") {
           documentResponses.push({
             url: response.url(),
             status: response.status(),
             headers: normalizedHeaders,
           });
+          if (Number.isFinite(parsedLength)) {
+            documentBytesRecorded = true;
+          }
           return;
         }
         if (!resourceType || !["xhr", "fetch"].includes(resourceType)) {
@@ -1848,6 +1974,13 @@ async function scrapeWithPuppeteer(url, options = {}) {
         }
         const text = await response.text();
         if (!text || text.length > 1_000_000) return;
+        const lowerText = text.toLowerCase();
+        if (!JSON_SIGNAL_KEYWORDS.some((keyword) => lowerText.includes(keyword))) {
+          return;
+        }
+        if (!Number.isFinite(parsedLength)) {
+          requestStats.transferredBytes += Buffer.byteLength(text, "utf8");
+        }
         networkPayloads.push({
           url: response.url(),
           body: text,
@@ -1881,6 +2014,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
     await page.setJavaScriptEnabled(true);
     await page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT);
     await page.setDefaultTimeout(NAVIGATION_TIMEOUT);
+    await page.setRequestInterception(true);
 
     await page.evaluateOnNewDocument(
       ({ overrides, ua }) => {
@@ -2114,6 +2248,9 @@ async function scrapeWithPuppeteer(url, options = {}) {
 
     const pageUrl = page.url();
     const html = await page.content();
+    if (!documentBytesRecorded) {
+      requestStats.transferredBytes += Buffer.byteLength(html || "", "utf8");
+    }
     const jsonLd = await page.$$eval(
       'script[type="application/ld+json"]',
       (scripts) => scripts.map((s) => s.innerText)
@@ -2172,6 +2309,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       documentResponses,
       navigationChain,
       consent,
+      requestStats,
       antiBotDetected: antiBotAnalysis.detected,
       antiBotReasons: antiBotAnalysis.reasons,
       meta: {
@@ -2201,22 +2339,19 @@ async function scrapeWithPuppeteer(url, options = {}) {
 }
 
 async function scrapeProduct(url, options = {}) {
+  const scrapeStartedAt = Date.now();
   const dumpNetwork = options.dumpNetwork === true;
   if (!dumpNetwork) {
     const cacheEntry = cache.get(url);
     if (cacheEntry) {
       debugLog("Cache hit", { url });
-      return { ...cacheEntry, cached: true };
+      return cacheEntry;
     }
   }
 
   const jar = getCookieJarForUrl(url);
   const localeSelection = pickProxyAndLangForUrl(url);
   const selectedProxyConfig = localeSelection.proxyConfig || null;
-  const usedProxyKeys = new Set();
-  if (selectedProxyConfig?.key) {
-    usedProxyKeys.add(selectedProxyConfig.key);
-  }
   const sessionUserAgent = pickUserAgent();
   const sessionViewport = pickViewport();
   const sessionNavigator = pickNavigatorOverrides(localeSelection.language);
@@ -2228,46 +2363,22 @@ async function scrapeProduct(url, options = {}) {
   console.log(`🌍 Using proxy ${countryLabel} | Lang ${localeSelection.language} | URL ${url}`);
 
   let axiosExtraction = createEmptyProduct();
-  let puppeteerExtraction = createEmptyProduct();
   let axiosError = null;
-  let puppeteerError = null;
-  let puppeteerMeta = null;
-  let axiosMeta = null;
-  let dynamicHint = false;
-  let axiosDiagnostics = null;
-  let puppeteerDiagnostics = null;
-  let networkDebugDump = null;
-
-  const attempts = { axios: [], puppeteer: [] };
-
-  const runAxios = async (proxyConfig) => {
-    const result = await pRetry(
-      () =>
-        fetchWithAxios(url, {
-          proxyConfig,
-          userAgent: sessionUserAgent,
-          jar,
-          acceptLanguage: acceptLanguageHeader,
-          language: localeSelection.language,
-        }),
-      { retries: MAX_RETRIES }
-    );
-    return result;
-  };
-
   let axiosAntiBot = { detected: false, reasons: [] };
+  let axiosHasStructuredData = false;
+  let axiosBytes = 0;
+  let axiosSuccess = false;
+  let dynamicHint = false;
+
   try {
-    const axiosResult = await runAxios(selectedProxyConfig);
-    const initialProxyOriginal = selectedProxyConfig?.original || null;
-    axiosDiagnostics = axiosResult;
-    dynamicHint = axiosResult.isLikelyDynamic;
-    axiosMeta = {
+    const axiosResult = await fetchWithAxios(url, {
+      proxyConfig: selectedProxyConfig,
       userAgent: sessionUserAgent,
-      proxy: initialProxyOriginal,
-      redirectCount: axiosResult.redirectCount ?? 0,
-      finalUrl: axiosResult.finalUrl ?? null,
-      visitedUrls: axiosResult.visitedUrls ?? null,
-    };
+      jar,
+      acceptLanguage: acceptLanguageHeader,
+      language: localeSelection.language,
+    });
+    axiosBytes = Buffer.byteLength(axiosResult.html || "", "utf8");
     axiosExtraction = extractFromHtml(
       axiosResult.html,
       url,
@@ -2278,118 +2389,46 @@ async function scrapeProduct(url, options = {}) {
       html: axiosResult.html,
       pageUrl: axiosResult.finalUrl,
     });
-    axiosMeta.antiBotDetected = axiosAntiBot.detected;
-    axiosMeta.antiBotReasons = axiosAntiBot.reasons;
-    attempts.axios.push({
-      proxy: initialProxyOriginal,
-      success: true,
-      antiBotDetected: axiosAntiBot.detected,
-      reasons: axiosAntiBot.reasons,
-      finalUrl: axiosResult.finalUrl ?? null,
-    });
+    axiosHasStructuredData = Boolean(
+      (axiosResult.jsonLdScripts && axiosResult.jsonLdScripts.length > 0) ||
+        axiosResult.nextDataPayload
+    );
+    dynamicHint = Boolean(axiosResult.isLikelyDynamic);
+    axiosSuccess = true;
   } catch (err) {
     axiosError = err;
-    const initialProxyOriginal = selectedProxyConfig?.original || null;
     logEvent("axios_error", {
       url,
       error: err.message,
-      proxy: initialProxyOriginal,
+      proxy: selectedProxyConfig?.original || null,
     });
-    attempts.axios.push({
-      proxy: initialProxyOriginal,
-      success: false,
-      error: err.message,
-    });
-  }
-
-  if (
-    proxyManager.hasResidentialProxy() &&
-    (axiosError || axiosAntiBot.detected)
-  ) {
-    const proxyConfig = proxyManager.getProxy({
-      requireResidential: true,
-      countryCode: localeSelection.countryCode,
-      excludeKeys: usedProxyKeys,
-    });
-    if (proxyConfig) {
-      if (proxyConfig?.key) {
-        usedProxyKeys.add(proxyConfig.key);
-      }
-      try {
-        const axiosResult = await runAxios(proxyConfig);
-        axiosDiagnostics = axiosResult;
-        dynamicHint = axiosResult.isLikelyDynamic;
-        axiosMeta = {
-          userAgent: sessionUserAgent,
-          proxy: proxyConfig.original,
-          redirectCount: axiosResult.redirectCount ?? 0,
-          finalUrl: axiosResult.finalUrl ?? null,
-          visitedUrls: axiosResult.visitedUrls ?? null,
-        };
-        axiosExtraction = extractFromHtml(
-          axiosResult.html,
-          url,
-          axiosResult.jsonLdScripts,
-          axiosResult.nextDataPayload
-        );
-        axiosAntiBot = analyzeAntiBotSignals({
-          html: axiosResult.html,
-          pageUrl: axiosResult.finalUrl,
-        });
-        axiosMeta.antiBotDetected = axiosAntiBot.detected;
-        axiosMeta.antiBotReasons = axiosAntiBot.reasons;
-        attempts.axios.push({
-          proxy: proxyConfig.original,
-          success: true,
-          antiBotDetected: axiosAntiBot.detected,
-          reasons: axiosAntiBot.reasons,
-          finalUrl: axiosResult.finalUrl ?? null,
-        });
-        axiosError = null;
-      } catch (err) {
-        axiosError = err;
-        logEvent("axios_proxy_error", {
-          url,
-          error: err.message,
-          proxy: proxyConfig.original,
-        });
-        attempts.axios.push({
-          proxy: proxyConfig.original,
-          success: false,
-          error: err.message,
-        });
-      }
-    }
   }
 
   const shouldUsePuppeteer =
     !DISABLE_PUPPETEER &&
-    (dynamicHint || axiosError || !hasProductSignals(axiosExtraction) || axiosAntiBot.detected);
+    !axiosHasStructuredData &&
+    (axiosError || !hasProductSignals(axiosExtraction) || axiosAntiBot.detected || dynamicHint);
+
+  let puppeteerExtraction = createEmptyProduct();
+  let puppeteerStats = null;
+  let puppeteerError = null;
 
   if (shouldUsePuppeteer) {
     try {
-      const puppeteerResult = await pRetry(
-        () =>
-          scrapeWithPuppeteer(url, {
-            ...options,
-            waitSelectors: options.waitSelectors,
-            waitAfterLoadMs: options.waitAfterLoadMs,
-            proxyConfig: selectedProxyConfig,
-            userAgent: sessionUserAgent,
-            viewport: sessionViewport,
-            navigatorOverrides: sessionNavigator,
-            preferredLanguage: localeSelection.language,
-            acceptLanguage: acceptLanguageHeader,
-            jar,
-            dumpNetwork,
-          }),
-        { retries: Math.min(1, MAX_RETRIES) }
-      );
-      puppeteerDiagnostics = puppeteerResult;
-      puppeteerMeta = {
-        ...puppeteerResult.meta,
-        proxy: null,
-      };
+      const puppeteerResult = await scrapeWithPuppeteer(url, {
+        ...options,
+        waitSelectors: options.waitSelectors,
+        waitAfterLoadMs: options.waitAfterLoadMs,
+        proxyConfig: selectedProxyConfig,
+        userAgent: sessionUserAgent,
+        viewport: sessionViewport,
+        navigatorOverrides: sessionNavigator,
+        preferredLanguage: localeSelection.language,
+        acceptLanguage: acceptLanguageHeader,
+        jar,
+        dumpNetwork,
+      });
+      puppeteerStats = puppeteerResult.requestStats || null;
       const htmlExtraction = extractFromHtml(
         puppeteerResult.html,
         url,
@@ -2400,16 +2439,6 @@ async function scrapeProduct(url, options = {}) {
         puppeteerResult.networkPayloads
       );
       puppeteerExtraction = mergeProductData(htmlExtraction, networkExtraction);
-      attempts.puppeteer.push({
-        proxy: selectedProxyConfig?.original || null,
-        success: true,
-        antiBotDetected: puppeteerResult.antiBotDetected,
-        reasons: puppeteerResult.antiBotReasons,
-        pageUrl: puppeteerResult.meta?.pageUrl ?? null,
-      });
-      if (dumpNetwork && puppeteerResult.networkDebug) {
-        networkDebugDump = puppeteerResult.networkDebug.slice(0);
-      }
     } catch (err) {
       puppeteerError = err;
       logEvent("puppeteer_error", {
@@ -2417,179 +2446,57 @@ async function scrapeProduct(url, options = {}) {
         error: err.message,
         proxy: selectedProxyConfig?.original || null,
       });
-      attempts.puppeteer.push({
-        proxy: selectedProxyConfig?.original || null,
-        success: false,
-        error: err.message,
-      });
-    }
-
-    const needProxyRetry =
-      proxyManager.hasResidentialProxy() &&
-      (puppeteerError || puppeteerDiagnostics?.antiBotDetected);
-
-    if (needProxyRetry) {
-      const proxyConfig = proxyManager.getProxy({
-        requireResidential: true,
-        countryCode: localeSelection.countryCode,
-        excludeKeys: usedProxyKeys,
-      });
-      if (proxyConfig) {
-        if (proxyConfig?.key) {
-          usedProxyKeys.add(proxyConfig.key);
-        }
-        try {
-          const proxiedResult = await pRetry(
-            () =>
-              scrapeWithPuppeteer(url, {
-                ...options,
-                proxyConfig,
-                userAgent: sessionUserAgent,
-                viewport: sessionViewport,
-                navigatorOverrides: sessionNavigator,
-                preferredLanguage: localeSelection.language,
-                acceptLanguage: acceptLanguageHeader,
-                jar,
-                dumpNetwork,
-              }),
-            { retries: Math.min(1, MAX_RETRIES) }
-          );
-          puppeteerDiagnostics = proxiedResult;
-          puppeteerMeta = {
-            ...proxiedResult.meta,
-            proxy: proxyConfig.original,
-          };
-          const htmlExtraction = extractFromHtml(
-            proxiedResult.html,
-            url,
-            proxiedResult.jsonLd,
-            proxiedResult.nextData
-          );
-          const networkExtraction = extractFromNetworkPayloads(
-            proxiedResult.networkPayloads
-          );
-          puppeteerExtraction = mergeProductData(
-            puppeteerExtraction,
-            mergeProductData(htmlExtraction, networkExtraction)
-          );
-          puppeteerError = null;
-          attempts.puppeteer.push({
-            proxy: proxyConfig.original,
-            success: true,
-            antiBotDetected: proxiedResult.antiBotDetected,
-            reasons: proxiedResult.antiBotReasons,
-            pageUrl: proxiedResult.meta?.pageUrl ?? null,
-          });
-          if (proxiedResult.antiBotDetected) {
-            proxyManager.reportFailure(proxyConfig, "anti-bot");
-          } else {
-            proxyManager.reportSuccess(proxyConfig);
-          }
-          if (dumpNetwork && proxiedResult.networkDebug) {
-            networkDebugDump = (networkDebugDump || []).concat(
-              proxiedResult.networkDebug
-            );
-          }
-        } catch (err) {
-          puppeteerError = err;
-          proxyManager.reportFailure(proxyConfig, err.name || "puppeteer-error");
-          logEvent("puppeteer_proxy_error", {
-            url,
-            error: err.message,
-            proxy: proxyConfig.original,
-          });
-          attempts.puppeteer.push({
-            proxy: proxyConfig.original,
-            success: false,
-            error: err.message,
-          });
-        }
-      }
     }
   }
 
-  let finalProduct = createEmptyProduct();
-  let source = "axios";
+  const finalProduct = mergeProductData(axiosExtraction, puppeteerExtraction);
 
-  if (hasProductSignals(puppeteerExtraction)) {
-    finalProduct = puppeteerExtraction;
-    source = "puppeteer";
-  } else if (hasProductSignals(axiosExtraction)) {
-    finalProduct = axiosExtraction;
-    source = "axios";
-  } else {
-    finalProduct = mergeProductData(axiosExtraction, puppeteerExtraction);
-    if (!hasProductSignals(finalProduct)) {
-      if (axiosError && puppeteerError) {
-        throw puppeteerError || axiosError;
-      }
-      if (axiosError && !shouldUsePuppeteer) {
-        throw axiosError;
-      }
-      if (!axiosError && puppeteerError && !hasProductSignals(axiosExtraction)) {
-        throw puppeteerError;
-      }
+  if (!hasProductSignals(finalProduct)) {
+    if (axiosError && puppeteerError) {
+      throw puppeteerError || axiosError;
     }
-    source = !puppeteerError ? "puppeteer" : "axios";
+    if (axiosError && !shouldUsePuppeteer) {
+      throw axiosError;
+    }
+    if (puppeteerError) {
+      throw puppeteerError;
+    }
   }
-
-  const antiBotDetected =
-    puppeteerDiagnostics?.antiBotDetected ||
-    puppeteerMeta?.antiBotDetected ||
-    axiosMeta?.antiBotDetected ||
-    false;
-  const antiBotReasons =
-    puppeteerDiagnostics?.antiBotReasons ||
-    puppeteerMeta?.antiBotReasons ||
-    axiosMeta?.antiBotReasons ||
-    [];
 
   const payload = {
     ok: true,
-    ...finalProduct,
-    source,
-    fetchedAt: Date.now(),
-    meta: {
-      axios: { ...(axiosMeta || {}), attempts: attempts.axios },
-      puppeteer: { ...(puppeteerMeta || {}), attempts: attempts.puppeteer },
-      axiosError: axiosError ? axiosError.message : null,
-      puppeteerError: puppeteerError ? puppeteerError.message : null,
-      redirectCount: axiosDiagnostics?.redirectCount ?? null,
-      finalUrl: axiosDiagnostics?.finalUrl ?? null,
-      antiBotDetected,
-      antiBotReasons,
-      pageUrl: puppeteerMeta?.pageUrl ?? null,
-    },
-    diagnostics: dumpNetwork
-      ? {
-          axios: {
-            finalUrl: axiosDiagnostics?.finalUrl ?? null,
-            redirectCount: axiosDiagnostics?.redirectCount ?? null,
-            visitedUrls: axiosDiagnostics?.visitedUrls ?? null,
-            antiBot: axiosMeta?.antiBotReasons ?? [],
-          },
-          puppeteer: {
-            pageUrl: puppeteerMeta?.pageUrl ?? null,
-            antiBotDetected: puppeteerMeta?.antiBotDetected ?? null,
-            antiBotReasons: puppeteerMeta?.antiBotReasons ?? [],
-            documentResponses: puppeteerDiagnostics?.documentResponses ?? [],
-            navigationChain: puppeteerDiagnostics?.navigationChain ?? [],
-          },
-          network: (puppeteerDiagnostics?.networkPayloads || []).map((entry) => ({
-            url: entry.url,
-            status: entry.status ?? null,
-            length: entry.body?.length ?? 0,
-            body: entry.body,
-          })),
-          networkDebug: networkDebugDump || [],
-        }
-      : undefined,
-    cached: false,
+    title: finalProduct.title || null,
+    description: finalProduct.description || null,
+    price: finalProduct.price || null,
+    images: finalProduct.images || [],
   };
 
   if (!dumpNetwork) {
     cache.set(url, payload);
   }
+
+  const totalRequests = (puppeteerStats?.allowedRequests || 0) + (axiosSuccess ? 1 : 0);
+  const totalBytes = (puppeteerStats?.transferredBytes || 0) + axiosBytes;
+  const proxyCountry = selectedProxyConfig?.countryCode
+    ? String(selectedProxyConfig.countryCode).toUpperCase()
+    : "";
+  const proxyLabel = selectedProxyConfig
+    ? `${proxyCountry} Proxy`.trim() || "Proxy"
+    : "Direct";
+  let domainLabel;
+  try {
+    domainLabel = new URL(url).hostname || url;
+  } catch {
+    domainLabel = url;
+  }
+  const durationSeconds = (Date.now() - scrapeStartedAt) / 1000;
+  const megabytes = totalBytes / (1024 * 1024);
+  console.log(
+    `🧭 [${proxyLabel}] ${totalRequests} requests, ${megabytes.toFixed(1)} MB transferred for ${domainLabel} (${durationSeconds.toFixed(
+      1
+    )}s)`
+  );
+
   return payload;
 }
 
