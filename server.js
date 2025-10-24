@@ -195,6 +195,22 @@ const PRODUCT_IMAGE_JSON_KEYS = new Set([
 
 const ZARA_HOSTNAME_REGEX = /(?:^|\.)zara\.com$/i;
 const ZARA_PLACEHOLDER_KEYWORDS = ["transparent-background", "stdstatic"];
+const ZARA_INTERSTITIAL_PATTERNS = [
+  /\/_sec\/verify\?provider=interstitial/i,
+  /bm-verify=/i,
+  /akam-logo/i,
+  /interstitial\/ic\.html/i,
+];
+
+function detectZaraInterstitialFromHtml(html) {
+  if (!html) {
+    return { detected: false, matches: [] };
+  }
+  const matches = ZARA_INTERSTITIAL_PATTERNS.filter((pattern) =>
+    pattern.test(html)
+  ).map((pattern) => pattern.source);
+  return { detected: matches.length > 0, matches };
+}
 
 function isZaraHostname(hostname) {
   if (!hostname) return false;
@@ -226,6 +242,62 @@ function filterZaraImageUrls(images) {
       return !ZARA_PLACEHOLDER_KEYWORDS.some((keyword) => lower.includes(keyword));
     });
   return dedupeImages(prepared);
+}
+
+function extractZaraImagesFromHtml(html) {
+  if (!html) return [];
+  try {
+    const matches = Array.from(
+      html.matchAll(/https:\/\/static\.zara\.net\/photos\/[^"'\s<>]+\.jpg/gi)
+    )
+      .map((entry) => (entry && entry[0] ? entry[0] : null))
+      .filter(Boolean);
+    return filterZaraImageUrls(matches);
+  } catch {
+    return [];
+  }
+}
+
+async function performHumanLikeDelays(page) {
+  if (!page) return;
+  try {
+    const viewport = page.viewport() || { width: 1280, height: 720 };
+    const startX = Math.max(
+      0,
+      Math.floor(Math.random() * Math.max(1, viewport.width - 50))
+    );
+    const startY = Math.max(
+      0,
+      Math.floor(Math.random() * Math.max(1, viewport.height - 50))
+    );
+    const endX = Math.max(
+      0,
+      Math.min(viewport.width, startX + Math.floor(Math.random() * 120))
+    );
+    const endY = Math.max(
+      0,
+      Math.min(viewport.height, startY + Math.floor(Math.random() * 160))
+    );
+    await page.mouse.move(startX, startY, { steps: 4 });
+    await page.waitForTimeout(120 + Math.floor(Math.random() * 180));
+    await page.mouse.move(endX, endY, { steps: 5 });
+    await page.waitForTimeout(80 + Math.floor(Math.random() * 160));
+    await page.mouse.move(Math.max(1, endX - 25), Math.max(1, endY - 15), {
+      steps: 3,
+    });
+    await page.waitForTimeout(50 + Math.floor(Math.random() * 120));
+    await page.evaluate(() => {
+      try {
+        const distance = 200 + Math.floor(Math.random() * 200);
+        window.scrollBy({ top: distance, behavior: "smooth" });
+      } catch {
+        window.scrollBy(0, 200);
+      }
+    });
+    await page.waitForTimeout(200 + Math.floor(Math.random() * 220));
+  } catch (err) {
+    debugLog("Human-like delay failed", err?.message || err);
+  }
 }
 
 async function extractZaraImagesFromPage(page, timeoutMs = 15000) {
@@ -2020,8 +2092,9 @@ async function scrapeWithPuppeteer(url, options = {}) {
 
   const proxyConfig = options.proxyConfig || null;
   const jar = options.jar || getCookieJarForUrl(url);
-  const userAgent = options.userAgent || pickUserAgent();
-  const viewport = options.viewport || pickViewport();
+  const isZaraTarget = Boolean(options.isZara) || isZaraUrl(url);
+  let userAgent = options.userAgent || pickUserAgent();
+  let viewport = options.viewport || pickViewport();
   const preferredLanguage = options.preferredLanguage || "en-US";
   const acceptLanguage = options.acceptLanguage || buildAcceptLanguageHeader(preferredLanguage);
   const navigatorOverrides =
@@ -2060,7 +2133,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
   const networkDebug = [];
   const documentResponses = [];
   const navigationChain = [];
-  const secChHeaders = buildSecChUaHeaders(userAgent);
+  let secChHeaders = buildSecChUaHeaders(userAgent);
   let consent = { clicked: false, selector: null };
   const requestStats = {
     interceptedRequests: 0,
@@ -2471,17 +2544,132 @@ async function scrapeWithPuppeteer(url, options = {}) {
       await sleep(effectiveWaitAfterLoad);
     }
 
-    const currentUrl = page.url();
-    if (isZaraUrl(currentUrl) || isZaraUrl(url)) {
-      try {
-        zaraImages = await extractZaraImagesFromPage(page);
-      } catch (err) {
-        debugLog("Failed to extract Zara images:", err?.message || err);
+    let currentUrl = page.url();
+    let html = await page.content();
+    const zaraInterstitialMeta = {
+      detected: false,
+      blocked: false,
+      matches: [],
+      attempts: [],
+    };
+
+    if (isZaraTarget || isZaraUrl(currentUrl)) {
+      let interstitialCheck = detectZaraInterstitialFromHtml(html);
+      if (interstitialCheck.detected) {
+        zaraInterstitialMeta.detected = true;
+        zaraInterstitialMeta.matches = interstitialCheck.matches;
+        debugLog("Zara interstitial detected", {
+          url: currentUrl,
+          matches: interstitialCheck.matches,
+        });
+        for (let attempt = 1; attempt <= 3 && interstitialCheck.detected; attempt += 1) {
+          const waitMs = 3000 + Math.floor(Math.random() * 2000);
+          debugLog("Zara interstitial retry scheduling", { attempt, waitMs });
+          await sleep(waitMs);
+
+          const nextUserAgent = pickUserAgent();
+          if (nextUserAgent && nextUserAgent !== userAgent) {
+            userAgent = nextUserAgent;
+            secChHeaders = buildSecChUaHeaders(userAgent);
+            await page.setUserAgent(userAgent);
+            debugLog("Zara interstitial retry user-agent updated", {
+              attempt,
+              userAgent,
+            });
+          }
+
+          const nextViewport = pickViewport();
+          viewport = nextViewport;
+          try {
+            await page.setViewport(viewport);
+            debugLog("Zara interstitial retry viewport updated", {
+              attempt,
+              viewport,
+            });
+          } catch (err) {
+            debugLog("Zara interstitial viewport update failed", err?.message || err);
+          }
+
+          debugLog("Zara interstitial retry proxy rotation skipped", {
+            attempt,
+            reason: "proxy change requires new browser session",
+          });
+
+          await performHumanLikeDelays(page);
+
+          try {
+            await page.reload({
+              waitUntil: ["domcontentloaded", "networkidle2"],
+              timeout: NAVIGATION_TIMEOUT,
+            });
+          } catch (err) {
+            const isTimeoutError =
+              (TimeoutError && err instanceof TimeoutError) ||
+              err?.name === "TimeoutError" ||
+              /timeout/i.test(err?.message || "");
+            if (isTimeoutError) {
+              debugLog("Zara interstitial reload timeout", err?.message || err);
+              try {
+                await page.reload({
+                  waitUntil: "domcontentloaded",
+                  timeout: NAVIGATION_TIMEOUT,
+                });
+              } catch (fallbackErr) {
+                debugLog(
+                  "Zara interstitial reload fallback failed",
+                  fallbackErr?.message || fallbackErr
+                );
+              }
+            } else {
+              debugLog(
+                "Zara interstitial reload failed",
+                err?.message || err
+              );
+            }
+          }
+
+          await sleep(500 + Math.floor(Math.random() * 500));
+          await performHumanLikeDelays(page);
+
+          currentUrl = page.url();
+          html = await page.content();
+          interstitialCheck = detectZaraInterstitialFromHtml(html);
+          zaraInterstitialMeta.attempts.push({
+            attempt,
+            waitMs,
+            userAgent,
+            viewport,
+            stillBlocked: interstitialCheck.detected,
+          });
+          if (!interstitialCheck.detected) {
+            debugLog("Zara interstitial cleared", { attempt, url: currentUrl });
+          } else {
+            debugLog("Zara interstitial persists", {
+              attempt,
+              url: currentUrl,
+            });
+          }
+        }
+        if (interstitialCheck.detected) {
+          zaraInterstitialMeta.blocked = true;
+          zaraInterstitialMeta.matches = interstitialCheck.matches;
+        }
+      }
+
+      if (!interstitialCheck.detected) {
+        try {
+          zaraImages = await extractZaraImagesFromPage(page);
+        } catch (err) {
+          debugLog("Failed to extract Zara images:", err?.message || err);
+        }
+        const htmlImages = extractZaraImagesFromHtml(html);
+        if (htmlImages.length) {
+          zaraImages = filterZaraImageUrls([...zaraImages, ...htmlImages]);
+        }
       }
     }
 
     const pageUrl = currentUrl;
-    const html = await page.content();
     if (!documentBytesRecorded) {
       requestStats.transferredBytes += Buffer.byteLength(html || "", "utf8");
     }
@@ -2553,6 +2741,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
       consent,
       requestStats,
       zaraImages,
+      zaraInterstitial: zaraInterstitialMeta,
       antiBotDetected: antiBotAnalysis.detected,
       antiBotReasons: antiBotAnalysis.reasons,
       meta: {
@@ -2566,6 +2755,7 @@ async function scrapeWithPuppeteer(url, options = {}) {
         consent,
         documentResponses,
         navigationChain,
+        zaraInterstitial: zaraInterstitialMeta,
       },
     };
   } catch (err) {
@@ -2628,6 +2818,7 @@ async function scrapeProduct(url, options = {}) {
     const sessionViewport = pickViewport();
     const sessionNavigator = pickNavigatorOverrides(localeSelection.language);
     const acceptLanguageHeader = buildAcceptLanguageHeader(localeSelection.language);
+    const isZaraTarget = isZaraUrl(url);
 
     let axiosExtraction = createEmptyProduct();
     let axiosError = null;
@@ -2637,6 +2828,7 @@ async function scrapeProduct(url, options = {}) {
     let axiosSuccess = false;
     let dynamicHint = false;
     let axiosFinalUrl = null;
+    let axiosZaraInterstitial = { detected: false, matches: [] };
 
     try {
       const axiosResult = await fetchWithAxios(url, {
@@ -2659,6 +2851,16 @@ async function scrapeProduct(url, options = {}) {
         html: axiosResult.html,
         pageUrl: axiosResult.finalUrl,
       });
+      if (isZaraTarget || (axiosResult.finalUrl && isZaraUrl(axiosResult.finalUrl))) {
+        axiosZaraInterstitial = detectZaraInterstitialFromHtml(axiosResult.html);
+        if (axiosZaraInterstitial.detected) {
+          debugLog("Axios detected Zara interstitial", {
+            url: axiosResult.finalUrl || url,
+            matches: axiosZaraInterstitial.matches,
+          });
+          axiosAntiBot.detected = true;
+        }
+      }
       axiosHasStructuredData = Boolean(
         (axiosResult.jsonLdScripts && axiosResult.jsonLdScripts.length > 0) ||
           axiosResult.nextDataPayload
@@ -2685,6 +2887,7 @@ async function scrapeProduct(url, options = {}) {
     let puppeteerResult = null;
     let puppeteerZaraImages = [];
     let puppeteerPageUrl = null;
+    let puppeteerZaraInterstitial = null;
 
     if (shouldUsePuppeteer) {
       try {
@@ -2700,10 +2903,12 @@ async function scrapeProduct(url, options = {}) {
           acceptLanguage: acceptLanguageHeader,
           jar,
           dumpNetwork,
+          isZara: isZaraTarget || (axiosFinalUrl && isZaraUrl(axiosFinalUrl)),
         });
         puppeteerStats = puppeteerResult.requestStats || null;
         puppeteerZaraImages = ensureArray(puppeteerResult.zaraImages);
         puppeteerPageUrl = puppeteerResult?.meta?.pageUrl || null;
+        puppeteerZaraInterstitial = puppeteerResult?.zaraInterstitial || null;
         const htmlExtraction = extractFromHtml(
           puppeteerResult.html,
           url,
@@ -2733,6 +2938,32 @@ async function scrapeProduct(url, options = {}) {
       (isZaraUrl(url) ? url : null);
 
     if (zaraContextUrl) {
+      if (puppeteerZaraInterstitial?.detected) {
+        debugLog("Zara interstitial attempts", {
+          url: zaraContextUrl,
+          attempts: ensureArray(puppeteerZaraInterstitial.attempts).length,
+          blocked: !!puppeteerZaraInterstitial.blocked,
+        });
+      }
+      if (puppeteerZaraInterstitial?.blocked) {
+        const blockedPayload = {
+          ok: false,
+          error: "Blocked by Zara bot protection (Akamai interstitial)",
+          status: "blocked",
+        };
+        logErrorMessage(blockedPayload.error);
+        return blockedPayload;
+      }
+      if (!shouldUsePuppeteer && axiosZaraInterstitial.detected) {
+        const blockedPayload = {
+          ok: false,
+          error: "Blocked by Zara bot protection (Akamai interstitial)",
+          status: "blocked",
+        };
+        logErrorMessage(blockedPayload.error);
+        return blockedPayload;
+      }
+
       const combinedZaraImages = filterZaraImageUrls([
         ...puppeteerZaraImages,
         ...ensureArray(finalProduct.images),
