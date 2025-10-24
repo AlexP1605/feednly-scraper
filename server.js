@@ -3,7 +3,6 @@ import * as cheerio from "cheerio";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import { performance } from "node:perf_hooks";
-import { setTimeout as delay } from "node:timers/promises";
 
 const app = express();
 app.set("etag", false);
@@ -16,6 +15,10 @@ function debugLog(...args) {
   }
 }
 
+async function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
+}
+
 puppeteer.use(StealthPlugin());
 
 const MAX_ATTEMPTS = 3;
@@ -26,6 +29,7 @@ const NAVIGATION_TIMEOUT = Math.max(
 );
 
 const HUMAN_DELAY_RANGE = [2000, 3200];
+const MAX_NETWORK_BODY_BYTES = 2 * 1024 * 1024; // 2MB
 
 const ALLOWED_RESOURCE_TYPES = new Set([
   "document",
@@ -194,11 +198,11 @@ async function performHumanLikeDelays(page) {
     const startX = Math.floor(Math.random() * Math.max(1, viewport.width - 200));
     const startY = Math.floor(Math.random() * Math.max(1, viewport.height - 200));
     await page.mouse.move(startX, startY, { steps: 5 });
-    await page.waitForTimeout(120 + Math.floor(Math.random() * 180));
+    await delay(120 + Math.floor(Math.random() * 180));
     await page.mouse.move(startX + Math.floor(Math.random() * 120), startY + 60, {
       steps: 6,
     });
-    await page.waitForTimeout(80 + Math.floor(Math.random() * 160));
+    await delay(80 + Math.floor(Math.random() * 160));
     await page.evaluate(() => {
       try {
         const distance = 200 + Math.floor(Math.random() * 200);
@@ -207,7 +211,7 @@ async function performHumanLikeDelays(page) {
         window.scrollBy(0, 200);
       }
     });
-    await page.waitForTimeout(140 + Math.floor(Math.random() * 220));
+    await delay(140 + Math.floor(Math.random() * 220));
   } catch (err) {
     debugLog("Human-like delays failed", err.message);
   }
@@ -446,16 +450,11 @@ function extractWindowGlobals(windowPayloads, url) {
 function extractNetworkPayloads(payloads, url) {
   const nodes = [];
   for (const payload of payloads || []) {
-    const { parsed, text } = payload;
-    if (parsed) {
-      flattenJsonLd(parsed, nodes);
-    } else if (text) {
-      try {
-        const parsedText = JSON.parse(text);
-        flattenJsonLd(parsedText, nodes);
-      } catch (err) {
-        debugLog("Network payload parse failed", err.message);
-      }
+    if (!payload || !payload.parsed) continue;
+    try {
+      flattenJsonLd(payload.parsed, nodes);
+    } catch (err) {
+      debugLog("Network payload flatten failed", err.message);
     }
   }
   const result = collectProductFields(nodes, url);
@@ -726,29 +725,65 @@ async function scrapeAttempt(url, attempt, proxy) {
     page.on("response", async (response) => {
       try {
         const headers = response.headers();
-        const contentLength = headers["content-length"]
-          ? Number.parseInt(headers["content-length"], 10)
-          : 0;
+        const url = response.url();
+        const contentType = (headers["content-type"] || "").toLowerCase();
+        const contentLengthHeader = headers["content-length"];
+        const contentLength = contentLengthHeader
+          ? Number.parseInt(contentLengthHeader, 10)
+          : Number.NaN;
         if (Number.isFinite(contentLength) && contentLength > 0) {
           networkStats.bytes += contentLength;
         }
-        const url = response.url();
-        const contentType = headers["content-type"] || "";
-        const shouldParse =
-          /application\/json/i.test(contentType) ||
-          /product|media|item|api|detail/i.test(url);
-        if (shouldParse) {
-          const text = await response.text();
-          if (text) {
-            try {
-              const parsed = JSON.parse(text);
-              if (jsonContainsProductSignals(parsed)) {
-                networkPayloads.push({ url, parsed });
-              }
-            } catch {
-              networkPayloads.push({ url, text });
-            }
+
+        const summary = {
+          url,
+          contentType: contentType || null,
+          bodyLength: Number.isFinite(contentLength) ? contentLength : null,
+        };
+
+        const isBinary =
+          /(application\/octet-stream|image\/|video\/|audio\/|font\/|application\/pdf)/i.test(
+            contentType
+          );
+        const exceedsLimit =
+          Number.isFinite(contentLength) && contentLength > MAX_NETWORK_BODY_BYTES;
+        if (isBinary || exceedsLimit) {
+          debugLog("Response summary", { ...summary, skipped: isBinary ? "binary" : ">limit" });
+          return;
+        }
+
+        const text = await response.text().catch(() => null);
+        if (!Number.isFinite(contentLength) && text) {
+          const byteLength = Buffer.byteLength(text, "utf8");
+          networkStats.bytes += byteLength;
+          summary.bodyLength = byteLength;
+        }
+
+        if (text) {
+          const byteLength = summary.bodyLength ?? Buffer.byteLength(text, "utf8");
+          if (byteLength > MAX_NETWORK_BODY_BYTES) {
+            debugLog("Response summary", { ...summary, bodyLength: byteLength, skipped: ">limit" });
+            return;
           }
+          summary.bodyLength = byteLength;
+        }
+
+        debugLog("Response summary", summary);
+
+        if (!text || !contentType.includes("application/json")) {
+          return;
+        }
+
+        let json = null;
+        try {
+          json = JSON.parse(text);
+        } catch (err) {
+          debugLog("Network payload parse skipped", err.message);
+          return;
+        }
+
+        if (json && jsonContainsProductSignals(json)) {
+          networkPayloads.push({ url, contentType, parsed: json });
         }
       } catch (err) {
         debugLog("Response handling failed", err.message);
@@ -860,7 +895,9 @@ async function scrapeAttempt(url, attempt, proxy) {
     debugLog("Attempt failed", err.message);
     throw err;
   } finally {
+    page.removeAllListeners();
     await page.close().catch(() => {});
+    await delay(2000);
     await browser.close().catch(() => {});
   }
 }
