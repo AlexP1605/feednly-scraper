@@ -487,67 +487,53 @@ async function runStage3(url) {
   }
   console.log("Fallback BrightData triggered");
   const stageStart = performance.now();
-  const countries = ["fr", "de", "it", "es"];
+  const payload = {
+    zone: process.env.BRIGHTDATA_ZONE || "web_unlocker1",
+    url,
+    render: true,
+    response_format: "text",
+  };
+
   const headers = {
-    Authorization: `Bearer ${apiKey}`,
+    Authorization: `Bearer ${process.env.BRIGHTDATA_API_KEY}`,
     "Content-Type": "application/json",
     "X-Feednly-Scraper": "CloudRun",
   };
-  const zone = process.env.BRIGHTDATA_ZONE || "web_unlocker1";
 
-  async function requestWithFormat(format) {
-    const country = countries[Math.floor(Math.random() * countries.length)];
-    try {
-      const payload = {
-        zone,
-        url,
-        format,
-        country,
-      };
-      console.log("BrightData zone used:", payload.zone);
-      const response = await axios.post(
-        "https://api.brightdata.com/request",
-        payload,
-        {
-          headers,
-          timeout: NAVIGATION_TIMEOUT,
-        }
-      );
-      const html = response.data?.response || response.data?.body || response.data || "";
-      const htmlContent =
-        typeof html === "string"
-          ? html
-          : Buffer.isBuffer(html)
-          ? html.toString("utf8")
-          : "";
-      if (!htmlContent) {
-        console.warn(`Stage3 ${format} empty response body`);
-        return null;
-      }
-      const extracted = extractFromHtmlContent(htmlContent, url);
-      if (!extracted.title && !extracted.images.length) {
-        console.warn(`Stage3 ${format} extraction missing title and images`);
-      }
-      return extracted;
-    } catch (err) {
-      console.warn(`Stage3 ${format} request error`, err.message);
+  let attempts = 1;
+
+  try {
+    const response = await axios.post(
+      "https://api.brightdata.com/web_unlocker/v1.0",
+      payload,
+      { headers, timeout: NAVIGATION_TIMEOUT }
+    );
+
+    const html =
+      response.data?.solution?.response?.body ||
+      response.data?.solution?.content ||
+      response.data?.body ||
+      "";
+
+    const htmlContent =
+      typeof html === "string"
+        ? html
+        : Buffer.isBuffer(html)
+        ? html.toString("utf8")
+        : "";
+
+    if (!htmlContent) {
+      console.warn("Stage3 empty response body");
       return null;
     }
-  }
 
-  let attempts = 0;
-  attempts += 1;
-  let extracted = await requestWithFormat("raw");
+    const extracted = extractFromHtmlContent(htmlContent, url);
 
-  if (!extracted || !extracted.images.length) {
-    attempts += 1;
-    const rendered = await requestWithFormat("rendered");
-    if (rendered && (rendered.images.length > (extracted?.images?.length || 0) || !extracted)) {
-      extracted = rendered;
+    if (!isValidResult(extracted)) {
+      console.warn("Stage3 failed to extract valid product data");
+      return null;
     }
-  }
 
-  if (extracted && isValidResult(extracted)) {
     const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
     console.log("Stage3 success");
     return buildSuccessPayload(extracted, {
@@ -559,10 +545,10 @@ async function runStage3(url) {
       network: { durationSeconds },
       attempts,
     });
+  } catch (err) {
+    console.warn("Stage3 request error", err.message);
+    return null;
   }
-
-  console.warn("Stage3 failed to extract valid product data");
-  return null;
 }
 
 async function scrapeWithStages(url) {
