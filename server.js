@@ -7,6 +7,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
+const axiosMaxRedirects = Number.parseInt(process.env.SCRAPER_AXIOS_MAX_REDIRECTS || "", 10);
+if (Number.isFinite(axiosMaxRedirects) && axiosMaxRedirects >= 0) {
+  axios.defaults.maxRedirects = axiosMaxRedirects;
+}
+
 const app = express();
 app.set("etag", false);
 
@@ -125,6 +130,15 @@ function randomItem(list) {
 
 function randomBetween(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function shuffleList(values) {
+  const list = [...(values || [])];
+  for (let i = list.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  return list;
 }
 
 const { TimeoutError } = puppeteer.errors ?? {};
@@ -450,26 +464,69 @@ function combinePriceWithCurrency(priceValue, currencyValue) {
   return `${currencyText} ${priceText}`.trim();
 }
 
-function createHtmlPreview(html, maxLength = 320) {
-  if (!html) return "";
-  const normalized = `${html}`.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
+function createImageDedupKey(url) {
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    const normalizedSearch = new URLSearchParams();
+    const skipKeys = new Set([
+      "w",
+      "width",
+      "wid",
+      "rw",
+      "mw",
+      "h",
+      "height",
+      "hei",
+      "rh",
+      "mh",
+      "ts",
+      "timestamp",
+      "cache",
+      "quality",
+      "q",
+    ]);
+    const sortedKeys = Array.from(parsed.searchParams.keys()).sort();
+    for (const key of sortedKeys) {
+      if (skipKeys.has(key.toLowerCase())) {
+        continue;
+      }
+      const values = parsed.searchParams.getAll(key);
+      for (const value of values) {
+        normalizedSearch.append(key.toLowerCase(), value);
+      }
+    }
+    const normalizedQuery = normalizedSearch.toString();
+    return `${parsed.origin}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+  } catch {
+    return `${url}`.trim().toLowerCase();
   }
-  return `${normalized.slice(0, maxLength)}…`;
 }
 
-function dedupe(values) {
+function dedupeImages(values) {
+  const order = [];
   const seen = new Set();
-  const result = [];
+  const bestByKey = new Map();
   for (const value of values || []) {
     if (!value) continue;
-    const key = value.trim();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    result.push(key);
+    const trimmed = `${value}`.trim();
+    if (!trimmed) continue;
+    const key = createImageDedupKey(trimmed);
+    const score = computeImageScore(trimmed);
+    if (!seen.has(key)) {
+      seen.add(key);
+      order.push(key);
+      bestByKey.set(key, { url: trimmed, score });
+      continue;
+    }
+    const current = bestByKey.get(key);
+    if (!current || score > current.score) {
+      bestByKey.set(key, { url: trimmed, score });
+    }
   }
-  return result;
+  return order
+    .map((key) => bestByKey.get(key)?.url)
+    .filter((url) => typeof url === "string" && url.trim().length > 0);
 }
 
 function extractFromHtmlContent(html, url) {
@@ -739,7 +796,7 @@ function extractFromHtmlContent(html, url) {
       }
     });
 
-  let uniqueImages = dedupe(images);
+  let uniqueImages = dedupeImages(images);
   if (uniqueImages.length < 5 && fallbackCandidateMap.size) {
     const fallbackCandidates = Array.from(fallbackCandidateMap.values())
       .sort((a, b) => b.score - a.score)
@@ -749,7 +806,7 @@ function extractFromHtmlContent(html, url) {
       uniqueImages.push(candidate);
       if (uniqueImages.length >= 10) break;
     }
-    uniqueImages = dedupe(uniqueImages);
+    uniqueImages = dedupeImages(uniqueImages);
   }
 
   if (!uniqueImages.length) {
@@ -778,7 +835,7 @@ function extractFromHtmlContent(html, url) {
           });
         }
       });
-    uniqueImages = dedupe(fallbackImages);
+    uniqueImages = dedupeImages(fallbackImages);
   }
 
   const priceAfterImages = findPriceInTexts(priceValues, Array.from(currencyValues));
@@ -854,8 +911,7 @@ async function runStage1(url) {
     browser = await launchBrowser();
     page = await browser.newPage();
     pageSetup = await configurePage(page, url);
-    const { userAgent, viewport } = pageSetup;
-    console.log("🟢 Stage1 start", { userAgent, viewport });
+    const { userAgent } = pageSetup;
     const navigationStart = performance.now();
     let navigationMeta = null;
     let navigationError = null;
@@ -874,21 +930,11 @@ async function runStage1(url) {
     const navigationWaitUntil = navigationMeta?.waitUntil ?? navigationError?.navigationWaitUntil ?? null;
     const navigationTimedOut =
       (navigationMeta && navigationMeta.navigationTimedOut) || Boolean(navigationError?.navigationTimedOut);
-    console.log("🟢 Stage1 navigation", {
-      waitUntil: navigationWaitUntil,
-      durationSeconds: navigationDurationSeconds,
-      navigationTimedOut,
-    });
     await delay(randomBetween(...HUMAN_DELAY_RANGE));
     const html = await page.content();
     const extracted = extractFromHtmlContent(html, url);
     if (isValidResult(extracted)) {
       const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-      console.log("🟢 Stage1 success", {
-        title: extracted.title || null,
-        images: extracted.images?.length || 0,
-        durationSeconds,
-      });
       return buildSuccessPayload(extracted, {
         stage: "stage1",
         blocked: false,
@@ -909,7 +955,7 @@ async function runStage1(url) {
   } catch (err) {
     lastError = err;
     lastErrorMessage = err.message || lastErrorMessage;
-    console.error("🔴 Stage1 error", { message: err.message, stack: err.stack });
+    console.error("Stage1 error", { message: err.message });
   } finally {
     try {
       pageSetup?.disableInterception?.();
@@ -926,20 +972,29 @@ async function runStage1(url) {
   return { ok: false, stage: "stage1", error: lastErrorMessage || lastError?.message || "Stage1 failed" };
 }
 
+function parseProxyPool(value) {
+  if (!value) return [];
+  const entries = `${value}`
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const seen = new Set();
+  const result = [];
+  for (const entry of entries) {
+    const lower = entry.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    result.push(entry);
+  }
+  return result;
+}
+
 async function runStage2(url) {
-  const proxyRaw = process.env.MOBILE_PROXY || "";
-  if (!proxyRaw) {
-    console.warn("Stage2 skipped: MOBILE_PROXY missing");
-    return { ok: false, stage: "stage2", error: "MOBILE_PROXY missing" };
+  const proxies = shuffleList(parseProxyPool(process.env.SCRAPER_PROXY_POOL));
+  if (!proxies.length) {
+    console.warn("Stage2 skipped: SCRAPER_PROXY_POOL missing");
+    return { ok: false, stage: "stage2", error: "SCRAPER_PROXY_POOL missing" };
   }
-  let proxy;
-  try {
-    proxy = new URL(proxyRaw);
-  } catch (err) {
-    console.warn("Stage2 invalid proxy", err.message);
-    return { ok: false, stage: "stage2", error: "Invalid MOBILE_PROXY URL" };
-  }
-  const proxyServer = `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ""}`;
   const domain = (() => {
     try {
       return new URL(url).hostname;
@@ -952,9 +1007,18 @@ async function runStage2(url) {
   let attempts = 0;
   let lastError = null;
   let lastErrorMessage = null;
-  console.log("🟡 Stage2 using proxy:", proxyRaw);
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    attempts = attempt;
+  for (const proxyRaw of proxies) {
+    let proxy;
+    try {
+      proxy = new URL(proxyRaw);
+    } catch (err) {
+      lastErrorMessage = "Invalid proxy URL";
+      console.warn("Stage2 invalid proxy", err.message);
+      continue;
+    }
+    attempts += 1;
+    const attemptNumber = attempts;
+    const proxyServer = `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ""}`;
     let browser;
     let page;
     let pageSetup = null;
@@ -962,8 +1026,7 @@ async function runStage2(url) {
       browser = await launchBrowser(proxyServer);
       page = await browser.newPage();
       pageSetup = await configurePage(page, url);
-      const { userAgent, viewport } = pageSetup;
-      console.log("🟢 Stage2 start", { attempt, userAgent, viewport });
+      const { userAgent } = pageSetup;
       if (proxy.username || proxy.password) {
         await page.authenticate({
           username: decodeURIComponent(proxy.username || ""),
@@ -988,7 +1051,7 @@ async function runStage2(url) {
         navigationError = err;
         lastError = err;
         lastErrorMessage = err.message;
-        console.warn(`Stage2 attempt ${attempt} navigation error`, err.message);
+        console.warn(`Stage2 attempt ${attemptNumber} navigation error`, err.message);
       }
       const navigationDurationSeconds =
         navigationMeta?.durationSeconds ??
@@ -997,30 +1060,18 @@ async function runStage2(url) {
       const navigationWaitUntil = navigationMeta?.waitUntil ?? navigationError?.navigationWaitUntil ?? null;
       const navigationTimedOut =
         (navigationMeta && navigationMeta.navigationTimedOut) || Boolean(navigationError?.navigationTimedOut);
-      console.log("🟢 Stage2 navigation", {
-        attempt,
-        waitUntil: navigationWaitUntil,
-        durationSeconds: navigationDurationSeconds,
-        navigationTimedOut,
-      });
       await delay(randomBetween(...HUMAN_DELAY_RANGE));
       const html = await page.content();
       const extracted = extractFromHtmlContent(html, url);
       if (isValidResult(extracted)) {
         const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-        console.log("🟢 Stage2 success", {
-          attempt,
-          title: extracted.title || null,
-          images: extracted.images?.length || 0,
-          durationSeconds,
-        });
         return buildSuccessPayload(extracted, {
           stage: "stage2",
           blocked: false,
           fallbackUsed: false,
           durationSeconds,
           network: { durationSeconds },
-          attempts: attempt,
+          attempts,
           proxy: proxyServer,
           userAgent,
           navigationWaitUntil,
@@ -1037,11 +1088,7 @@ async function runStage2(url) {
     } catch (err) {
       lastError = err;
       lastErrorMessage = err.message || lastErrorMessage;
-      console.error("🔴 Stage2 failed", {
-        attempt,
-        message: err.message,
-        stack: err.stack,
-      });
+      console.error("Stage2 failed", { proxy: proxyServer, message: err.message });
     } finally {
       try {
         pageSetup?.disableInterception?.();
@@ -1085,9 +1132,6 @@ async function runStage3(url) {
   let attempts = 1;
 
   try {
-    console.log("🟡 BrightData request start", { zone: payload.zone, url });
-    console.log("🟡 BrightData payload:", JSON.stringify(payload));
-
     const response = await axios.post(
       "https://api.brightdata.com/request",
       payload,
@@ -1095,17 +1139,6 @@ async function runStage3(url) {
     );
 
     const responseData = response.data;
-    const responseType = Array.isArray(responseData)
-      ? "array"
-      : responseData === null
-      ? "null"
-      : typeof responseData;
-    console.log("🟢 BrightData response status:", response.status);
-    console.log("🟢 BrightData response type:", responseType);
-    if (responseData && typeof responseData === "object") {
-      console.log("🟢 BrightData response keys:", Object.keys(responseData));
-    }
-    console.log("🟢 BrightData response preview:", JSON.stringify(responseData).slice(0, 500));
 
     const htmlCandidates = [];
     if (typeof responseData === "string") {
@@ -1128,40 +1161,23 @@ async function runStage3(url) {
       }
     }
 
-    const htmlContent = htmlCandidates.find((candidate) =>
-      typeof candidate === "string" && candidate.trim().length > 0
+    const htmlContent = htmlCandidates.find(
+      (candidate) => typeof candidate === "string" && candidate.trim().length > 0
     );
 
     if (!htmlContent) {
-      console.warn("Stage3 empty response body", {
-        responseType,
-        hasContent: htmlCandidates.some((candidate) => candidate && candidate.length),
-      });
+      console.warn("Stage3 empty response body");
       return { ok: false, stage: "stage3", attempts, error: "Empty response body" };
     }
-
-    const htmlPreview = createHtmlPreview(htmlContent);
-    console.log("🟡 BrightData HTML preview", {
-      length: htmlContent.length,
-      preview: htmlPreview,
-    });
 
     const extracted = extractFromHtmlContent(htmlContent, url);
 
     if (!isValidResult(extracted)) {
-      console.warn("Stage3 failed to extract valid product data", {
-        htmlLength: htmlContent.length,
-        preview: htmlPreview,
-      });
+      console.warn("Stage3 failed to extract valid product data");
       return { ok: false, stage: "stage3", attempts, error: "Invalid BrightData extraction" };
     }
 
     const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-    console.log("🟢 BrightData success", {
-      title: extracted.title || null,
-      images: extracted.images?.length || 0,
-      durationSeconds,
-    });
     return buildSuccessPayload(extracted, {
       stage: "brightdata",
       fallbackUsed: true,
@@ -1172,9 +1188,7 @@ async function runStage3(url) {
       attempts,
     });
   } catch (err) {
-    console.error("🔴 BrightData error:", err.message);
-    console.error("🔴 BrightData response status:", err.response?.status);
-    console.error("🔴 BrightData response data:", err.response?.data);
+    console.error("BrightData error", { message: err.message, status: err.response?.status });
     return {
       ok: false,
       stage: "stage3",
@@ -1188,27 +1202,23 @@ async function scrapeWithStages(url) {
   if (!url) {
     throw new Error("URL is required");
   }
-  console.log("🧩 Starting scrapeWithStages", { url, time: new Date().toISOString() });
   const attemptsSummary = [];
-  console.log("➡️ Starting Stage1");
   const stage1 = await runStage1(url);
   attemptsSummary.push({ stage: "stage1", ok: Boolean(stage1?.ok), error: stage1?.error || null });
   if (stage1?.ok) {
     return stage1;
   }
-  console.log("➡️ Starting Stage2");
   const stage2 = await runStage2(url);
   attemptsSummary.push({ stage: "stage2", ok: Boolean(stage2?.ok), error: stage2?.error || null });
   if (stage2?.ok) {
     return stage2;
   }
-  console.log("➡️ Starting Stage3");
   const stage3 = await runStage3(url);
   attemptsSummary.push({ stage: "stage3", ok: Boolean(stage3?.ok), error: stage3?.error || null });
   if (stage3?.ok) {
     return stage3;
   }
-  console.error("❌ All stages failed", { attempts: attemptsSummary });
+  console.error("All stages failed", { attempts: attemptsSummary });
   return { ok: false, status: "blocked" };
 }
 
@@ -1220,7 +1230,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     uptime: process.uptime(),
-    mobileProxyConfigured: Boolean(process.env.MOBILE_PROXY),
+    proxyPoolConfigured: parseProxyPool(process.env.SCRAPER_PROXY_POOL).length > 0,
     brightDataConfigured: Boolean(process.env.BRIGHTDATA_API_KEY),
   });
 });
@@ -1244,11 +1254,6 @@ let PORT = Number.parseInt(`${portValue ?? ""}`.trim(), 10);
 if (!Number.isFinite(PORT) || PORT <= 0) {
   PORT = 8080;
 }
-
-console.log("🩺 Health configuration", {
-  brightDataZone: process.env.BRIGHTDATA_ZONE || null,
-  mobileProxyConfigured: Boolean(process.env.MOBILE_PROXY),
-});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Feednly Scraper listening on port ${PORT}`);
