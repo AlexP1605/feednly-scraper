@@ -30,6 +30,11 @@ const USER_AGENTS = [
 ];
 const VIEWPORT_WIDTHS = [1280, 1366, 1440, 1536, 1680, 1920];
 const VIEWPORT_HEIGHTS = [720, 768, 900, 960, 1080];
+const MAX_IMAGE_RESULTS = Math.max(
+  1,
+  Number.parseInt(process.env.SCRAPER_MAX_IMAGE_RESULTS || "15", 10) || 15
+);
+
 const PRODUCT_IMAGE_KEYWORDS = [
   "product",
   "media",
@@ -804,7 +809,7 @@ function extractFromHtmlContent(html, url) {
     for (const candidate of fallbackCandidates) {
       if (uniqueImages.includes(candidate)) continue;
       uniqueImages.push(candidate);
-      if (uniqueImages.length >= 10) break;
+      if (uniqueImages.length >= MAX_IMAGE_RESULTS) break;
     }
     uniqueImages = dedupeImages(uniqueImages);
   }
@@ -836,6 +841,10 @@ function extractFromHtmlContent(html, url) {
         }
       });
     uniqueImages = dedupeImages(fallbackImages);
+  }
+
+  if (uniqueImages.length > MAX_IMAGE_RESULTS) {
+    uniqueImages = uniqueImages.slice(0, MAX_IMAGE_RESULTS);
   }
 
   const priceAfterImages = findPriceInTexts(priceValues, Array.from(currencyValues));
@@ -1203,21 +1212,37 @@ async function scrapeWithStages(url) {
     throw new Error("URL is required");
   }
   const attemptsSummary = [];
+  const logSummary = (resultStage) => {
+    const stageOrder = ["stage1", "stage2", "stage3"];
+    const stages = new Map(attemptsSummary.map((entry) => [entry.stage, entry]));
+    const parts = stageOrder.map((stage) => {
+      const entry = stages.get(stage);
+      if (!entry) return `${stage}:skipped`;
+      if (entry.ok) return `${stage}:success`;
+      const errorMessage = entry.error ? `(${entry.error})` : "";
+      return `${stage}:failed${errorMessage}`;
+    });
+    console.log(`[SCRAPE] url=${url} result=${resultStage} steps=${parts.join(" ")}`);
+  };
   const stage1 = await runStage1(url);
   attemptsSummary.push({ stage: "stage1", ok: Boolean(stage1?.ok), error: stage1?.error || null });
   if (stage1?.ok) {
+    logSummary(stage1?.meta?.stage || "stage1");
     return stage1;
   }
   const stage2 = await runStage2(url);
   attemptsSummary.push({ stage: "stage2", ok: Boolean(stage2?.ok), error: stage2?.error || null });
   if (stage2?.ok) {
+    logSummary(stage2?.meta?.stage || "stage2");
     return stage2;
   }
   const stage3 = await runStage3(url);
   attemptsSummary.push({ stage: "stage3", ok: Boolean(stage3?.ok), error: stage3?.error || null });
   if (stage3?.ok) {
+    logSummary(stage3?.meta?.stage || "stage3");
     return stage3;
   }
+  logSummary("failed");
   console.error("All stages failed", { attempts: attemptsSummary });
   return { ok: false, status: "blocked" };
 }
