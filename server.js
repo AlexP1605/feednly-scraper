@@ -135,15 +135,21 @@ async function navigatePage(page, url) {
   ];
   let lastError = null;
   for (const strategy of strategies) {
+    const attemptStart = performance.now();
     try {
       await page.goto(url, { waitUntil: strategy.waitUntil, timeout: NAVIGATION_TIMEOUT });
       await page
         .waitForSelector("body", { timeout: Math.min(10000, NAVIGATION_TIMEOUT) })
         .catch(() => {});
-      return { waitUntil: strategy.label };
+      const durationSeconds = roundDuration((performance.now() - attemptStart) / 1000);
+      return { waitUntil: strategy.label, durationSeconds, navigationTimedOut: false };
     } catch (err) {
+      const durationSeconds = roundDuration((performance.now() - attemptStart) / 1000);
       lastError = err;
       const isTimeout = TimeoutError && err instanceof TimeoutError;
+      err.navigationWaitUntil = strategy.label;
+      err.navigationDurationSeconds = durationSeconds;
+      err.navigationTimedOut = isTimeout;
       console.warn(`Navigation attempt (${strategy.label}) failed`, err.message);
       if (!isTimeout) {
         throw err;
@@ -330,25 +336,47 @@ async function runStage1(url) {
   let browser;
   let page;
   let pageSetup = null;
+  let lastError = null;
+  let lastErrorMessage = null;
   try {
     browser = await launchBrowser();
     page = await browser.newPage();
     pageSetup = await configurePage(page, url);
-    const { userAgent } = pageSetup;
+    const { userAgent, viewport } = pageSetup;
+    console.log("🟢 Stage1 start", { userAgent, viewport });
+    const navigationStart = performance.now();
     let navigationMeta = null;
     let navigationError = null;
     try {
       navigationMeta = await navigatePage(page, url);
     } catch (err) {
       navigationError = err;
+      lastError = err;
+      lastErrorMessage = err.message;
       console.warn("Stage1 navigation error", err.message);
     }
+    const navigationDurationSeconds =
+      navigationMeta?.durationSeconds ??
+      navigationError?.navigationDurationSeconds ??
+      roundDuration((performance.now() - navigationStart) / 1000);
+    const navigationWaitUntil = navigationMeta?.waitUntil ?? navigationError?.navigationWaitUntil ?? null;
+    const navigationTimedOut =
+      (navigationMeta && navigationMeta.navigationTimedOut) || Boolean(navigationError?.navigationTimedOut);
+    console.log("🟢 Stage1 navigation", {
+      waitUntil: navigationWaitUntil,
+      durationSeconds: navigationDurationSeconds,
+      navigationTimedOut,
+    });
     await delay(randomBetween(...HUMAN_DELAY_RANGE));
     const html = await page.content();
     const extracted = extractFromHtmlContent(html, url);
     if (isValidResult(extracted)) {
       const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-      console.log("Stage1 success");
+      console.log("🟢 Stage1 success", {
+        title: extracted.title || null,
+        images: extracted.images?.length || 0,
+        durationSeconds,
+      });
       return buildSuccessPayload(extracted, {
         stage: "stage1",
         blocked: false,
@@ -356,15 +384,20 @@ async function runStage1(url) {
         durationSeconds,
         network: { durationSeconds },
         userAgent,
-        navigationWaitUntil: navigationMeta?.waitUntil || null,
-        navigationTimedOut: Boolean(navigationError),
+        navigationWaitUntil,
+        navigationTimedOut,
       });
+    }
+    if (!lastErrorMessage) {
+      lastErrorMessage = "Stage1 produced no valid result";
     }
     if (navigationError) {
       throw navigationError;
     }
   } catch (err) {
-    console.warn("Stage1 error", err.message);
+    lastError = err;
+    lastErrorMessage = err.message || lastErrorMessage;
+    console.error("🔴 Stage1 error", { message: err.message, stack: err.stack });
   } finally {
     try {
       pageSetup?.disableInterception?.();
@@ -378,21 +411,21 @@ async function runStage1(url) {
       await browser.close().catch(() => {});
     }
   }
-  return null;
+  return { ok: false, stage: "stage1", error: lastErrorMessage || lastError?.message || "Stage1 failed" };
 }
 
 async function runStage2(url) {
   const proxyRaw = process.env.MOBILE_PROXY || "";
   if (!proxyRaw) {
     console.warn("Stage2 skipped: MOBILE_PROXY missing");
-    return null;
+    return { ok: false, stage: "stage2", error: "MOBILE_PROXY missing" };
   }
   let proxy;
   try {
     proxy = new URL(proxyRaw);
   } catch (err) {
     console.warn("Stage2 invalid proxy", err.message);
-    return null;
+    return { ok: false, stage: "stage2", error: "Invalid MOBILE_PROXY URL" };
   }
   const proxyServer = `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ""}`;
   const domain = (() => {
@@ -405,7 +438,11 @@ async function runStage2(url) {
 
   const stageStart = performance.now();
   let attempts = 0;
-  for (attempts = 1; attempts <= 2; attempts += 1) {
+  let lastError = null;
+  let lastErrorMessage = null;
+  console.log("🟡 Stage2 using proxy:", proxyRaw);
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    attempts = attempt;
     let browser;
     let page;
     let pageSetup = null;
@@ -413,7 +450,8 @@ async function runStage2(url) {
       browser = await launchBrowser(proxyServer);
       page = await browser.newPage();
       pageSetup = await configurePage(page, url);
-      const { userAgent } = pageSetup;
+      const { userAgent, viewport } = pageSetup;
+      console.log("🟢 Stage2 start", { attempt, userAgent, viewport });
       if (proxy.username || proxy.password) {
         await page.authenticate({
           username: decodeURIComponent(proxy.username || ""),
@@ -431,37 +469,67 @@ async function runStage2(url) {
       await delay(randomBetween(400, 900));
       let navigationMeta = null;
       let navigationError = null;
+      const navigationStart = performance.now();
       try {
         navigationMeta = await navigatePage(page, url);
       } catch (err) {
         navigationError = err;
-        console.warn(`Stage2 attempt ${attempts} navigation error`, err.message);
+        lastError = err;
+        lastErrorMessage = err.message;
+        console.warn(`Stage2 attempt ${attempt} navigation error`, err.message);
       }
+      const navigationDurationSeconds =
+        navigationMeta?.durationSeconds ??
+        navigationError?.navigationDurationSeconds ??
+        roundDuration((performance.now() - navigationStart) / 1000);
+      const navigationWaitUntil = navigationMeta?.waitUntil ?? navigationError?.navigationWaitUntil ?? null;
+      const navigationTimedOut =
+        (navigationMeta && navigationMeta.navigationTimedOut) || Boolean(navigationError?.navigationTimedOut);
+      console.log("🟢 Stage2 navigation", {
+        attempt,
+        waitUntil: navigationWaitUntil,
+        durationSeconds: navigationDurationSeconds,
+        navigationTimedOut,
+      });
       await delay(randomBetween(...HUMAN_DELAY_RANGE));
       const html = await page.content();
       const extracted = extractFromHtmlContent(html, url);
       if (isValidResult(extracted)) {
         const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-        console.log("Stage2 success");
+        console.log("🟢 Stage2 success", {
+          attempt,
+          title: extracted.title || null,
+          images: extracted.images?.length || 0,
+          durationSeconds,
+        });
         return buildSuccessPayload(extracted, {
           stage: "stage2",
           blocked: false,
           fallbackUsed: false,
           durationSeconds,
           network: { durationSeconds },
-          attempts,
+          attempts: attempt,
           proxy: proxyServer,
           userAgent,
-          navigationWaitUntil: navigationMeta?.waitUntil || null,
-          navigationTimedOut: Boolean(navigationError),
+          navigationWaitUntil,
+          navigationTimedOut,
         });
+      }
+      if (!lastErrorMessage) {
+        lastErrorMessage = "Stage2 produced no valid result";
       }
       if (navigationError) {
         throw navigationError;
       }
       await delay(randomBetween(800, 1500));
     } catch (err) {
-      console.warn(`Stage2 attempt ${attempts} error`, err.message);
+      lastError = err;
+      lastErrorMessage = err.message || lastErrorMessage;
+      console.error("🔴 Stage2 failed", {
+        attempt,
+        message: err.message,
+        stack: err.stack,
+      });
     } finally {
       try {
         pageSetup?.disableInterception?.();
@@ -476,23 +544,26 @@ async function runStage2(url) {
       }
     }
   }
-  return null;
+  return {
+    ok: false,
+    stage: "stage2",
+    attempts,
+    error: lastErrorMessage || lastError?.message || "Stage2 failed",
+  };
 }
 
 async function runStage3(url) {
   const apiKey = process.env.BRIGHTDATA_API_KEY;
   if (!apiKey) {
     console.warn("Stage3 skipped: BRIGHTDATA_API_KEY missing");
-    return null;
+    return { ok: false, stage: "stage3", error: "BRIGHTDATA_API_KEY missing" };
   }
-  console.log("Fallback BrightData triggered");
   const stageStart = performance.now();
   const payload = {
     zone: process.env.BRIGHTDATA_ZONE || "web_unlocker1",
     url,
     format: "raw",
   };
-  const zone = payload.zone;
 
   const headers = {
     Authorization: `Bearer ${process.env.BRIGHTDATA_API_KEY}`,
@@ -502,7 +573,7 @@ async function runStage3(url) {
   let attempts = 1;
 
   try {
-    console.log("🟡 BrightData zone:", zone);
+    console.log("🟡 BrightData request start", { zone: payload.zone, url });
     console.log("🟡 BrightData payload:", JSON.stringify(payload));
 
     const response = await axios.post(
@@ -512,11 +583,8 @@ async function runStage3(url) {
     );
 
     console.log("🟢 BrightData response status:", response.status);
-    console.log("🟢 BrightData keys:", Object.keys(response.data || {}));
-    console.log(
-      "🟢 BrightData raw data sample:",
-      JSON.stringify(response.data).slice(0, 300)
-    );
+    console.log("🟢 BrightData response keys:", Object.keys(response.data || {}));
+    console.log("🟢 BrightData response preview:", JSON.stringify(response.data).slice(0, 500));
 
     const html =
       response.data?.solution?.response?.body ||
@@ -533,19 +601,28 @@ async function runStage3(url) {
         : "";
 
     if (!htmlContent) {
-      console.warn("Stage3 empty response body");
-      return null;
+      console.warn("Stage3 empty response body", response.data);
+      return { ok: false, stage: "stage3", attempts, error: "Empty response body" };
     }
+
+    const htmlPreview = htmlContent.slice(0, 500);
+    console.log("🟡 BrightData HTML preview:", htmlPreview);
 
     const extracted = extractFromHtmlContent(htmlContent, url);
 
     if (!isValidResult(extracted)) {
-      console.warn("Stage3 failed to extract valid product data");
-      return null;
+      console.warn("Stage3 failed to extract valid product data", {
+        htmlPreview,
+      });
+      return { ok: false, stage: "stage3", attempts, error: "Invalid BrightData extraction" };
     }
 
     const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-    console.log("Stage3 success");
+    console.log("🟢 BrightData success", {
+      title: extracted.title || null,
+      images: extracted.images?.length || 0,
+      durationSeconds,
+    });
     return buildSuccessPayload(extracted, {
       stage: "brightdata",
       fallbackUsed: true,
@@ -556,11 +633,15 @@ async function runStage3(url) {
       attempts,
     });
   } catch (err) {
-    console.warn("Stage3 request error", err.message);
     console.error("🔴 BrightData error:", err.message);
     console.error("🔴 BrightData response status:", err.response?.status);
     console.error("🔴 BrightData response data:", err.response?.data);
-    return null;
+    return {
+      ok: false,
+      stage: "stage3",
+      attempts,
+      error: err.message || "BrightData request failed",
+    };
   }
 }
 
@@ -568,18 +649,27 @@ async function scrapeWithStages(url) {
   if (!url) {
     throw new Error("URL is required");
   }
+  console.log("🧩 Starting scrapeWithStages", { url, time: new Date().toISOString() });
+  const attemptsSummary = [];
+  console.log("➡️ Starting Stage1");
   const stage1 = await runStage1(url);
+  attemptsSummary.push({ stage: "stage1", ok: Boolean(stage1?.ok), error: stage1?.error || null });
   if (stage1?.ok) {
     return stage1;
   }
+  console.log("➡️ Starting Stage2");
   const stage2 = await runStage2(url);
+  attemptsSummary.push({ stage: "stage2", ok: Boolean(stage2?.ok), error: stage2?.error || null });
   if (stage2?.ok) {
     return stage2;
   }
+  console.log("➡️ Starting Stage3");
   const stage3 = await runStage3(url);
+  attemptsSummary.push({ stage: "stage3", ok: Boolean(stage3?.ok), error: stage3?.error || null });
   if (stage3?.ok) {
     return stage3;
   }
+  console.error("❌ All stages failed", { attempts: attemptsSummary });
   return { ok: false, status: "blocked" };
 }
 
@@ -615,6 +705,11 @@ let PORT = Number.parseInt(`${portValue ?? ""}`.trim(), 10);
 if (!Number.isFinite(PORT) || PORT <= 0) {
   PORT = 8080;
 }
+
+console.log("🩺 Health configuration", {
+  brightDataZone: process.env.BRIGHTDATA_ZONE || null,
+  mobileProxyConfigured: Boolean(process.env.MOBILE_PROXY),
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Feednly Scraper listening on port ${PORT}`);
