@@ -34,6 +34,7 @@ const MAX_IMAGE_RESULTS = Math.max(
   1,
   Number.parseInt(process.env.SCRAPER_MAX_IMAGE_RESULTS || "15", 10) || 15
 );
+const BEST_IMAGE_LIMIT = Math.min(10, MAX_IMAGE_RESULTS);
 
 const PRODUCT_IMAGE_KEYWORDS = [
   "product",
@@ -406,6 +407,52 @@ function computeImageScore(url, meta = {}) {
   if (meta.order !== undefined && meta.order !== null) {
     score -= meta.order;
   }
+  return score;
+}
+
+const IMAGE_KEYWORD_BONUSES = ["meta", "og", "product", "main", "hero", "cover"];
+const IMAGE_QUALITY_HINTS = ["_large", "-large", "_xlarge", "-xlarge", "_2x", "-2x", "@2x", "1200", "1600"];
+const IMAGE_NEGATIVE_KEYWORDS = ["logo", "icon", "nav", "sprite", "small", "thumbnail", "thumb", "avatar"];
+
+function scoreImage(url) {
+  if (!url) return 0;
+  const normalized = `${url}`.trim();
+  if (!normalized) return 0;
+  const lower = normalized.toLowerCase();
+  let score = 0;
+
+  const extensionMatch = lower.match(/\.([a-z0-9]+)(?:[?#]|$)/);
+  if (extensionMatch) {
+    const ext = extensionMatch[1];
+    if (ext === "svg") {
+      score -= 250;
+    } else if (["jpg", "jpeg", "png", "webp", "avif", "gif", "bmp", "tif", "tiff", "jfif", "pjpeg", "pjp"].includes(ext)) {
+      score += 40;
+    } else {
+      score += 20;
+    }
+  } else {
+    score += 15;
+  }
+
+  for (const keyword of IMAGE_KEYWORD_BONUSES) {
+    if (lower.includes(keyword)) {
+      score += 25;
+    }
+  }
+
+  for (const hint of IMAGE_QUALITY_HINTS) {
+    if (lower.includes(hint)) {
+      score += 18;
+    }
+  }
+
+  for (const negative of IMAGE_NEGATIVE_KEYWORDS) {
+    if (lower.includes(negative)) {
+      score -= 35;
+    }
+  }
+
   return score;
 }
 
@@ -847,6 +894,13 @@ function extractFromHtmlContent(html, url) {
     uniqueImages = uniqueImages.slice(0, MAX_IMAGE_RESULTS);
   }
 
+  const rankedImages = Array.from(new Set(uniqueImages))
+    .map((imageUrl) => ({ url: imageUrl, score: scoreImage(imageUrl) }))
+    .sort((a, b) => b.score - a.score);
+  const bestRankedImages = rankedImages.filter((entry) => entry.score > 0).slice(0, BEST_IMAGE_LIMIT);
+  const bestImages = bestRankedImages.map((entry) => entry.url);
+  const bestImage = bestImages[0] || null;
+
   const priceAfterImages = findPriceInTexts(priceValues, Array.from(currencyValues));
   if (!price && priceAfterImages) {
     price = priceAfterImages;
@@ -862,7 +916,7 @@ function extractFromHtmlContent(html, url) {
     }
   }
 
-  return { title, description, price: price || null, images: uniqueImages };
+  return { title, description, price: price || null, images: bestImages, bestImage };
 }
 
 function isValidResult(result) {
@@ -905,6 +959,7 @@ function buildSuccessPayload(data, meta) {
     description: data.description || null,
     price: data.price || null,
     images: data.images || [],
+    bestImage: data.bestImage || null,
     meta,
   };
 }
@@ -1211,40 +1266,93 @@ async function scrapeWithStages(url) {
   if (!url) {
     throw new Error("URL is required");
   }
-  const attemptsSummary = [];
-  const logSummary = (resultStage) => {
-    const stageOrder = ["stage1", "stage2", "stage3"];
-    const stages = new Map(attemptsSummary.map((entry) => [entry.stage, entry]));
-    const parts = stageOrder.map((stage) => {
-      const entry = stages.get(stage);
-      if (!entry) return `${stage}:skipped`;
-      if (entry.ok) return `${stage}:success`;
-      const errorMessage = entry.error ? `(${entry.error})` : "";
-      return `${stage}:failed${errorMessage}`;
-    });
-    console.log(`[SCRAPE] url=${url} result=${resultStage} steps=${parts.join(" ")}`);
+  const requestStart = performance.now();
+  const steps = { stage1: "skipped", stage2: "skipped", stage3: "skipped" };
+
+  const resolveStageStatus = (result, attempted, allowMissingAsSkipped) => {
+    if (!attempted) {
+      return "skipped";
+    }
+    if (result?.ok) {
+      return "success";
+    }
+    if (allowMissingAsSkipped) {
+      const errorText = `${result?.error || ""}`.toLowerCase();
+      if (errorText.includes("missing") || errorText.includes("skip")) {
+        return "skipped";
+      }
+    }
+    return "failed";
   };
-  const stage1 = await runStage1(url);
-  attemptsSummary.push({ stage: "stage1", ok: Boolean(stage1?.ok), error: stage1?.error || null });
-  if (stage1?.ok) {
-    logSummary(stage1?.meta?.stage || "stage1");
-    return stage1;
+
+  const stage1Result = await runStage1(url);
+  steps.stage1 = resolveStageStatus(stage1Result, true, false);
+  let finalResult = null;
+  let finalStage = stage1Result?.meta?.stage || "stage1";
+
+  let stage2Result = null;
+  let stage2Attempted = false;
+  if (stage1Result?.ok) {
+    finalResult = stage1Result;
+  } else {
+    stage2Attempted = true;
+    stage2Result = await runStage2(url);
+    if (stage2Result?.ok) {
+      finalResult = stage2Result;
+      finalStage = stage2Result?.meta?.stage || "stage2";
+    }
   }
-  const stage2 = await runStage2(url);
-  attemptsSummary.push({ stage: "stage2", ok: Boolean(stage2?.ok), error: stage2?.error || null });
-  if (stage2?.ok) {
-    logSummary(stage2?.meta?.stage || "stage2");
-    return stage2;
+  steps.stage2 = resolveStageStatus(stage2Result, stage2Attempted, true);
+
+  let stage3Result = null;
+  let stage3Attempted = false;
+  if (!finalResult) {
+    stage3Attempted = true;
+    stage3Result = await runStage3(url);
+    if (stage3Result?.ok) {
+      finalResult = stage3Result;
+      finalStage = stage3Result?.meta?.stage || "brightdata";
+    }
   }
-  const stage3 = await runStage3(url);
-  attemptsSummary.push({ stage: "stage3", ok: Boolean(stage3?.ok), error: stage3?.error || null });
-  if (stage3?.ok) {
-    logSummary(stage3?.meta?.stage || "stage3");
-    return stage3;
+  steps.stage3 = resolveStageStatus(stage3Result, stage3Attempted, true);
+
+  if (!finalResult) {
+    finalResult = { ok: false, status: "blocked" };
+    finalStage = "failed";
   }
-  logSummary("failed");
-  console.error("All stages failed", { attempts: attemptsSummary });
-  return { ok: false, status: "blocked" };
+
+  const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
+  const blocked = Boolean(
+    finalResult?.meta?.blocked ||
+      finalResult?.status === "blocked" ||
+      stage1Result?.status === "blocked" ||
+      stage2Result?.status === "blocked" ||
+      stage3Result?.status === "blocked"
+  );
+
+  const logEntry = {
+    event: "SCRAPE",
+    url,
+    result: finalResult.ok ? finalStage : "failed",
+    steps,
+    duration: durationSeconds,
+    blocked,
+    imagesCount: Array.isArray(finalResult?.images) ? finalResult.images.length : 0,
+    bestImage: finalResult?.bestImage || null,
+    timestamp: new Date().toISOString(),
+  };
+
+  console.log(JSON.stringify(logEntry));
+
+  if (!finalResult.ok) {
+    console.error("All stages failed", {
+      stage1: stage1Result?.error || null,
+      stage2: stage2Result?.error || null,
+      stage3: stage3Result?.error || null,
+    });
+  }
+
+  return finalResult;
 }
 
 app.get("/", (_req, res) => {
