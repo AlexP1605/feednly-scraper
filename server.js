@@ -191,12 +191,28 @@ function normalizeUrl(value, baseUrl) {
   }
 }
 
-function isLikelyProductImage(url) {
+function isLikelyProductImage(url, { requireProductKeyword = true } = {}) {
   if (!url) return false;
   const lower = url.toLowerCase();
-  if (!/\.(jpe?g|png|webp)(?:$|\?)/.test(lower)) return false;
+  if (!/\.(jpe?g|png|webp|gif)(?:$|\?)/.test(lower)) return false;
   if (PLACEHOLDER_KEYWORDS.some((keyword) => lower.includes(keyword))) return false;
+  if (!requireProductKeyword) return true;
   return PRODUCT_IMAGE_KEYWORDS.some((keyword) => lower.includes(keyword));
+}
+
+function extractSrcsetUrls(value) {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((part) => part.trim().split(/\s+/)[0])
+    .filter(Boolean);
+}
+
+function addImageCandidate(collection, candidate, url, options) {
+  const normalized = normalizeUrl(candidate, url);
+  if (normalized && isLikelyProductImage(normalized, options)) {
+    collection.push(normalized);
+  }
 }
 
 function createHtmlPreview(html, maxLength = 320) {
@@ -276,24 +292,91 @@ function extractFromHtmlContent(html, url) {
       .toArray()
       .forEach((element) => {
         const candidate = $(element).attr("content") || $(element).attr("href");
-        const normalized = normalizeUrl(candidate, url);
-        if (normalized && isLikelyProductImage(normalized)) {
-          images.push(normalized);
-        }
+        addImageCandidate(images, candidate, url, { requireProductKeyword: false });
       });
   }
 
   $("img")
     .toArray()
     .forEach((element) => {
-      const candidate = $(element).attr("src") || $(element).attr("data-src");
-      const normalized = normalizeUrl(candidate, url);
-      if (normalized && isLikelyProductImage(normalized)) {
-        images.push(normalized);
+      const el = $(element);
+      const src = el.attr("src") || el.attr("data-src");
+      addImageCandidate(images, src, url, { requireProductKeyword: true });
+      const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
+      for (const srcset of srcsetValues) {
+        extractSrcsetUrls(srcset).forEach((candidate) => {
+          addImageCandidate(images, candidate, url, { requireProductKeyword: true });
+        });
       }
     });
 
-  return { title, description, price: price || null, images: dedupe(images) };
+  $("source")
+    .toArray()
+    .forEach((element) => {
+      const el = $(element);
+      const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
+      for (const srcset of srcsetValues) {
+        extractSrcsetUrls(srcset).forEach((candidate) => {
+          addImageCandidate(images, candidate, url, { requireProductKeyword: true });
+        });
+      }
+    });
+
+  $("script[type='application/ld+json']")
+    .toArray()
+    .forEach((element) => {
+      const text = $(element).text();
+      if (!text) return;
+      try {
+        const json = JSON.parse(text);
+        const nodes = Array.isArray(json) ? json : [json];
+        nodes.forEach((node) => {
+          if (!node || typeof node !== "object") return;
+          const imageField = node.image || node.images || node.photo;
+          if (!imageField) return;
+          const imageValues = Array.isArray(imageField) ? imageField : [imageField];
+          imageValues.forEach((candidate) => {
+            if (typeof candidate === "string") {
+              addImageCandidate(images, candidate, url, { requireProductKeyword: false });
+            }
+          });
+        });
+      } catch {
+        // ignore invalid JSON-LD
+      }
+    });
+
+  let uniqueImages = dedupe(images);
+  if (!uniqueImages.length) {
+    const fallbackImages = [];
+    $("img")
+      .toArray()
+      .forEach((element) => {
+        const el = $(element);
+        const src = el.attr("src") || el.attr("data-src");
+        addImageCandidate(fallbackImages, src, url, { requireProductKeyword: false });
+        const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
+        for (const srcset of srcsetValues) {
+          extractSrcsetUrls(srcset).forEach((candidate) => {
+            addImageCandidate(fallbackImages, candidate, url, { requireProductKeyword: false });
+          });
+        }
+      });
+    $("source")
+      .toArray()
+      .forEach((element) => {
+        const el = $(element);
+        const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
+        for (const srcset of srcsetValues) {
+          extractSrcsetUrls(srcset).forEach((candidate) => {
+            addImageCandidate(fallbackImages, candidate, url, { requireProductKeyword: false });
+          });
+        }
+      });
+    uniqueImages = dedupe(fallbackImages);
+  }
+
+  return { title, description, price: price || null, images: uniqueImages };
 }
 
 function isValidResult(result) {
