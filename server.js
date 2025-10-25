@@ -60,6 +60,102 @@ function randomBetween(min, max) {
   return min + Math.random() * (max - min);
 }
 
+const { TimeoutError } = puppeteer.errors ?? {};
+
+async function enableRequestOptimizations(page, targetUrl) {
+  let targetHostname = null;
+  try {
+    targetHostname = new URL(targetUrl).hostname;
+  } catch {
+    targetHostname = null;
+  }
+
+  try {
+    await page.setRequestInterception(true);
+  } catch (err) {
+    console.warn("Failed to enable request interception", err.message);
+    return () => {};
+  }
+
+  const handler = (request) => {
+    try {
+      const type = request.resourceType();
+      if (type === "stylesheet" || type === "font" || type === "media") {
+        request.abort();
+        return;
+      }
+      if (type === "image") {
+        if (targetHostname) {
+          try {
+            const requestHostname = new URL(request.url()).hostname;
+            if (requestHostname && requestHostname !== targetHostname) {
+              request.abort();
+              return;
+            }
+          } catch {
+            request.abort();
+            return;
+          }
+        }
+      }
+    } catch {
+      // Ignore interception errors and fall back to continuing the request.
+    }
+    request.continue().catch(() => {});
+  };
+
+  page.on("request", handler);
+  return () => {
+    page.off("request", handler);
+    page.setRequestInterception(false).catch(() => {});
+  };
+}
+
+async function configurePage(page, url) {
+  const userAgent = pickUserAgent();
+  const viewport = pickViewport();
+  await page.setUserAgent(userAgent);
+  await page.setViewport(viewport);
+  await page.setJavaScriptEnabled(true);
+  if (typeof page.setDefaultNavigationTimeout === "function") {
+    page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT);
+  }
+  if (typeof page.setDefaultTimeout === "function") {
+    page.setDefaultTimeout(Math.max(NAVIGATION_TIMEOUT, 30000));
+  }
+  const disableInterception = await enableRequestOptimizations(page, url);
+  return { userAgent, viewport, disableInterception };
+}
+
+async function navigatePage(page, url) {
+  const strategies = [
+    { waitUntil: "domcontentloaded", label: "domcontentloaded" },
+    { waitUntil: "load", label: "load" },
+    { waitUntil: "networkidle2", label: "networkidle2" },
+  ];
+  let lastError = null;
+  for (const strategy of strategies) {
+    try {
+      await page.goto(url, { waitUntil: strategy.waitUntil, timeout: NAVIGATION_TIMEOUT });
+      await page
+        .waitForSelector("body", { timeout: Math.min(10000, NAVIGATION_TIMEOUT) })
+        .catch(() => {});
+      return { waitUntil: strategy.label };
+    } catch (err) {
+      lastError = err;
+      const isTimeout = TimeoutError && err instanceof TimeoutError;
+      console.warn(`Navigation attempt (${strategy.label}) failed`, err.message);
+      if (!isTimeout) {
+        throw err;
+      }
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
+  throw new Error("Navigation failed");
+}
+
 function pickUserAgent() {
   return randomItem(USER_AGENTS);
 }
@@ -233,15 +329,20 @@ async function runStage1(url) {
   const stageStart = performance.now();
   let browser;
   let page;
+  let pageSetup = null;
   try {
     browser = await launchBrowser();
     page = await browser.newPage();
-    const userAgent = pickUserAgent();
-    const viewport = pickViewport();
-    await page.setUserAgent(userAgent);
-    await page.setViewport(viewport);
-    await page.setJavaScriptEnabled(true);
-    await page.goto(url, { waitUntil: "networkidle2", timeout: NAVIGATION_TIMEOUT });
+    pageSetup = await configurePage(page, url);
+    const { userAgent } = pageSetup;
+    let navigationMeta = null;
+    let navigationError = null;
+    try {
+      navigationMeta = await navigatePage(page, url);
+    } catch (err) {
+      navigationError = err;
+      console.warn("Stage1 navigation error", err.message);
+    }
     await delay(randomBetween(...HUMAN_DELAY_RANGE));
     const html = await page.content();
     const extracted = extractFromHtmlContent(html, url);
@@ -255,11 +356,21 @@ async function runStage1(url) {
         durationSeconds,
         network: { durationSeconds },
         userAgent,
+        navigationWaitUntil: navigationMeta?.waitUntil || null,
+        navigationTimedOut: Boolean(navigationError),
       });
+    }
+    if (navigationError) {
+      throw navigationError;
     }
   } catch (err) {
     console.warn("Stage1 error", err.message);
   } finally {
+    try {
+      pageSetup?.disableInterception?.();
+    } catch {
+      // ignore
+    }
     if (page) {
       await page.close().catch(() => {});
     }
@@ -297,13 +408,12 @@ async function runStage2(url) {
   for (attempts = 1; attempts <= 2; attempts += 1) {
     let browser;
     let page;
+    let pageSetup = null;
     try {
       browser = await launchBrowser(proxyServer);
       page = await browser.newPage();
-      const userAgent = pickUserAgent();
-      const viewport = pickViewport();
-      await page.setUserAgent(userAgent);
-      await page.setViewport(viewport);
+      pageSetup = await configurePage(page, url);
+      const { userAgent } = pageSetup;
       if (proxy.username || proxy.password) {
         await page.authenticate({
           username: decodeURIComponent(proxy.username || ""),
@@ -319,7 +429,14 @@ async function runStage2(url) {
         }
       }
       await delay(randomBetween(400, 900));
-      await page.goto(url, { waitUntil: "networkidle2", timeout: NAVIGATION_TIMEOUT });
+      let navigationMeta = null;
+      let navigationError = null;
+      try {
+        navigationMeta = await navigatePage(page, url);
+      } catch (err) {
+        navigationError = err;
+        console.warn(`Stage2 attempt ${attempts} navigation error`, err.message);
+      }
       await delay(randomBetween(...HUMAN_DELAY_RANGE));
       const html = await page.content();
       const extracted = extractFromHtmlContent(html, url);
@@ -334,12 +451,23 @@ async function runStage2(url) {
           network: { durationSeconds },
           attempts,
           proxy: proxyServer,
+          userAgent,
+          navigationWaitUntil: navigationMeta?.waitUntil || null,
+          navigationTimedOut: Boolean(navigationError),
         });
+      }
+      if (navigationError) {
+        throw navigationError;
       }
       await delay(randomBetween(800, 1500));
     } catch (err) {
       console.warn(`Stage2 attempt ${attempts} error`, err.message);
     } finally {
+      try {
+        pageSetup?.disableInterception?.();
+      } catch {
+        // ignore
+      }
       if (page) {
         await page.close().catch(() => {});
       }
