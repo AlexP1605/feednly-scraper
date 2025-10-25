@@ -591,26 +591,49 @@ async function runStage3(url) {
       { headers, timeout: NAVIGATION_TIMEOUT }
     );
 
+    const responseData = response.data;
+    const responseType = Array.isArray(responseData)
+      ? "array"
+      : responseData === null
+      ? "null"
+      : typeof responseData;
     console.log("🟢 BrightData response status:", response.status);
-    console.log("🟢 BrightData response keys:", Object.keys(response.data || {}));
-    console.log("🟢 BrightData response preview:", JSON.stringify(response.data).slice(0, 500));
+    console.log("🟢 BrightData response type:", responseType);
+    if (responseData && typeof responseData === "object") {
+      console.log("🟢 BrightData response keys:", Object.keys(responseData));
+    }
+    console.log("🟢 BrightData response preview:", JSON.stringify(responseData).slice(0, 500));
 
-    const html =
-      response.data?.solution?.response?.body ||
-      response.data?.solution?.content ||
-      response.data?.response?.body ||
-      response.data?.body ||
-      "";
+    const htmlCandidates = [];
+    if (typeof responseData === "string") {
+      htmlCandidates.push(responseData);
+    }
+    if (Buffer.isBuffer(responseData)) {
+      htmlCandidates.push(responseData.toString("utf8"));
+    }
+    if (responseData && typeof responseData === "object") {
+      const html =
+        responseData?.solution?.response?.body ||
+        responseData?.solution?.content ||
+        responseData?.response?.body ||
+        responseData?.body ||
+        "";
+      if (typeof html === "string") {
+        htmlCandidates.push(html);
+      } else if (Buffer.isBuffer(html)) {
+        htmlCandidates.push(html.toString("utf8"));
+      }
+    }
 
-    const htmlContent =
-      typeof html === "string"
-        ? html
-        : Buffer.isBuffer(html)
-        ? html.toString("utf8")
-        : "";
+    const htmlContent = htmlCandidates.find((candidate) =>
+      typeof candidate === "string" && candidate.trim().length > 0
+    );
 
     if (!htmlContent) {
-      console.warn("Stage3 empty response body", response.data);
+      console.warn("Stage3 empty response body", {
+        responseType,
+        hasContent: htmlCandidates.some((candidate) => candidate && candidate.length),
+      });
       return { ok: false, stage: "stage3", attempts, error: "Empty response body" };
     }
 
