@@ -493,6 +493,7 @@ async function runStage3(url) {
     render: true,
     response_format: "text",
   };
+  const zone = payload.zone;
 
   const headers = {
     Authorization: `Bearer ${process.env.BRIGHTDATA_API_KEY}`,
@@ -503,10 +504,20 @@ async function runStage3(url) {
   let attempts = 1;
 
   try {
+    console.log("🟡 BrightData zone:", zone);
+    console.log("🟡 BrightData payload:", JSON.stringify(payload));
+
     const response = await axios.post(
       "https://api.brightdata.com/web_unlocker/v1.0",
       payload,
       { headers, timeout: NAVIGATION_TIMEOUT }
+    );
+
+    console.log("🟢 BrightData response status:", response.status);
+    console.log("🟢 BrightData keys:", Object.keys(response.data || {}));
+    console.log(
+      "🟢 BrightData raw data sample:",
+      JSON.stringify(response.data).slice(0, 300)
     );
 
     const html =
@@ -547,6 +558,9 @@ async function runStage3(url) {
     });
   } catch (err) {
     console.warn("Stage3 request error", err.message);
+    console.error("🔴 BrightData error:", err.message);
+    console.error("🔴 BrightData response status:", err.response?.status);
+    console.error("🔴 BrightData response data:", err.response?.data);
     return null;
   }
 }
