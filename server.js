@@ -48,6 +48,73 @@ const PLACEHOLDER_KEYWORDS = [
   "icon",
 ];
 
+const CURRENCY_SYMBOLS = [
+  "$",
+  "€",
+  "£",
+  "¥",
+  "₹",
+  "₩",
+  "₽",
+  "₫",
+  "₦",
+  "₪",
+  "฿",
+  "₴",
+  "₱",
+  "₲",
+  "₵",
+  "₡",
+  "R$",
+];
+
+const CURRENCY_CODES = [
+  "USD",
+  "EUR",
+  "GBP",
+  "JPY",
+  "CNY",
+  "CAD",
+  "AUD",
+  "NZD",
+  "CHF",
+  "HKD",
+  "SEK",
+  "NOK",
+  "DKK",
+  "PLN",
+  "RON",
+  "HUF",
+  "CZK",
+  "MXN",
+  "ARS",
+  "BRL",
+  "TRY",
+  "ZAR",
+  "AED",
+  "SAR",
+  "INR",
+  "KRW",
+  "RUB",
+  "SGD",
+  "TWD",
+  "MYR",
+  "THB",
+  "PHP",
+  "IDR",
+];
+
+const CURRENCY_SYMBOL_PATTERN = CURRENCY_SYMBOLS.map((symbol) =>
+  symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+).join("|");
+const CURRENCY_CODE_PATTERN = CURRENCY_CODES.join("|");
+const PRICE_REGEXES = [
+  new RegExp(`(?:${CURRENCY_SYMBOL_PATTERN})\\s*\\d[\\d.,]*`, "i"),
+  new RegExp(`\\d[\\d.,]*\\s*(?:${CURRENCY_SYMBOL_PATTERN})`, "i"),
+  new RegExp(`(?:${CURRENCY_CODE_PATTERN})\\s*\\d[\\d.,]*`, "i"),
+  new RegExp(`\\d[\\d.,]*\\s*(?:${CURRENCY_CODE_PATTERN})`, "i"),
+];
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
 }
@@ -200,19 +267,187 @@ function isLikelyProductImage(url, { requireProductKeyword = true } = {}) {
   return PRODUCT_IMAGE_KEYWORDS.some((keyword) => lower.includes(keyword));
 }
 
-function extractSrcsetUrls(value) {
+function parseDimension(value) {
+  if (value === undefined || value === null) return null;
+  const stringValue = `${value}`.replace(/,/g, ".");
+  const match = stringValue.match(/\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const number = Number.parseFloat(match[0]);
+  if (!Number.isFinite(number) || number <= 0) return null;
+  return Math.round(number);
+}
+
+function extractDimensionsFromUrl(url) {
+  let width = null;
+  let height = null;
+  try {
+    const parsed = new URL(url);
+    const widthKeys = ["w", "width", "wid", "rw", "mw"];
+    const heightKeys = ["h", "height", "hei", "rh", "mh"];
+    for (const key of widthKeys) {
+      const candidate = parseDimension(parsed.searchParams.get(key));
+      if (candidate) {
+        width = candidate;
+        break;
+      }
+    }
+    for (const key of heightKeys) {
+      const candidate = parseDimension(parsed.searchParams.get(key));
+      if (candidate) {
+        height = candidate;
+        break;
+      }
+    }
+  } catch {
+    // ignore URL parsing issues
+  }
+  if (!width || !height) {
+    const match = url.match(/([0-9]{2,4})x([0-9]{2,4})/);
+    if (match) {
+      if (!width) {
+        width = parseDimension(match[1]);
+      }
+      if (!height) {
+        height = parseDimension(match[2]);
+      }
+    }
+  }
+  return { width, height };
+}
+
+function extractSrcsetCandidates(value) {
   if (!value) return [];
   return value
     .split(",")
-    .map((part) => part.trim().split(/\s+/)[0])
-    .filter(Boolean);
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const [urlPart, descriptor] = part.split(/\s+/, 2);
+      const result = { url: urlPart, width: null, density: null };
+      if (descriptor) {
+        if (descriptor.endsWith("w")) {
+          const widthValue = parseDimension(descriptor.slice(0, -1));
+          if (widthValue) {
+            result.width = widthValue;
+          }
+        } else if (descriptor.endsWith("x")) {
+          const densityValue = Number.parseFloat(descriptor.slice(0, -1));
+          if (Number.isFinite(densityValue) && densityValue > 0) {
+            result.density = densityValue;
+          }
+        }
+      }
+      return result;
+    })
+    .filter((candidate) => candidate.url);
+}
+
+function normalizeImageCandidate(candidate, url, options) {
+  const normalized = normalizeUrl(candidate, url);
+  if (normalized && isLikelyProductImage(normalized, options)) {
+    return normalized;
+  }
+  return null;
 }
 
 function addImageCandidate(collection, candidate, url, options) {
-  const normalized = normalizeUrl(candidate, url);
-  if (normalized && isLikelyProductImage(normalized, options)) {
+  const normalized = normalizeImageCandidate(candidate, url, options);
+  if (normalized) {
     collection.push(normalized);
   }
+  return normalized;
+}
+
+function computeImageScore(url, meta = {}) {
+  const dimensions = extractDimensionsFromUrl(url);
+  let width = meta.width || dimensions.width || null;
+  let height = meta.height || dimensions.height || null;
+  if (!width && meta.aspectRatio && height) {
+    width = Math.round(height * meta.aspectRatio);
+  }
+  if (!height && meta.aspectRatio && width) {
+    height = Math.round(width / meta.aspectRatio);
+  }
+  let score = 0;
+  if (width && height) {
+    score = width * height;
+  } else if (width) {
+    score = width * 800;
+  } else if (height) {
+    score = height * 800;
+  } else {
+    score = 1000 + Math.min(url.length, 500);
+    if (/\b(?:large|xl|zoom|big|hero|main|product|detail)\b/i.test(url)) {
+      score += 5000;
+    }
+  }
+  if (meta.density && meta.density > 0 && Number.isFinite(meta.density)) {
+    score *= meta.density;
+  }
+  if (meta.order !== undefined && meta.order !== null) {
+    score -= meta.order;
+  }
+  return score;
+}
+
+function findPriceInTexts(texts, currencyHints = []) {
+  if (!Array.isArray(texts) || !texts.length) return null;
+  const normalizedCurrencyHints = Array.from(
+    new Set(
+      currencyHints
+        .map((hint) => `${hint || ""}`.trim())
+        .filter(Boolean)
+    )
+  );
+
+  for (const text of texts) {
+    const normalized = `${text || ""}`.replace(/\s+/g, " ").trim();
+    if (!normalized) continue;
+    for (const regex of PRICE_REGEXES) {
+      const match = normalized.match(regex);
+      if (match && match[0]) {
+        return match[0].trim();
+      }
+    }
+  }
+
+  if (normalizedCurrencyHints.length) {
+    const numberRegex = /\d[\d.,]*/;
+    for (const text of texts) {
+      const normalized = `${text || ""}`.replace(/\s+/g, " ").trim();
+      if (!normalized) continue;
+      const numberMatch = normalized.match(numberRegex);
+      if (!numberMatch) continue;
+      const numberValue = numberMatch[0];
+      for (const hint of normalizedCurrencyHints) {
+        const combined = combinePriceWithCurrency(numberValue, hint);
+        if (combined) {
+          return combined;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function combinePriceWithCurrency(priceValue, currencyValue) {
+  const priceText = `${priceValue || ""}`.replace(/\s+/g, " ").trim();
+  if (!priceText) return null;
+  const currencyText = `${currencyValue || ""}`.replace(/\s+/g, " ").trim();
+  if (!currencyText) return priceText;
+  const upperPrice = priceText.toUpperCase();
+  const upperCurrency = currencyText.toUpperCase();
+  if (upperPrice.includes(upperCurrency)) {
+    return priceText;
+  }
+  if (CURRENCY_SYMBOLS.some((symbol) => priceText.includes(symbol))) {
+    return priceText;
+  }
+  if (/^[A-Z]{2,3}$/.test(upperCurrency)) {
+    return `${priceText} ${upperCurrency}`.trim();
+  }
+  return `${currencyText} ${priceText}`.trim();
 }
 
 function createHtmlPreview(html, maxLength = 320) {
@@ -258,25 +493,99 @@ function extractFromHtmlContent(html, url) {
     $("p").toArray().map((el) => $(el).text().trim()).find((text) => text.length > 60) ||
     null;
 
-  const priceMeta =
-    $("meta[property='product:price:amount']").attr("content") ||
-    $("meta[name='product:price:amount']").attr("content") ||
-    $("meta[itemprop='price']").attr("content") ||
-    null;
-  let price = priceMeta;
-  if (!price) {
-    const priceRegex = /(\$|€|£|¥|₹|₩|₽)\s?\d+[\d.,]*/;
-    const priceCandidate =
-      $("[class*='price'], [id*='price'], span[itemprop='price'], meta[itemprop='price']")
-        .toArray()
-        .map((el) => {
-          const element = $(el);
-          return element.attr("content") || element.text();
-        })
-        .find((text) => text && priceRegex.test(text));
-    if (priceCandidate) {
-      price = priceCandidate.trim();
+  const priceValues = [];
+  const currencyValues = new Set();
+
+  function pushPriceValue(value) {
+    if (!value) return;
+    const normalized = `${value}`.replace(/\s+/g, " ").trim();
+    if (normalized) {
+      priceValues.push(normalized);
     }
+  }
+
+  function pushCurrencyValue(value) {
+    if (!value) return;
+    const normalized = `${value}`.replace(/\s+/g, " ").trim();
+    if (normalized) {
+      currencyValues.add(normalized);
+    }
+  }
+
+  const priceMetaSelectors = [
+    "meta[property='product:price:amount']",
+    "meta[name='product:price:amount']",
+    "meta[itemprop='price']",
+    "meta[property='og:price:amount']",
+    "meta[name='og:price:amount']",
+  ];
+  for (const selector of priceMetaSelectors) {
+    $(selector)
+      .toArray()
+      .forEach((element) => {
+        const value = $(element).attr("content");
+        pushPriceValue(value);
+      });
+  }
+
+  const currencyMetaSelectors = [
+    "meta[itemprop='priceCurrency']",
+    "meta[property='product:price:currency']",
+    "meta[name='product:price:currency']",
+    "meta[property='og:price:currency']",
+    "meta[name='og:price:currency']",
+  ];
+  for (const selector of currencyMetaSelectors) {
+    $(selector)
+      .toArray()
+      .forEach((element) => {
+        const value = $(element).attr("content");
+        pushCurrencyValue(value);
+      });
+  }
+
+  const priceElementSelectors = [
+    "[class*='price']",
+    "[id*='price']",
+    "span[itemprop='price']",
+    "meta[itemprop='price']",
+    "[data-price]",
+    "[data-price-amount]",
+  ];
+  $(priceElementSelectors.join(","))
+    .toArray()
+    .forEach((element) => {
+      const el = $(element);
+      const content =
+        el.attr("content") ||
+        el.attr("data-price") ||
+        el.attr("data-price-amount") ||
+        el.text();
+      pushPriceValue(content);
+      const currency =
+        el.attr("data-currency") ||
+        el.attr("data-price-currency") ||
+        el.attr("data-currency-code") ||
+        null;
+      pushCurrencyValue(currency);
+    });
+
+  let price = findPriceInTexts(priceValues, Array.from(currencyValues));
+
+  const images = [];
+  const fallbackCandidateMap = new Map();
+  let fallbackOrder = 0;
+
+  function registerFallbackCandidate(candidate, meta = {}) {
+    const normalized = normalizeImageCandidate(candidate, url, { requireProductKeyword: false });
+    if (!normalized) return;
+    const order = meta.order ?? fallbackOrder;
+    const score = computeImageScore(normalized, { ...meta, order });
+    const existing = fallbackCandidateMap.get(normalized);
+    if (!existing || existing.score < score) {
+      fallbackCandidateMap.set(normalized, { url: normalized, score, order });
+    }
+    fallbackOrder += 1;
   }
 
   const imageSelectors = [
@@ -286,13 +595,15 @@ function extractFromHtmlContent(html, url) {
     "meta[name='twitter:image:src']",
     "link[rel='image_src']",
   ];
-  const images = [];
   for (const selector of imageSelectors) {
     $(selector)
       .toArray()
       .forEach((element) => {
         const candidate = $(element).attr("content") || $(element).attr("href");
         addImageCandidate(images, candidate, url, { requireProductKeyword: false });
+        if (candidate) {
+          registerFallbackCandidate(candidate, { order: fallbackOrder });
+        }
       });
   }
 
@@ -301,11 +612,37 @@ function extractFromHtmlContent(html, url) {
     .forEach((element) => {
       const el = $(element);
       const src = el.attr("src") || el.attr("data-src");
+      const widthAttr =
+        el.attr("width") ||
+        el.attr("data-width") ||
+        el.attr("data-original-width") ||
+        el.attr("data-large-width") ||
+        el.attr("data-zoom-width") ||
+        el.attr("data-image-width");
+      const heightAttr =
+        el.attr("height") ||
+        el.attr("data-height") ||
+        el.attr("data-original-height") ||
+        el.attr("data-large-height") ||
+        el.attr("data-zoom-height") ||
+        el.attr("data-image-height");
+      const width = parseDimension(widthAttr);
+      const height = parseDimension(heightAttr);
+      const aspectRatio = width && height ? width / height : null;
       addImageCandidate(images, src, url, { requireProductKeyword: true });
+      if (src) {
+        registerFallbackCandidate(src, { width, height, aspectRatio });
+      }
       const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
       for (const srcset of srcsetValues) {
-        extractSrcsetUrls(srcset).forEach((candidate) => {
-          addImageCandidate(images, candidate, url, { requireProductKeyword: true });
+        extractSrcsetCandidates(srcset).forEach((candidate) => {
+          addImageCandidate(images, candidate.url, url, { requireProductKeyword: true });
+          registerFallbackCandidate(candidate.url, {
+            width: candidate.width || width,
+            height,
+            aspectRatio,
+            density: candidate.density,
+          });
         });
       }
     });
@@ -316,8 +653,12 @@ function extractFromHtmlContent(html, url) {
       const el = $(element);
       const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
       for (const srcset of srcsetValues) {
-        extractSrcsetUrls(srcset).forEach((candidate) => {
-          addImageCandidate(images, candidate, url, { requireProductKeyword: true });
+        extractSrcsetCandidates(srcset).forEach((candidate) => {
+          addImageCandidate(images, candidate.url, url, { requireProductKeyword: true });
+          registerFallbackCandidate(candidate.url, {
+            width: candidate.width,
+            density: candidate.density,
+          });
         });
       }
     });
@@ -330,15 +671,67 @@ function extractFromHtmlContent(html, url) {
       try {
         const json = JSON.parse(text);
         const nodes = Array.isArray(json) ? json : [json];
+        const toArray = (value) => (Array.isArray(value) ? value : value ? [value] : []);
         nodes.forEach((node) => {
           if (!node || typeof node !== "object") return;
-          const imageField = node.image || node.images || node.photo;
-          if (!imageField) return;
-          const imageValues = Array.isArray(imageField) ? imageField : [imageField];
-          imageValues.forEach((candidate) => {
-            if (typeof candidate === "string") {
-              addImageCandidate(images, candidate, url, { requireProductKeyword: false });
+
+          if (node.price) {
+            pushPriceValue(node.price);
+          }
+          if (node.priceCurrency) {
+            pushCurrencyValue(node.priceCurrency);
+          }
+
+          const imageField = node.image || node.images || node.photo || node.thumbnailUrl;
+          toArray(imageField).forEach((imageValue) => {
+            if (!imageValue) return;
+            if (typeof imageValue === "string") {
+              addImageCandidate(images, imageValue, url, {
+                requireProductKeyword: false,
+              });
+              registerFallbackCandidate(imageValue, {});
+            } else if (typeof imageValue === "object") {
+              const imageUrl =
+                imageValue.url ||
+                imageValue.contentUrl ||
+                imageValue.image ||
+                imageValue.thumbnailUrl ||
+                imageValue['@id'] ||
+                null;
+              const imageWidth = parseDimension(imageValue.width || imageValue.widthInPixels);
+              const imageHeight = parseDimension(imageValue.height || imageValue.heightInPixels);
+              if (imageUrl) {
+                addImageCandidate(images, imageUrl, url, {
+                  requireProductKeyword: false,
+                });
+                registerFallbackCandidate(imageUrl, {
+                  width: imageWidth,
+                  height: imageHeight,
+                  aspectRatio: imageWidth && imageHeight ? imageWidth / imageHeight : null,
+                });
+              }
             }
+          });
+
+          const offerFields = [...toArray(node.offers), ...toArray(node.aggregateOffer)];
+          offerFields.forEach((offer) => {
+            if (!offer || typeof offer !== "object") return;
+            if (offer.price) {
+              pushPriceValue(offer.price);
+            }
+            if (offer.priceCurrency) {
+              pushCurrencyValue(offer.priceCurrency);
+            }
+            const priceSpecFields = toArray(offer.priceSpecification);
+            priceSpecFields.forEach((spec) => {
+              if (!spec || typeof spec !== "object") return;
+              if (spec.price) {
+                pushPriceValue(spec.price);
+              }
+              if (spec.priceCurrency) {
+                pushCurrencyValue(spec.priceCurrency);
+              }
+            });
           });
         });
       } catch {
@@ -347,6 +740,18 @@ function extractFromHtmlContent(html, url) {
     });
 
   let uniqueImages = dedupe(images);
+  if (uniqueImages.length < 5 && fallbackCandidateMap.size) {
+    const fallbackCandidates = Array.from(fallbackCandidateMap.values())
+      .sort((a, b) => b.score - a.score)
+      .map((candidate) => candidate.url);
+    for (const candidate of fallbackCandidates) {
+      if (uniqueImages.includes(candidate)) continue;
+      uniqueImages.push(candidate);
+      if (uniqueImages.length >= 10) break;
+    }
+    uniqueImages = dedupe(uniqueImages);
+  }
+
   if (!uniqueImages.length) {
     const fallbackImages = [];
     $("img")
@@ -357,8 +762,8 @@ function extractFromHtmlContent(html, url) {
         addImageCandidate(fallbackImages, src, url, { requireProductKeyword: false });
         const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
         for (const srcset of srcsetValues) {
-          extractSrcsetUrls(srcset).forEach((candidate) => {
-            addImageCandidate(fallbackImages, candidate, url, { requireProductKeyword: false });
+          extractSrcsetCandidates(srcset).forEach((candidate) => {
+            addImageCandidate(fallbackImages, candidate.url, url, { requireProductKeyword: false });
           });
         }
       });
@@ -368,12 +773,27 @@ function extractFromHtmlContent(html, url) {
         const el = $(element);
         const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
         for (const srcset of srcsetValues) {
-          extractSrcsetUrls(srcset).forEach((candidate) => {
-            addImageCandidate(fallbackImages, candidate, url, { requireProductKeyword: false });
+          extractSrcsetCandidates(srcset).forEach((candidate) => {
+            addImageCandidate(fallbackImages, candidate.url, url, { requireProductKeyword: false });
           });
         }
       });
     uniqueImages = dedupe(fallbackImages);
+  }
+
+  const priceAfterImages = findPriceInTexts(priceValues, Array.from(currencyValues));
+  if (!price && priceAfterImages) {
+    price = priceAfterImages;
+  }
+
+  if (!price && priceValues.length && currencyValues.size) {
+    const [firstCurrency] = Array.from(currencyValues);
+    const numericCandidate = priceValues
+      .map((value) => value.match(/\d[\d.,]*/)?.[0] || null)
+      .find(Boolean);
+    if (numericCandidate) {
+      price = combinePriceWithCurrency(numericCandidate, firstCurrency);
+    }
   }
 
   return { title, description, price: price || null, images: uniqueImages };
