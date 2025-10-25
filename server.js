@@ -199,6 +199,15 @@ function isLikelyProductImage(url) {
   return PRODUCT_IMAGE_KEYWORDS.some((keyword) => lower.includes(keyword));
 }
 
+function createHtmlPreview(html, maxLength = 320) {
+  if (!html) return "";
+  const normalized = `${html}`.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength)}…`;
+}
+
 function dedupe(values) {
   const seen = new Set();
   const result = [];
@@ -605,14 +614,18 @@ async function runStage3(url) {
       return { ok: false, stage: "stage3", attempts, error: "Empty response body" };
     }
 
-    const htmlPreview = htmlContent.slice(0, 500);
-    console.log("🟡 BrightData HTML preview:", htmlPreview);
+    const htmlPreview = createHtmlPreview(htmlContent);
+    console.log("🟡 BrightData HTML preview", {
+      length: htmlContent.length,
+      preview: htmlPreview,
+    });
 
     const extracted = extractFromHtmlContent(htmlContent, url);
 
     if (!isValidResult(extracted)) {
       console.warn("Stage3 failed to extract valid product data", {
-        htmlPreview,
+        htmlLength: htmlContent.length,
+        preview: htmlPreview,
       });
       return { ok: false, stage: "stage3", attempts, error: "Invalid BrightData extraction" };
     }
