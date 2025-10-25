@@ -359,48 +359,78 @@ async function runStage3(url) {
   }
   console.log("Fallback BrightData triggered");
   const stageStart = performance.now();
-  try {
-    const response = await axios.post(
-      "https://api.brightdata.com/web_unlocker/v1.0/",
-      {
-        url,
-        response_format: "text",
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
+  const countries = ["fr", "de", "it", "es"];
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    "Content-Type": "application/json",
+    "X-Feednly-Scraper": "CloudRun",
+  };
+
+  async function requestWithFormat(format) {
+    const country = countries[Math.floor(Math.random() * countries.length)];
+    try {
+      const response = await axios.post(
+        "https://api.brightdata.com/request",
+        {
+          zone: "web_unlocker1",
+          url,
+          format,
+          country,
         },
-        timeout: NAVIGATION_TIMEOUT,
+        {
+          headers,
+          timeout: NAVIGATION_TIMEOUT,
+        }
+      );
+      const html = response.data?.response || response.data?.body || response.data || "";
+      const htmlContent =
+        typeof html === "string"
+          ? html
+          : Buffer.isBuffer(html)
+          ? html.toString("utf8")
+          : "";
+      if (!htmlContent) {
+        console.warn(`Stage3 ${format} empty response body`);
+        return null;
       }
-    );
-    const payload = response.data || {};
-    const body =
-      payload.solution?.response?.body ||
-      payload.solution?.content ||
-      payload.body ||
-      payload.html ||
-      null;
-    if (!body) {
-      console.warn("Stage3 empty response body");
+      const extracted = extractFromHtmlContent(htmlContent, url);
+      if (!extracted.title && !extracted.images.length) {
+        console.warn(`Stage3 ${format} extraction missing title and images`);
+      }
+      return extracted;
+    } catch (err) {
+      console.warn(`Stage3 ${format} request error`, err.message);
       return null;
     }
-    const extracted = extractFromHtmlContent(body, url);
-    if (isValidResult(extracted)) {
-      const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-      console.log("Stage3 success");
-      return buildSuccessPayload(extracted, {
-        stage: "brightdata",
-        fallbackUsed: true,
-        blocked: false,
-        costEstimate: 0.0015,
-        durationSeconds,
-        network: { durationSeconds },
-      });
-    }
-  } catch (err) {
-    console.warn("Stage3 error", err.message);
   }
+
+  let attempts = 0;
+  attempts += 1;
+  let extracted = await requestWithFormat("raw");
+
+  if (!extracted || !extracted.images.length) {
+    attempts += 1;
+    const rendered = await requestWithFormat("rendered");
+    if (rendered && (rendered.images.length > (extracted?.images?.length || 0) || !extracted)) {
+      extracted = rendered;
+    }
+  }
+
+  if (extracted && isValidResult(extracted)) {
+    const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
+    console.log("Stage3 success");
+    return buildSuccessPayload(extracted, {
+      stage: "brightdata",
+      fallbackUsed: true,
+      blocked: false,
+      costEstimate: 0.0015,
+      durationSeconds,
+      network: { durationSeconds },
+      attempts,
+    });
+  }
+
+  console.warn("Stage3 failed to extract valid product data");
   return null;
 }
 
