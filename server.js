@@ -365,18 +365,21 @@ async function runStage3(url) {
     "Content-Type": "application/json",
     "X-Feednly-Scraper": "CloudRun",
   };
+  const zone = process.env.BRIGHTDATA_ZONE || "web_unlocker1";
 
   async function requestWithFormat(format) {
     const country = countries[Math.floor(Math.random() * countries.length)];
     try {
+      const payload = {
+        zone,
+        url,
+        format,
+        country,
+      };
+      console.log("BrightData zone used:", payload.zone);
       const response = await axios.post(
         "https://api.brightdata.com/request",
-        {
-          zone: "web_unlocker1",
-          url,
-          format,
-          country,
-        },
+        payload,
         {
           headers,
           timeout: NAVIGATION_TIMEOUT,
