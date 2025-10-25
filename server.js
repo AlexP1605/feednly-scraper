@@ -490,15 +490,13 @@ async function runStage3(url) {
   const payload = {
     zone: process.env.BRIGHTDATA_ZONE || "web_unlocker1",
     url,
-    render: true,
-    response_format: "text",
+    format: "raw",
   };
   const zone = payload.zone;
 
   const headers = {
     Authorization: `Bearer ${process.env.BRIGHTDATA_API_KEY}`,
     "Content-Type": "application/json",
-    "X-Feednly-Scraper": "CloudRun",
   };
 
   let attempts = 1;
@@ -508,7 +506,7 @@ async function runStage3(url) {
     console.log("🟡 BrightData payload:", JSON.stringify(payload));
 
     const response = await axios.post(
-      "https://api.brightdata.com/web_unlocker/v1.0",
+      "https://api.brightdata.com/request",
       payload,
       { headers, timeout: NAVIGATION_TIMEOUT }
     );
@@ -523,6 +521,7 @@ async function runStage3(url) {
     const html =
       response.data?.solution?.response?.body ||
       response.data?.solution?.content ||
+      response.data?.response?.body ||
       response.data?.body ||
       "";
 
