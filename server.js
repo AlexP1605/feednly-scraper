@@ -899,7 +899,6 @@ function extractFromHtmlContent(html, url) {
     .sort((a, b) => b.score - a.score);
   const bestRankedImages = rankedImages.filter((entry) => entry.score > 0).slice(0, BEST_IMAGE_LIMIT);
   const bestImages = bestRankedImages.map((entry) => entry.url);
-  const bestImage = bestImages[0] || null;
 
   const priceAfterImages = findPriceInTexts(priceValues, Array.from(currencyValues));
   if (!price && priceAfterImages) {
@@ -916,7 +915,7 @@ function extractFromHtmlContent(html, url) {
     }
   }
 
-  return { title, description, price: price || null, images: bestImages, bestImage };
+  return { title, description, price: price || null, images: bestImages };
 }
 
 function isValidResult(result) {
@@ -959,7 +958,6 @@ function buildSuccessPayload(data, meta) {
     description: data.description || null,
     price: data.price || null,
     images: data.images || [],
-    bestImage: data.bestImage || null,
     meta,
   };
 }
@@ -1333,12 +1331,13 @@ async function scrapeWithStages(url) {
   const logEntry = {
     event: "SCRAPE",
     url,
-    result: finalResult.ok ? finalStage : "failed",
-    steps,
-    duration: durationSeconds,
+    stage: finalStage,
+    ok: Boolean(finalResult?.ok),
     blocked,
+    duration: durationSeconds,
     imagesCount: Array.isArray(finalResult?.images) ? finalResult.images.length : 0,
-    bestImage: finalResult?.bestImage || null,
+    title: finalResult?.title || null,
+    price: finalResult?.price || null,
     timestamp: new Date().toISOString(),
   };
 
