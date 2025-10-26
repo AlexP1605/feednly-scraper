@@ -215,6 +215,46 @@ function shuffleList(values) {
 
 const { TimeoutError } = puppeteer.errors ?? {};
 
+const BROWSER_LAUNCH_ARGS = ["--no-sandbox", "--disable-setuid-sandbox"];
+let sharedBrowserPromise = null;
+const cookieCache = new Map();
+
+function createBrowserLaunchOptions(proxyUrl) {
+  const args = [...BROWSER_LAUNCH_ARGS];
+  if (proxyUrl) {
+    args.push(`--proxy-server=${proxyUrl}`);
+  }
+  return { headless: "new", args };
+}
+
+async function acquireSharedBrowser() {
+  if (sharedBrowserPromise) {
+    try {
+      const existing = await sharedBrowserPromise;
+      if (existing?.isConnected?.()) {
+        return existing;
+      }
+    } catch {
+      sharedBrowserPromise = null;
+    }
+  }
+
+  sharedBrowserPromise = puppeteer
+    .launch(createBrowserLaunchOptions())
+    .then((browser) => {
+      browser?.once?.("disconnected", () => {
+        sharedBrowserPromise = null;
+      });
+      return browser;
+    })
+    .catch((err) => {
+      sharedBrowserPromise = null;
+      throw err;
+    });
+
+  return sharedBrowserPromise;
+}
+
 async function enableRequestOptimizations(page, targetUrl) {
   let targetHostname = null;
   try {
@@ -225,8 +265,7 @@ async function enableRequestOptimizations(page, targetUrl) {
 
   try {
     await page.setRequestInterception(true);
-  } catch (err) {
-    console.warn("Failed to enable request interception", err.message);
+  } catch {
     return () => {};
   }
 
@@ -303,7 +342,6 @@ async function navigatePage(page, url) {
       err.navigationWaitUntil = strategy.label;
       err.navigationDurationSeconds = durationSeconds;
       err.navigationTimedOut = isTimeout;
-      console.warn(`Navigation attempt (${strategy.label}) failed`, err.message);
       if (!isTimeout) {
         throw err;
       }
@@ -1022,28 +1060,34 @@ function isValidResult(result) {
 }
 
 async function launchBrowser(proxyUrl) {
-  const args = ["--no-sandbox", "--disable-setuid-sandbox"];
-  if (proxyUrl) {
-    args.push(`--proxy-server=${proxyUrl}`);
-  }
-  return puppeteer.launch({ headless: "new", args });
+  return puppeteer.launch(createBrowserLaunchOptions(proxyUrl));
 }
 
 async function loadCookiesForDomain(domain) {
   if (!domain) return [];
-  const cookiePath = path.resolve("cookies", `${domain}_cookies.json`);
-  try {
-    const raw = await fs.readFile(cookiePath, "utf8");
-    const cookies = JSON.parse(raw);
-    if (Array.isArray(cookies)) {
-      return cookies.filter((cookie) => cookie && typeof cookie === "object");
-    }
-  } catch (err) {
-    if (err.code !== "ENOENT") {
-      console.warn("Failed to load cookies", err.message);
-    }
+  if (!cookieCache.has(domain)) {
+    const cookiePath = path.resolve("cookies", `${domain}_cookies.json`);
+    const loader = (async () => {
+      try {
+        const raw = await fs.readFile(cookiePath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.filter((cookie) => cookie && typeof cookie === "object");
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT") {
+          return [];
+        }
+      }
+      return [];
+    })();
+    cookieCache.set(domain, loader);
   }
-  return [];
+  const cookies = await cookieCache.get(domain);
+  if (!Array.isArray(cookies) || cookies.length === 0) {
+    return [];
+  }
+  return cookies.map((cookie) => ({ ...cookie }));
 }
 
 function roundDuration(seconds) {
@@ -1068,8 +1112,18 @@ async function runStage1(url) {
   let pageSetup = null;
   let lastError = null;
   let lastErrorMessage = null;
+  let usingSharedBrowser = false;
   try {
-    browser = await launchBrowser();
+    try {
+      browser = await acquireSharedBrowser();
+      usingSharedBrowser = true;
+    } catch {
+      browser = await launchBrowser();
+      usingSharedBrowser = false;
+    }
+    if (!browser) {
+      throw new Error("Browser launch failed");
+    }
     page = await browser.newPage();
     pageSetup = await configurePage(page, url);
     const { userAgent } = pageSetup;
@@ -1081,8 +1135,7 @@ async function runStage1(url) {
     } catch (err) {
       navigationError = err;
       lastError = err;
-      lastErrorMessage = err.message;
-      console.warn("Stage1 navigation error", err.message);
+      lastErrorMessage = err?.message || "Navigation error";
     }
     const navigationDurationSeconds =
       navigationMeta?.durationSeconds ??
@@ -1115,8 +1168,8 @@ async function runStage1(url) {
     }
   } catch (err) {
     lastError = err;
-    lastErrorMessage = err.message || lastErrorMessage;
-    console.error("Stage1 error", { message: err.message });
+    const message = err?.message || lastErrorMessage || "Stage1 failed";
+    lastErrorMessage = message;
   } finally {
     try {
       pageSetup?.disableInterception?.();
@@ -1126,8 +1179,11 @@ async function runStage1(url) {
     if (page) {
       await page.close().catch(() => {});
     }
-    if (browser) {
+    if (browser && !usingSharedBrowser) {
       await browser.close().catch(() => {});
+    }
+    if (usingSharedBrowser && browser && !browser.isConnected?.()) {
+      sharedBrowserPromise = null;
     }
   }
   return { ok: false, stage: "stage1", error: lastErrorMessage || lastError?.message || "Stage1 failed" };
@@ -1151,41 +1207,6 @@ function parseProxyPool(value) {
     result.push(entry);
   }
   return result;
-}
-
-function sanitizeProxyCredentialString(value) {
-  if (typeof value !== "string") {
-    return value;
-  }
-  return value.replace(/\/\/([^@\/]*)@/, (match, credentials) => {
-    if (!credentials) {
-      return match;
-    }
-    if (credentials.includes(":")) {
-      return "//***:***@";
-    }
-    return "//***@";
-  });
-}
-
-function formatProxyForLog(proxyValue) {
-  if (!proxyValue) {
-    return null;
-  }
-  try {
-    const proxy = proxyValue instanceof URL ? proxyValue : new URL(`${proxyValue}`);
-    return {
-      protocol: proxy.protocol ? proxy.protocol.replace(/:$/, "") : null,
-      host: proxy.hostname || null,
-      port: proxy.port || null,
-      hasAuth: Boolean(proxy.username || proxy.password),
-    };
-  } catch (err) {
-    return {
-      raw: sanitizeProxyCredentialString(typeof proxyValue === "string" ? proxyValue : String(proxyValue)),
-      error: err.message,
-    };
-  }
 }
 
 function resolveProxyConfiguration() {
@@ -1213,17 +1234,7 @@ async function runStage2(url) {
   if (proxyConfig.fallback.length) {
     proxies.push(...proxyConfig.fallback);
   }
-  console.info("Stage2 proxy configuration", {
-    primaryCount: proxyConfig.primary.length,
-    fallbackCount: proxyConfig.fallback.length,
-    combinedCount: proxies.length,
-    proxies: proxies.map((entry) => formatProxyForLog(entry)),
-  });
   if (!proxies.length) {
-    console.warn("Stage2 skipped: SCRAPER_PROXY_POOL missing", {
-      envPrimaryLength: `${process.env.SCRAPER_PROXY_POOL || ""}`.length,
-      envFallbackLength: `${process.env.SCRAPER_PROXY_FALLBACK || process.env.SCRAPER_PROXY || ""}`.length,
-    });
     return { ok: false, stage: "stage2", error: "SCRAPER_PROXY_POOL missing" };
   }
   const domain = (() => {
@@ -1243,27 +1254,21 @@ async function runStage2(url) {
     try {
       proxy = new URL(proxyRaw);
     } catch (err) {
-      lastErrorMessage = "Invalid proxy URL";
-      console.warn("Stage2 invalid proxy", {
-        error: err.message,
-        value: formatProxyForLog(proxyRaw),
-      });
+      lastError = err;
+      lastErrorMessage = err?.message ? `Invalid proxy URL: ${err.message}` : "Invalid proxy URL";
       continue;
     }
     attempts += 1;
     const attemptNumber = attempts;
     const proxyServer = `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ""}`;
-    const attemptSource = attemptNumber <= proxyConfig.primary.length ? "primary" : "fallback";
-    console.info("Stage2 attempt starting", {
-      attempt: attemptNumber,
-      source: attemptSource,
-      proxy: formatProxyForLog(proxy),
-    });
     let browser;
     let page;
     let pageSetup = null;
     try {
       browser = await launchBrowser(proxyServer);
+      if (!browser) {
+        throw new Error("Browser launch failed");
+      }
       page = await browser.newPage();
       pageSetup = await configurePage(page, url);
       const { userAgent } = pageSetup;
@@ -1278,7 +1283,11 @@ async function runStage2(url) {
         try {
           await page.setCookie(...cookies);
         } catch (err) {
-          console.warn("Failed to apply cookies", err.message);
+          if (!lastErrorMessage) {
+            lastErrorMessage = err?.message
+              ? `Failed to apply cookies: ${err.message}`
+              : "Failed to apply cookies";
+          }
         }
       }
       await delay(randomBetween(400, 900));
@@ -1290,8 +1299,8 @@ async function runStage2(url) {
       } catch (err) {
         navigationError = err;
         lastError = err;
-        lastErrorMessage = err.message;
-        console.warn(`Stage2 attempt ${attemptNumber} navigation error`, err.message);
+        const navMessage = err?.message || "Unknown navigation error";
+        lastErrorMessage = `Navigation error on attempt ${attemptNumber}: ${navMessage}`;
       }
       const navigationDurationSeconds =
         navigationMeta?.durationSeconds ??
@@ -1304,11 +1313,6 @@ async function runStage2(url) {
       const html = await page.content();
       const extracted = extractFromHtmlContent(html, url);
       if (isValidResult(extracted)) {
-        console.info("Stage2 success", {
-          attempt: attemptNumber,
-          proxy: formatProxyForLog(proxy),
-          durationSeconds: roundDuration((performance.now() - stageStart) / 1000),
-        });
         const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
         return buildSuccessPayload(extracted, {
           stage: "stage2",
@@ -1332,12 +1336,8 @@ async function runStage2(url) {
       await delay(randomBetween(800, 1500));
     } catch (err) {
       lastError = err;
-      lastErrorMessage = err.message || lastErrorMessage;
-      console.error("Stage2 failed", {
-        attempt: attemptNumber,
-        proxy: formatProxyForLog(proxy),
-        message: err.message,
-      });
+      const message = err?.message || lastErrorMessage || "Stage2 attempt failed";
+      lastErrorMessage = message;
     } finally {
       try {
         pageSetup?.disableInterception?.();
@@ -1352,10 +1352,6 @@ async function runStage2(url) {
       }
     }
   }
-  console.error("Stage2 exhausted proxies", {
-    attempts,
-    lastError: lastErrorMessage || lastError?.message || null,
-  });
   return {
     ok: false,
     stage: "stage2",
@@ -1367,7 +1363,6 @@ async function runStage2(url) {
 async function runStage3(url) {
   const apiKey = process.env.BRIGHTDATA_API_KEY;
   if (!apiKey) {
-    console.warn("Stage3 skipped: BRIGHTDATA_API_KEY missing");
     return { ok: false, stage: "stage3", error: "BRIGHTDATA_API_KEY missing" };
   }
   const stageStart = performance.now();
@@ -1419,14 +1414,12 @@ async function runStage3(url) {
     );
 
     if (!htmlContent) {
-      console.warn("Stage3 empty response body");
       return { ok: false, stage: "stage3", attempts, error: "Empty response body" };
     }
 
     const extracted = extractFromHtmlContent(htmlContent, url);
 
     if (!isValidResult(extracted)) {
-      console.warn("Stage3 failed to extract valid product data");
       return { ok: false, stage: "stage3", attempts, error: "Invalid BrightData extraction" };
     }
 
@@ -1441,12 +1434,13 @@ async function runStage3(url) {
       attempts,
     });
   } catch (err) {
-    console.error("BrightData error", { message: err.message, status: err.response?.status });
+    const statusText = err?.response?.status ? ` (status ${err.response.status})` : "";
+    const message = err?.message ? `${err.message}${statusText}` : `BrightData request failed${statusText}`;
     return {
       ok: false,
       stage: "stage3",
       attempts,
-      error: err.message || "BrightData request failed",
+      error: message,
     };
   }
 }
@@ -1530,17 +1524,23 @@ async function scrapeWithStages(url) {
     title: finalResult?.title || null,
     price: finalResult?.price || null,
     timestamp: new Date().toISOString(),
+    steps,
+    stageMeta: {
+      stage1: stage1Result?.meta || null,
+      stage2: stage2Result?.meta || null,
+      stage3: stage3Result?.meta || null,
+    },
   };
 
-  console.log(JSON.stringify(logEntry));
-
   if (!finalResult.ok) {
-    console.error("All stages failed", {
+    logEntry.errors = {
       stage1: stage1Result?.error || null,
       stage2: stage2Result?.error || null,
       stage3: stage3Result?.error || null,
-    });
+    };
   }
+
+  console.log(JSON.stringify(logEntry));
 
   return finalResult;
 }
@@ -1578,6 +1578,4 @@ if (!Number.isFinite(PORT) || PORT <= 0) {
   PORT = 8080;
 }
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Feednly Scraper listening on port ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0");
