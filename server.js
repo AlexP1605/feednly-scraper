@@ -126,6 +126,72 @@ const PRICE_REGEXES = [
   new RegExp(`\\d[\\d.,]*\\s*(?:${CURRENCY_CODE_PATTERN})`, "i"),
 ];
 
+function parseNumericPrice(value) {
+  if (!value) return null;
+  const digits = `${value}`.match(/[\d]/g);
+  if (!digits || !digits.length) {
+    return null;
+  }
+  let normalized = `${value}`.replace(/[^\d.,]/g, "");
+  if (!normalized) {
+    return null;
+  }
+  const lastComma = normalized.lastIndexOf(",");
+  const lastDot = normalized.lastIndexOf(".");
+  if (lastComma > lastDot) {
+    normalized = normalized.replace(/\./g, "").replace(/,/g, ".");
+  } else if (lastDot > lastComma) {
+    normalized = normalized.replace(/,/g, "");
+  } else {
+    normalized = normalized.replace(/[.,]/g, "");
+  }
+  const parsed = Number.parseFloat(normalized);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed;
+}
+
+function scorePriceCandidate(rawValue, { order = 0, currencyHints = [] } = {}) {
+  const value = `${rawValue || ""}`.trim();
+  if (!value) {
+    return null;
+  }
+  const upperValue = value.toUpperCase();
+  const numericValue = parseNumericPrice(value);
+  const digitsCount = (value.match(/\d/g) || []).length;
+  const decimalMatch = value.match(/[.,](\d{1,})/);
+  const decimalDigits = decimalMatch ? decimalMatch[1].length : 0;
+  const hasCurrencySymbol = CURRENCY_SYMBOLS.some((symbol) => value.includes(symbol));
+  const hasCurrencyCode = CURRENCY_CODES.some((code) => upperValue.includes(code));
+  const matchesHint = currencyHints.some((hint) => upperValue.includes(hint.toUpperCase()));
+
+  let score = 0;
+  if (hasCurrencySymbol) score += 6;
+  if (hasCurrencyCode) score += 5;
+  if (matchesHint) score += 4;
+  if (decimalDigits === 2) score += 2;
+  else if (decimalDigits === 1) score += 1;
+  if (digitsCount >= 4) score += 3;
+  else if (digitsCount >= 3) score += 2;
+  if (numericValue !== null) {
+    if (numericValue >= 1000) score += 3;
+    else if (numericValue >= 100) score += 2;
+    else if (numericValue >= 20) score += 1;
+    else if (numericValue < 5) score -= 2;
+    else if (numericValue < 10) score -= 1;
+  }
+
+  // Prefer earlier discoveries when scores are equal.
+  const tieBreaker = order * 0.01;
+
+  return {
+    value,
+    score: score - tieBreaker,
+    order,
+  };
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
 }
@@ -466,35 +532,68 @@ function findPriceInTexts(texts, currencyHints = []) {
     )
   );
 
-  for (const text of texts) {
+  const candidates = [];
+
+  texts.forEach((text, index) => {
     const normalized = `${text || ""}`.replace(/\s+/g, " ").trim();
-    if (!normalized) continue;
+    if (!normalized) return;
     for (const regex of PRICE_REGEXES) {
       const match = normalized.match(regex);
       if (match && match[0]) {
-        return match[0].trim();
+        const candidate = scorePriceCandidate(match[0], {
+          order: index,
+          currencyHints: normalizedCurrencyHints,
+        });
+        if (candidate) {
+          candidates.push(candidate);
+        }
+        break;
       }
     }
-  }
+  });
 
-  if (normalizedCurrencyHints.length) {
+  if (!candidates.length && normalizedCurrencyHints.length) {
     const numberRegex = /\d[\d.,]*/;
-    for (const text of texts) {
+    texts.forEach((text, index) => {
       const normalized = `${text || ""}`.replace(/\s+/g, " ").trim();
-      if (!normalized) continue;
+      if (!normalized) return;
       const numberMatch = normalized.match(numberRegex);
-      if (!numberMatch) continue;
+      if (!numberMatch) return;
       const numberValue = numberMatch[0];
       for (const hint of normalizedCurrencyHints) {
         const combined = combinePriceWithCurrency(numberValue, hint);
-        if (combined) {
-          return combined;
+        const candidate = scorePriceCandidate(combined, {
+          order: texts.length + index,
+          currencyHints: normalizedCurrencyHints,
+        });
+        if (candidate) {
+          candidates.push(candidate);
         }
       }
+    });
+  }
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  const deduped = new Map();
+  for (const candidate of candidates) {
+    const key = candidate.value;
+    const existing = deduped.get(key);
+    if (!existing || existing.score < candidate.score) {
+      deduped.set(key, candidate);
     }
   }
 
-  return null;
+  const best = Array.from(deduped.values()).sort((a, b) => {
+    if (b.score !== a.score) {
+      return b.score - a.score;
+    }
+    return a.order - b.order;
+  })[0];
+
+  return best ? best.value : null;
 }
 
 function combinePriceWithCurrency(priceValue, currencyValue) {
@@ -1054,8 +1153,31 @@ function parseProxyPool(value) {
   return result;
 }
 
+function resolveProxyConfiguration() {
+  const primary = parseProxyPool(process.env.SCRAPER_PROXY_POOL);
+  const fallbackEnv = process.env.SCRAPER_PROXY_FALLBACK || process.env.SCRAPER_PROXY || "";
+  const fallbackCandidates = parseProxyPool(fallbackEnv);
+  const seen = new Set(primary.map((entry) => entry.toLowerCase()));
+  const fallback = [];
+  for (const entry of fallbackCandidates) {
+    const lower = entry.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    fallback.push(entry);
+  }
+  return {
+    primary,
+    fallback,
+    combined: [...primary, ...fallback],
+  };
+}
+
 async function runStage2(url) {
-  const proxies = shuffleList(parseProxyPool(process.env.SCRAPER_PROXY_POOL));
+  const proxyConfig = resolveProxyConfiguration();
+  const proxies = shuffleList(proxyConfig.primary);
+  if (proxyConfig.fallback.length) {
+    proxies.push(...proxyConfig.fallback);
+  }
   if (!proxies.length) {
     console.warn("Stage2 skipped: SCRAPER_PROXY_POOL missing");
     return { ok: false, stage: "stage2", error: "SCRAPER_PROXY_POOL missing" };
@@ -1365,7 +1487,7 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     uptime: process.uptime(),
-    proxyPoolConfigured: parseProxyPool(process.env.SCRAPER_PROXY_POOL).length > 0,
+    proxyPoolConfigured: resolveProxyConfiguration().combined.length > 0,
     brightDataConfigured: Boolean(process.env.BRIGHTDATA_API_KEY),
   });
 });
