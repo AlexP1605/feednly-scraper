@@ -231,9 +231,11 @@ async function acquireSharedBrowser() {
   if (sharedBrowserPromise) {
     try {
       const existing = await sharedBrowserPromise;
-      if (existing?.isConnected?.()) {
+      const hasProcess = Boolean(existing?.process?.()?.pid);
+      if (existing?.isConnected?.() && hasProcess) {
         return existing;
       }
+      await existing?.close?.().catch(() => {});
     } catch {
       sharedBrowserPromise = null;
     }
