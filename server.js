@@ -1153,6 +1153,41 @@ function parseProxyPool(value) {
   return result;
 }
 
+function sanitizeProxyCredentialString(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  return value.replace(/\/\/([^@\/]*)@/, (match, credentials) => {
+    if (!credentials) {
+      return match;
+    }
+    if (credentials.includes(":")) {
+      return "//***:***@";
+    }
+    return "//***@";
+  });
+}
+
+function formatProxyForLog(proxyValue) {
+  if (!proxyValue) {
+    return null;
+  }
+  try {
+    const proxy = proxyValue instanceof URL ? proxyValue : new URL(`${proxyValue}`);
+    return {
+      protocol: proxy.protocol ? proxy.protocol.replace(/:$/, "") : null,
+      host: proxy.hostname || null,
+      port: proxy.port || null,
+      hasAuth: Boolean(proxy.username || proxy.password),
+    };
+  } catch (err) {
+    return {
+      raw: sanitizeProxyCredentialString(typeof proxyValue === "string" ? proxyValue : String(proxyValue)),
+      error: err.message,
+    };
+  }
+}
+
 function resolveProxyConfiguration() {
   const primary = parseProxyPool(process.env.SCRAPER_PROXY_POOL);
   const fallbackEnv = process.env.SCRAPER_PROXY_FALLBACK || process.env.SCRAPER_PROXY || "";
@@ -1178,8 +1213,17 @@ async function runStage2(url) {
   if (proxyConfig.fallback.length) {
     proxies.push(...proxyConfig.fallback);
   }
+  console.info("Stage2 proxy configuration", {
+    primaryCount: proxyConfig.primary.length,
+    fallbackCount: proxyConfig.fallback.length,
+    combinedCount: proxies.length,
+    proxies: proxies.map((entry) => formatProxyForLog(entry)),
+  });
   if (!proxies.length) {
-    console.warn("Stage2 skipped: SCRAPER_PROXY_POOL missing");
+    console.warn("Stage2 skipped: SCRAPER_PROXY_POOL missing", {
+      envPrimaryLength: `${process.env.SCRAPER_PROXY_POOL || ""}`.length,
+      envFallbackLength: `${process.env.SCRAPER_PROXY_FALLBACK || process.env.SCRAPER_PROXY || ""}`.length,
+    });
     return { ok: false, stage: "stage2", error: "SCRAPER_PROXY_POOL missing" };
   }
   const domain = (() => {
@@ -1200,12 +1244,21 @@ async function runStage2(url) {
       proxy = new URL(proxyRaw);
     } catch (err) {
       lastErrorMessage = "Invalid proxy URL";
-      console.warn("Stage2 invalid proxy", err.message);
+      console.warn("Stage2 invalid proxy", {
+        error: err.message,
+        value: formatProxyForLog(proxyRaw),
+      });
       continue;
     }
     attempts += 1;
     const attemptNumber = attempts;
     const proxyServer = `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ""}`;
+    const attemptSource = attemptNumber <= proxyConfig.primary.length ? "primary" : "fallback";
+    console.info("Stage2 attempt starting", {
+      attempt: attemptNumber,
+      source: attemptSource,
+      proxy: formatProxyForLog(proxy),
+    });
     let browser;
     let page;
     let pageSetup = null;
@@ -1251,6 +1304,11 @@ async function runStage2(url) {
       const html = await page.content();
       const extracted = extractFromHtmlContent(html, url);
       if (isValidResult(extracted)) {
+        console.info("Stage2 success", {
+          attempt: attemptNumber,
+          proxy: formatProxyForLog(proxy),
+          durationSeconds: roundDuration((performance.now() - stageStart) / 1000),
+        });
         const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
         return buildSuccessPayload(extracted, {
           stage: "stage2",
@@ -1275,7 +1333,11 @@ async function runStage2(url) {
     } catch (err) {
       lastError = err;
       lastErrorMessage = err.message || lastErrorMessage;
-      console.error("Stage2 failed", { proxy: proxyServer, message: err.message });
+      console.error("Stage2 failed", {
+        attempt: attemptNumber,
+        proxy: formatProxyForLog(proxy),
+        message: err.message,
+      });
     } finally {
       try {
         pageSetup?.disableInterception?.();
@@ -1290,6 +1352,10 @@ async function runStage2(url) {
       }
     }
   }
+  console.error("Stage2 exhausted proxies", {
+    attempts,
+    lastError: lastErrorMessage || lastError?.message || null,
+  });
   return {
     ok: false,
     stage: "stage2",
