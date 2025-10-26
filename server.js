@@ -1037,12 +1037,15 @@ async function runStage1(url) {
 function parseProxyPool(value) {
   if (!value) return [];
   const entries = `${value}`
-    .split(",")
+    .split(/[\s,;\n]+/)
     .map((part) => part.trim())
     .filter(Boolean);
   const seen = new Set();
   const result = [];
-  for (const entry of entries) {
+  for (let entry of entries) {
+    if (!/^[a-z][\w+.-]*:\/\//i.test(entry)) {
+      entry = `http://${entry}`;
+    }
     const lower = entry.toLowerCase();
     if (seen.has(lower)) continue;
     seen.add(lower);
