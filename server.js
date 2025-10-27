@@ -115,6 +115,26 @@ const CURRENCY_CODES = [
   "IDR",
 ];
 
+const CURRENCY_SYMBOL_TO_CODE = new Map([
+  ["$", "USD"],
+  ["US$", "USD"],
+  ["USD$", "USD"],
+  ["€", "EUR"],
+  ["£", "GBP"],
+  ["¥", "JPY"],
+  ["C$", "CAD"],
+  ["CA$", "CAD"],
+  ["A$", "AUD"],
+  ["AU$", "AUD"],
+  ["NZ$", "NZD"],
+  ["HK$", "HKD"],
+  ["₩", "KRW"],
+  ["₽", "RUB"],
+  ["₹", "INR"],
+  ["₺", "TRY"],
+  ["R$", "BRL"],
+]);
+
 const CURRENCY_SYMBOL_PATTERN = CURRENCY_SYMBOLS.map((symbol) =>
   symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 ).join("|");
@@ -125,6 +145,22 @@ const PRICE_REGEXES = [
   new RegExp(`(?:${CURRENCY_CODE_PATTERN})\\s*\\d[\\d.,]*`, "i"),
   new RegExp(`\\d[\\d.,]*\\s*(?:${CURRENCY_CODE_PATTERN})`, "i"),
 ];
+
+const PRICE_CONTEXT_NEGATIVE_KEYWORDS = [
+  "assurance",
+  "garantie",
+  "warranty",
+  "insurance",
+  "protection",
+  "coverage",
+  "subscription",
+  "abonnement",
+  "support",
+  "service",
+  "plan",
+];
+
+const DEFAULT_USD_TO_EUR_RATE = 0.92;
 
 function parseNumericPrice(value) {
   if (!value) return null;
@@ -152,7 +188,10 @@ function parseNumericPrice(value) {
   return parsed;
 }
 
-function scorePriceCandidate(rawValue, { order = 0, currencyHints = [] } = {}) {
+function scorePriceCandidate(
+  rawValue,
+  { order = 0, currencyHints = [], contextPenalty = 0 } = {}
+) {
   const value = `${rawValue || ""}`.trim();
   if (!value) {
     return null;
@@ -180,6 +219,10 @@ function scorePriceCandidate(rawValue, { order = 0, currencyHints = [] } = {}) {
     else if (numericValue >= 20) score += 1;
     else if (numericValue < 5) score -= 2;
     else if (numericValue < 10) score -= 1;
+  }
+
+  if (Number.isFinite(contextPenalty) && contextPenalty !== 0) {
+    score += contextPenalty;
   }
 
   // Prefer earlier discoveries when scores are equal.
@@ -562,6 +605,15 @@ function scoreImage(url) {
   return score;
 }
 
+function computePriceContextPenalty(text) {
+  if (!text) return 0;
+  const lower = `${text}`.toLowerCase();
+  if (!lower) return 0;
+  return PRICE_CONTEXT_NEGATIVE_KEYWORDS.some((keyword) => lower.includes(keyword))
+    ? -8
+    : 0;
+}
+
 function findPriceInTexts(texts, currencyHints = []) {
   if (!Array.isArray(texts) || !texts.length) return null;
   const normalizedCurrencyHints = Array.from(
@@ -577,12 +629,14 @@ function findPriceInTexts(texts, currencyHints = []) {
   texts.forEach((text, index) => {
     const normalized = `${text || ""}`.replace(/\s+/g, " ").trim();
     if (!normalized) return;
+    const contextPenalty = computePriceContextPenalty(normalized);
     for (const regex of PRICE_REGEXES) {
       const match = normalized.match(regex);
       if (match && match[0]) {
         const candidate = scorePriceCandidate(match[0], {
           order: index,
           currencyHints: normalizedCurrencyHints,
+          contextPenalty,
         });
         if (candidate) {
           candidates.push(candidate);
@@ -595,21 +649,23 @@ function findPriceInTexts(texts, currencyHints = []) {
   if (!candidates.length && normalizedCurrencyHints.length) {
     const numberRegex = /\d[\d.,]*/;
     texts.forEach((text, index) => {
-      const normalized = `${text || ""}`.replace(/\s+/g, " ").trim();
-      if (!normalized) return;
-      const numberMatch = normalized.match(numberRegex);
-      if (!numberMatch) return;
-      const numberValue = numberMatch[0];
-      for (const hint of normalizedCurrencyHints) {
-        const combined = combinePriceWithCurrency(numberValue, hint);
-        const candidate = scorePriceCandidate(combined, {
-          order: texts.length + index,
-          currencyHints: normalizedCurrencyHints,
-        });
-        if (candidate) {
-          candidates.push(candidate);
-        }
+    const normalized = `${text || ""}`.replace(/\s+/g, " ").trim();
+    if (!normalized) return;
+    const contextPenalty = computePriceContextPenalty(normalized);
+    const numberMatch = normalized.match(numberRegex);
+    if (!numberMatch) return;
+    const numberValue = numberMatch[0];
+    for (const hint of normalizedCurrencyHints) {
+      const combined = combinePriceWithCurrency(numberValue, hint);
+      const candidate = scorePriceCandidate(combined, {
+        order: texts.length + index,
+        currencyHints: normalizedCurrencyHints,
+        contextPenalty,
+      });
+      if (candidate) {
+        candidates.push(candidate);
       }
+    }
     });
   }
 
@@ -653,6 +709,86 @@ function combinePriceWithCurrency(priceValue, currencyValue) {
     return `${priceText} ${upperCurrency}`.trim();
   }
   return `${currencyText} ${priceText}`.trim();
+}
+
+function getUsdToEurRate() {
+  const envValue = Number.parseFloat(process.env.SCRAPER_USD_TO_EUR_RATE || "");
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return envValue;
+  }
+  return DEFAULT_USD_TO_EUR_RATE;
+}
+
+function detectCurrencyFromText(value, currencyHints = []) {
+  const text = `${value || ""}`;
+  const normalizedHints = (currencyHints || [])
+    .map((hint) => `${hint || ""}`.trim())
+    .filter(Boolean);
+
+  for (const hint of normalizedHints) {
+    const upper = hint.toUpperCase();
+    if (CURRENCY_CODES.includes(upper)) {
+      return upper;
+    }
+    const direct = CURRENCY_SYMBOL_TO_CODE.get(hint) || CURRENCY_SYMBOL_TO_CODE.get(upper);
+    if (direct) {
+      return direct;
+    }
+  }
+
+  const upperText = text.toUpperCase();
+  for (const code of CURRENCY_CODES) {
+    if (upperText.includes(code)) {
+      return code;
+    }
+  }
+
+  for (const [symbol, code] of CURRENCY_SYMBOL_TO_CODE.entries()) {
+    if (!symbol) continue;
+    if (!text.includes(symbol)) continue;
+    if (symbol === "$") {
+      if (/US\$|USD/.test(upperText)) {
+        return "USD";
+      }
+      const hintedCode = normalizedHints
+        .map((hint) => `${hint}`.toUpperCase())
+        .find((hint) => CURRENCY_CODES.includes(hint));
+      if (hintedCode) {
+        return hintedCode;
+      }
+      return "USD";
+    }
+    return code;
+  }
+
+  return null;
+}
+
+function formatPriceNumber(value) {
+  if (!Number.isFinite(value)) return null;
+  const rounded = Math.round(value * 100) / 100;
+  const fixed = rounded.toFixed(2);
+  return fixed.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+}
+
+function normalizePriceOutput(value, currencyHints = []) {
+  if (!value) return null;
+  let amount = parseNumericPrice(value);
+  if (amount === null) {
+    const digitsOnly = `${value}`.replace(/[^0-9.,-]/g, "");
+    amount = parseNumericPrice(digitsOnly);
+    if (amount === null) {
+      const sanitized = digitsOnly.replace(/,/g, "");
+      return sanitized || null;
+    }
+  }
+
+  const detectedCurrency = detectCurrencyFromText(value, currencyHints);
+  if (detectedCurrency === "USD") {
+    amount *= getUsdToEurRate();
+  }
+
+  return formatPriceNumber(amount);
 }
 
 function createImageDedupKey(url) {
@@ -1037,15 +1173,16 @@ function extractFromHtmlContent(html, url) {
     .map((imageUrl) => ({ url: imageUrl, score: scoreImage(imageUrl) }))
     .sort((a, b) => b.score - a.score);
   const bestRankedImages = rankedImages.filter((entry) => entry.score > 0).slice(0, BEST_IMAGE_LIMIT);
-  const bestImages = bestRankedImages.map((entry) => entry.url);
+  const bestImages = dedupeImages(bestRankedImages.map((entry) => entry.url));
 
-  const priceAfterImages = findPriceInTexts(priceValues, Array.from(currencyValues));
+  const currencyHintList = Array.from(currencyValues);
+  const priceAfterImages = findPriceInTexts(priceValues, currencyHintList);
   if (!price && priceAfterImages) {
     price = priceAfterImages;
   }
 
-  if (!price && priceValues.length && currencyValues.size) {
-    const [firstCurrency] = Array.from(currencyValues);
+  if (!price && priceValues.length && currencyHintList.length) {
+    const [firstCurrency] = currencyHintList;
     const numericCandidate = priceValues
       .map((value) => value.match(/\d[\d.,]*/)?.[0] || null)
       .find(Boolean);
@@ -1054,7 +1191,10 @@ function extractFromHtmlContent(html, url) {
     }
   }
 
-  return { title, description, price: price || null, images: bestImages };
+  const normalizedPrice = normalizePriceOutput(price, currencyHintList);
+  const finalPrice = normalizedPrice && `${normalizedPrice}`.trim() ? normalizedPrice : null;
+
+  return { title, description, price: finalPrice, images: bestImages };
 }
 
 function isValidResult(result) {
