@@ -807,11 +807,19 @@ function createImageDedupKey(url) {
       "hei",
       "rh",
       "mh",
+      "imwidth",
+      "size",
+      "scale",
+      "scaling",
+      "dpr",
       "ts",
       "timestamp",
       "cache",
+      "format",
+      "ext",
       "quality",
       "q",
+      "compression",
     ]);
     const sortedKeys = Array.from(parsed.searchParams.keys()).sort();
     for (const key of sortedKeys) {
