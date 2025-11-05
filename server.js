@@ -1245,12 +1245,13 @@ function roundDuration(seconds) {
 }
 
 function buildSuccessPayload(data, meta) {
+  const imageObjects = (data.images || []).map((url) => ({ url }));
   return {
     ok: true,
     title: data.title || null,
     description: data.description || null,
     price: data.price || null,
-    images: data.images || [],
+    images: imageObjects,
     meta,
   };
 }
