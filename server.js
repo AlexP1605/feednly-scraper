@@ -329,18 +329,8 @@ async function enableRequestOptimizations(page, targetUrl) {
         return;
       }
       if (type === "image") {
-        if (targetHostname) {
-          try {
-            const requestHostname = new URL(request.url()).hostname;
-            if (requestHostname && requestHostname !== targetHostname) {
-              request.abort();
-              return;
-            }
-          } catch {
-            request.abort();
-            return;
-          }
-        }
+        request.abort();
+        return;
       }
     } catch {
       // Ignore interception errors and fall back to continuing the request.
