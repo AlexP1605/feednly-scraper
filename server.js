@@ -3,6 +3,7 @@ import * as cheerio from "cheerio";
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import axios from "axios";
+import he from "he";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -1241,12 +1242,17 @@ function roundDuration(seconds) {
   return Number(seconds.toFixed(3));
 }
 
+function decodeHtmlEntities(value) {
+  if (typeof value !== "string") return value;
+  return he.decode(value);
+}
+
 function buildSuccessPayload(data, meta) {
   const imageObjects = (data.images || []).map((url) => ({ url }));
   return {
     ok: true,
-    title: data.title || null,
-    description: data.description || null,
+    title: decodeHtmlEntities(data.title) || null,
+    description: decodeHtmlEntities(data.description) || null,
     price: data.price || null,
     images: imageObjects,
     meta,
