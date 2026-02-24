@@ -6,6 +6,7 @@ import axios from "axios";
 import he from "he";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isIP } from "node:net";
 import { performance } from "node:perf_hooks";
 
 const axiosMaxRedirects = Number.parseInt(process.env.SCRAPER_AXIOS_MAX_REDIRECTS || "", 10);
@@ -20,8 +21,11 @@ puppeteer.use(StealthPlugin());
 
 const NAVIGATION_TIMEOUT = Math.max(
   5000,
-  Number.parseInt(process.env.SCRAPER_NAVIGATION_TIMEOUT_MS || "45000", 10) || 45000
+  Number.parseInt(process.env.SCRAPER_NAVIGATION_TIMEOUT_MS || "40000", 10) || 40000
 );
+const STAGE1_HARD_TIMEOUT_MS = 40000;
+const STAGE2_HARD_TIMEOUT_MS = 45000;
+const STAGE3_HARD_TIMEOUT_MS = 30000;
 const HUMAN_DELAY_RANGE = [1200, 2400];
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -1242,6 +1246,75 @@ function roundDuration(seconds) {
   return Number(seconds.toFixed(3));
 }
 
+function isDisallowedHostname(hostname) {
+  const normalizedHost = `${hostname || ""}`.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!normalizedHost) {
+    return true;
+  }
+  if (normalizedHost === "localhost") {
+    return true;
+  }
+
+  const ipType = isIP(normalizedHost);
+  if (ipType === 4) {
+    const octets = normalizedHost.split(".").map((part) => Number.parseInt(part, 10));
+    if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+      return true;
+    }
+    if (normalizedHost === "127.0.0.1" || normalizedHost === "0.0.0.0") {
+      return true;
+    }
+    const [first, second] = octets;
+    if (first === 10) return true;
+    if (first === 172 && second >= 16 && second <= 31) return true;
+    if (first === 192 && second === 168) return true;
+    if (first === 169 && second === 254) return true;
+  }
+
+  if (ipType === 6) {
+    if (normalizedHost === "::1") {
+      return true;
+    }
+    const firstHextet = (normalizedHost.split(":").find(Boolean) || "0").toLowerCase();
+    if (/^f[c-d][0-9a-f]{0,2}$/i.test(firstHextet)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isAllowedScrapeUrl(rawUrl) {
+  if (typeof rawUrl !== "string") {
+    return false;
+  }
+  const input = rawUrl.trim();
+  if (!input || input.length > 2048) {
+    return false;
+  }
+  try {
+    const parsed = new URL(input);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return false;
+    }
+    if (isDisallowedHostname(parsed.hostname)) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runStageWithHardTimeout(stageName, timeoutMs, stageFn) {
+  const timeoutResult = new Promise((resolve) => {
+    setTimeout(() => {
+      resolve({ ok: false, stage: stageName, error: `${stageName} hard timeout after ${timeoutMs}ms` });
+    }, timeoutMs);
+  });
+  return Promise.race([stageFn(), timeoutResult]);
+}
+
 function decodeHtmlEntities(value) {
   if (typeof value !== "string") return value;
   return he.decode(value);
@@ -1622,7 +1695,7 @@ async function scrapeWithStages(url) {
     return "failed";
   };
 
-  const stage1Result = await runStage1(url);
+  const stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
   steps.stage1 = resolveStageStatus(stage1Result, true, false);
   let finalResult = null;
   let finalStage = stage1Result?.meta?.stage || "stage1";
@@ -1633,7 +1706,7 @@ async function scrapeWithStages(url) {
     finalResult = stage1Result;
   } else {
     stage2Attempted = true;
-    stage2Result = await runStage2(url);
+    stage2Result = await runStageWithHardTimeout("stage2", STAGE2_HARD_TIMEOUT_MS, () => runStage2(url));
     if (stage2Result?.ok) {
       finalResult = stage2Result;
       finalStage = stage2Result?.meta?.stage || "stage2";
@@ -1645,7 +1718,7 @@ async function scrapeWithStages(url) {
   let stage3Attempted = false;
   if (!finalResult) {
     stage3Attempted = true;
-    stage3Result = await runStage3(url);
+    stage3Result = await runStageWithHardTimeout("stage3", STAGE3_HARD_TIMEOUT_MS, () => runStage3(url));
     if (stage3Result?.ok) {
       finalResult = stage3Result;
       finalStage = stage3Result?.meta?.stage || "brightdata";
@@ -1716,6 +1789,10 @@ app.get("/scrape", async (req, res) => {
   const { url } = req.query;
   if (!url) {
     res.status(400).json({ ok: false, error: "Missing url query parameter" });
+    return;
+  }
+  if (!isAllowedScrapeUrl(`${url}`)) {
+    res.status(400).json({ ok: false, error: "Invalid or disallowed URL" });
     return;
   }
   try {
