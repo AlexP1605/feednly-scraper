@@ -258,7 +258,14 @@ function shuffleList(values) {
 
 const { TimeoutError } = puppeteer.errors ?? {};
 
-const BROWSER_LAUNCH_ARGS = ["--no-sandbox", "--disable-setuid-sandbox"];
+const BROWSER_LAUNCH_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--no-zygote",
+  "--single-process"
+];
 let sharedBrowserPromise = null;
 const cookieCache = new Map();
 
