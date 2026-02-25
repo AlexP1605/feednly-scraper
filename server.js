@@ -558,6 +558,16 @@ function computeImageScore(url, meta = {}) {
   if (meta.order !== undefined && meta.order !== null) {
     score -= meta.order;
   }
+  if (width && height) {
+    const ratio = width / height;
+    if (ratio > 1.6 && width >= 900) {
+      score -= 1500;
+    }
+    if (height < 250 && width > 800) {
+      score -= 1200;
+    }
+  }
+  score += scoreImage(url, meta);
   return score;
 }
 
@@ -565,7 +575,40 @@ const IMAGE_KEYWORD_BONUSES = ["meta", "og", "product", "main", "hero", "cover"]
 const IMAGE_QUALITY_HINTS = ["_large", "-large", "_xlarge", "-xlarge", "_2x", "-2x", "@2x", "1200", "1600"];
 const IMAGE_NEGATIVE_KEYWORDS = ["logo", "icon", "nav", "sprite", "small", "thumbnail", "thumb", "avatar"];
 
-function scoreImage(url) {
+const IMAGE_MARKETING_KEYWORDS = [
+  "banner",
+  "marketing",
+  "campaign",
+  "editorial",
+  "homepage",
+  "landing",
+  "lookbook",
+  "promo",
+  "offer",
+  "newsletter",
+  "hero",
+  "carousel",
+  "slider",
+  "library-sites",
+  "shade_finder",
+];
+const IMAGE_PRODUCT_KEYWORDS = [
+  "pim",
+  "product",
+  "media_principal",
+  "published",
+  "pdp",
+  "gallery",
+  "zoom",
+  "detail",
+  "packshot",
+  "main",
+  "primary",
+  "front",
+  "image",
+];
+
+function scoreImage(url, meta = {}) {
   if (!url) return 0;
   const normalized = `${url}`.trim();
   if (!normalized) return 0;
@@ -602,6 +645,22 @@ function scoreImage(url) {
     if (lower.includes(negative)) {
       score -= 35;
     }
+  }
+
+  for (const keyword of IMAGE_MARKETING_KEYWORDS) {
+    if (lower.includes(keyword)) {
+      score -= 800;
+    }
+  }
+
+  for (const keyword of IMAGE_PRODUCT_KEYWORDS) {
+    if (lower.includes(keyword)) {
+      score += 250;
+    }
+  }
+
+  if (meta.source === "jsonld_product") {
+    score += 1200;
   }
 
   return score;
@@ -967,17 +1026,37 @@ function extractFromHtmlContent(html, url) {
   let price = findPriceInTexts(priceValues, Array.from(currencyValues));
 
   const images = [];
+  const productJsonLdImages = [];
+  const imageMetaByUrl = new Map();
   const fallbackCandidateMap = new Map();
   let fallbackOrder = 0;
 
-  function registerFallbackCandidate(candidate, meta = {}) {
+  function mergeImageMeta(currentMeta = {}, nextMeta = {}) {
+    const merged = { ...currentMeta };
+    for (const [key, value] of Object.entries(nextMeta || {})) {
+      if (value !== undefined && value !== null) {
+        merged[key] = value;
+      }
+    }
+    return merged;
+  }
+
+  function registerImageMeta(candidate, meta = {}) {
     const normalized = normalizeImageCandidate(candidate, url, { requireProductKeyword: false });
+    if (!normalized) return null;
+    const existing = imageMetaByUrl.get(normalized) || {};
+    imageMetaByUrl.set(normalized, mergeImageMeta(existing, meta));
+    return normalized;
+  }
+
+  function registerFallbackCandidate(candidate, meta = {}) {
+    const normalized = registerImageMeta(candidate, meta);
     if (!normalized) return;
     const order = meta.order ?? fallbackOrder;
     const score = computeImageScore(normalized, { ...meta, order });
     const existing = fallbackCandidateMap.get(normalized);
     if (!existing || existing.score < score) {
-      fallbackCandidateMap.set(normalized, { url: normalized, score, order });
+      fallbackCandidateMap.set(normalized, { url: normalized, score, order, meta: { ...meta } });
     }
     fallbackOrder += 1;
   }
@@ -1066,6 +1145,61 @@ function extractFromHtmlContent(html, url) {
         const json = JSON.parse(text);
         const nodes = Array.isArray(json) ? json : [json];
         const toArray = (value) => (Array.isArray(value) ? value : value ? [value] : []);
+        const hasType = (node, typeName) => {
+          const types = toArray(node?.["@type"]).map((item) => `${item}`.toLowerCase());
+          return types.includes(`${typeName}`.toLowerCase());
+        };
+        const gatherProductNodes = (node) => {
+          if (!node || typeof node !== "object") return [];
+          const productNodes = [];
+          if (hasType(node, "Product")) {
+            productNodes.push(node);
+          }
+          toArray(node["@graph"])
+            .filter((entry) => entry && typeof entry === "object")
+            .forEach((graphNode) => {
+              if (hasType(graphNode, "Product")) {
+                productNodes.push(graphNode);
+              }
+            });
+          return productNodes;
+        };
+        const extractImageValue = (imageValue, meta = {}) => {
+          if (!imageValue) return null;
+          if (typeof imageValue === "string") {
+            const normalized = addImageCandidate(images, imageValue, url, {
+              requireProductKeyword: false,
+            });
+            if (normalized) {
+              registerFallbackCandidate(normalized, meta);
+            }
+            return normalized;
+          }
+          if (typeof imageValue !== "object") return null;
+          const imageUrl =
+            imageValue.url ||
+            imageValue.contentUrl ||
+            imageValue.image ||
+            imageValue.thumbnailUrl ||
+            imageValue['@id'] ||
+            null;
+          const imageWidth = parseDimension(imageValue.width || imageValue.widthInPixels || meta.width);
+          const imageHeight = parseDimension(imageValue.height || imageValue.heightInPixels || meta.height);
+          if (!imageUrl) return null;
+          const normalized = addImageCandidate(images, imageUrl, url, {
+            requireProductKeyword: false,
+          });
+          if (normalized) {
+            registerFallbackCandidate(normalized, {
+              ...meta,
+              width: imageWidth,
+              height: imageHeight,
+              aspectRatio: imageWidth && imageHeight ? imageWidth / imageHeight : meta.aspectRatio || null,
+            });
+          }
+          return normalized;
+        };
+
         nodes.forEach((node) => {
           if (!node || typeof node !== "object") return;
 
@@ -1078,33 +1212,17 @@ function extractFromHtmlContent(html, url) {
 
           const imageField = node.image || node.images || node.photo || node.thumbnailUrl;
           toArray(imageField).forEach((imageValue) => {
-            if (!imageValue) return;
-            if (typeof imageValue === "string") {
-              addImageCandidate(images, imageValue, url, {
-                requireProductKeyword: false,
-              });
-              registerFallbackCandidate(imageValue, {});
-            } else if (typeof imageValue === "object") {
-              const imageUrl =
-                imageValue.url ||
-                imageValue.contentUrl ||
-                imageValue.image ||
-                imageValue.thumbnailUrl ||
-                imageValue['@id'] ||
-                null;
-              const imageWidth = parseDimension(imageValue.width || imageValue.widthInPixels);
-              const imageHeight = parseDimension(imageValue.height || imageValue.heightInPixels);
-              if (imageUrl) {
-                addImageCandidate(images, imageUrl, url, {
-                  requireProductKeyword: false,
-                });
-                registerFallbackCandidate(imageUrl, {
-                  width: imageWidth,
-                  height: imageHeight,
-                  aspectRatio: imageWidth && imageHeight ? imageWidth / imageHeight : null,
-                });
+            extractImageValue(imageValue, {});
+          });
+
+          const productMeta = { source: "jsonld_product", priorityBoost: true };
+          gatherProductNodes(node).forEach((productNode) => {
+            toArray(productNode.image).forEach((productImage) => {
+              const normalized = extractImageValue(productImage, productMeta);
+              if (normalized) {
+                productJsonLdImages.push(normalized);
               }
-            }
+            });
           });
 
           const offerFields = [...toArray(node.offers), ...toArray(node.aggregateOffer)];
@@ -1180,10 +1298,37 @@ function extractFromHtmlContent(html, url) {
   }
 
   const rankedImages = Array.from(new Set(uniqueImages))
-    .map((imageUrl) => ({ url: imageUrl, score: scoreImage(imageUrl) }))
+    .map((imageUrl) => ({
+      url: imageUrl,
+      meta: imageMetaByUrl.get(imageUrl) || {},
+      score: computeImageScore(imageUrl, imageMetaByUrl.get(imageUrl) || {}),
+    }))
     .sort((a, b) => b.score - a.score);
   const bestRankedImages = rankedImages.filter((entry) => entry.score > 0).slice(0, BEST_IMAGE_LIMIT);
-  const bestImages = dedupeImages(bestRankedImages.map((entry) => entry.url));
+  let bestImages = dedupeImages(bestRankedImages.map((entry) => entry.url));
+
+  const validProductJsonLdImages = dedupeImages(productJsonLdImages);
+  if (validProductJsonLdImages.length) {
+    const bestProductMain = [...validProductJsonLdImages]
+      .map((imageUrl) => ({
+        url: imageUrl,
+        score: computeImageScore(imageUrl, imageMetaByUrl.get(imageUrl) || { source: "jsonld_product", priorityBoost: true }),
+      }))
+      .sort((a, b) => b.score - a.score)[0];
+
+    if (bestProductMain?.url) {
+      if (process.env.SCRAPER_DEBUG === "1") {
+        console.log("[extractFromHtmlContent] Using jsonld_product main image", {
+          mainImage: bestProductMain.url,
+          candidates: validProductJsonLdImages.length,
+        });
+      }
+      bestImages = dedupeImages([
+        bestProductMain.url,
+        ...bestImages.filter((imageUrl) => imageUrl !== bestProductMain.url),
+      ]).slice(0, BEST_IMAGE_LIMIT);
+    }
+  }
 
   const currencyHintList = Array.from(currencyValues);
   const priceAfterImages = findPriceInTexts(priceValues, currencyHintList);
