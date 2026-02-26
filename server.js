@@ -362,8 +362,8 @@ async function configurePage(page, url) {
   if (typeof page.setDefaultTimeout === "function") {
     page.setDefaultTimeout(Math.max(NAVIGATION_TIMEOUT, 30000));
   }
-  const disableInterception = await enableRequestOptimizations(page, url);
-  return { userAgent, viewport, disableInterception };
+  // const disableInterception = await enableRequestOptimizations(page, url);
+  return { userAgent, viewport };
 }
 
 async function navigatePage(page, url) {
@@ -1543,11 +1543,6 @@ async function runStage1(url) {
     const message = err?.message || lastErrorMessage || "Stage1 failed";
     lastErrorMessage = message;
   } finally {
-    try {
-      pageSetup?.disableInterception?.();
-    } catch {
-      // ignore
-    }
     if (page) {
       await page.close().catch(() => {});
     }
@@ -1711,11 +1706,6 @@ async function runStage2(url) {
       const message = err?.message || lastErrorMessage || "Stage2 attempt failed";
       lastErrorMessage = message;
     } finally {
-      try {
-        pageSetup?.disableInterception?.();
-      } catch {
-        // ignore
-      }
       if (page) {
         await page.close().catch(() => {});
       }
