@@ -268,7 +268,11 @@ const BROWSER_LAUNCH_ARGS = [
   "--disable-setuid-sandbox",
   "--disable-dev-shm-usage",
   "--disable-gpu",
-  "--no-zygote"
+  "--no-zygote",
+  "--ignore-certificate-errors",
+  "--ignore-certificate-errors-spki-list",
+  "--disable-features=site-per-process",
+  "--disable-software-rasterizer"
 ];
 let sharedBrowserPromise = null;
 const cookieCache = new Map();
@@ -278,7 +282,7 @@ function normalizeChromiumProxy(proxyUrl) {
   const raw = `${proxyUrl}`.trim();
   if (!raw) return null;
   if (!/^[a-z][\w+.-]*:\/\//i.test(raw)) {
-    return raw;
+    return `http://${raw}`;
   }
   try {
     const parsed = new URL(raw);
@@ -287,14 +291,17 @@ function normalizeChromiumProxy(proxyUrl) {
     if (protocol === "socks5:" || protocol === "socks4:") {
       return `${protocol}//${hostPort}`;
     }
-    return hostPort;
+    return `http://${hostPort}`;
   } catch {
     return raw;
   }
 }
 
-function createBrowserLaunchOptions(proxyUrl) {
+function createBrowserLaunchOptions(proxyUrl, userAgent) {
   const args = [...BROWSER_LAUNCH_ARGS];
+  if (userAgent) {
+    args.push(`--user-agent=${userAgent}`);
+  }
   const normalizedProxy = normalizeChromiumProxy(proxyUrl);
   if (normalizedProxy) {
     args.push(`--proxy-server=${normalizedProxy}`);
@@ -423,8 +430,8 @@ async function enableRequestOptimizations(page, targetUrl) {
   };
 }
 
-async function configurePage(page, url) {
-  const userAgent = pickUserAgent();
+async function configurePage(page, url, preferredUserAgent) {
+  const userAgent = preferredUserAgent || pickUserAgent();
   const viewport = pickViewport();
   await page.setUserAgent(userAgent);
   await page.setViewport(viewport);
@@ -1447,8 +1454,8 @@ function isValidResult(result) {
   return Boolean(result && result.title && Array.isArray(result.images) && result.images.length > 0);
 }
 
-async function launchBrowser(proxyUrl) {
-  return puppeteer.launch(createBrowserLaunchOptions(proxyUrl));
+async function launchBrowser(proxyUrl, userAgent) {
+  return puppeteer.launch(createBrowserLaunchOptions(proxyUrl, userAgent));
 }
 
 async function loadCookiesForDomain(domain) {
@@ -1725,23 +1732,23 @@ async function runStage2(url) {
     const attemptNumber = attempts;
     const proxyServer = `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ""}`;
     const chromiumProxy = normalizeChromiumProxy(proxyServer);
+    const userAgent = pickUserAgent();
     let browser;
     let page;
     let pageSetup = null;
     try {
-      browser = await launchBrowser(chromiumProxy);
+      browser = await launchBrowser(chromiumProxy, userAgent);
       if (!browser) {
         throw new Error("Browser launch failed");
       }
       page = await browser.newPage();
-      pageSetup = await configurePage(page, url);
-      const { userAgent } = pageSetup;
       if (proxy.username || proxy.password) {
         await page.authenticate({
           username: decodeURIComponent(proxy.username || ""),
           password: decodeURIComponent(proxy.password || ""),
         });
       }
+      pageSetup = await configurePage(page, url, userAgent);
       const cookies = await loadCookiesForDomain(domain);
       if (cookies.length) {
         try {
