@@ -560,12 +560,24 @@ function computeImageScore(url, meta = {}) {
   }
   if (width && height) {
     const ratio = width / height;
+    if (ratio > 1.8) {
+      score -= 4000;
+    }
     if (ratio > 1.6 && width >= 900) {
       score -= 1500;
     }
     if (height < 250 && width > 800) {
       score -= 1200;
     }
+  }
+  if (width && width < 400) {
+    score -= 5000;
+  }
+  if (height && height < 400) {
+    score -= 5000;
+  }
+  if (meta.source === "jsonld_product") {
+    score += 5000;
   }
   score += scoreImage(url, meta);
   return score;
@@ -872,11 +884,17 @@ function createImageDedupKey(url) {
       "size",
       "scale",
       "scaling",
+      "scalewidth",
+      "scaleheight",
+      "scalemode",
+      "fit",
+      "crop",
       "dpr",
       "ts",
       "timestamp",
       "cache",
       "format",
+      "auto",
       "ext",
       "quality",
       "q",
