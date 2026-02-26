@@ -268,18 +268,91 @@ const BROWSER_LAUNCH_ARGS = [
   "--disable-setuid-sandbox",
   "--disable-dev-shm-usage",
   "--disable-gpu",
-  "--no-zygote",
-  "--single-process"
+  "--no-zygote"
 ];
 let sharedBrowserPromise = null;
 const cookieCache = new Map();
 
+function normalizeChromiumProxy(proxyUrl) {
+  if (!proxyUrl) return null;
+  const raw = `${proxyUrl}`.trim();
+  if (!raw) return null;
+  if (!/^[a-z][\w+.-]*:\/\//i.test(raw)) {
+    return raw;
+  }
+  try {
+    const parsed = new URL(raw);
+    const hostPort = `${parsed.hostname}${parsed.port ? `:${parsed.port}` : ""}`;
+    const protocol = parsed.protocol.toLowerCase();
+    if (protocol === "socks5:" || protocol === "socks4:") {
+      return `${protocol}//${hostPort}`;
+    }
+    return hostPort;
+  } catch {
+    return raw;
+  }
+}
+
 function createBrowserLaunchOptions(proxyUrl) {
   const args = [...BROWSER_LAUNCH_ARGS];
-  if (proxyUrl) {
-    args.push(`--proxy-server=${proxyUrl}`);
+  const normalizedProxy = normalizeChromiumProxy(proxyUrl);
+  if (normalizedProxy) {
+    args.push(`--proxy-server=${normalizedProxy}`);
   }
   return { headless: "new", args };
+}
+
+function shouldDecodeLikelyBase64(value) {
+  if (typeof value !== "string") return false;
+  const normalized = value.replace(/\s+/g, "");
+  if (normalized.length < 40 || normalized.length % 4 !== 0) return false;
+  if (!/^[A-Za-z0-9+/=]+$/.test(normalized)) return false;
+  return true;
+}
+
+function decodeLikelyBase64(value) {
+  if (!shouldDecodeLikelyBase64(value)) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(value.replace(/\s+/g, ""), "base64").toString("utf8");
+    if (decoded && /<html|<!doctype html|<body|<head/i.test(decoded)) {
+      return decoded;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function pickBrightDataHtmlCandidate(payload) {
+  const paths = [
+    ["solution", "response", "body"],
+    ["solution", "content"],
+    ["response", "body"],
+    ["body"],
+    ["result"],
+    ["content"],
+    ["html"],
+  ];
+  for (const pathParts of paths) {
+    let current = payload;
+    for (const key of pathParts) {
+      if (!current || typeof current !== "object") {
+        current = null;
+        break;
+      }
+      current = current[key];
+    }
+    if (typeof current === "string" && current.trim()) {
+      return current;
+    }
+    if (Buffer.isBuffer(current)) {
+      const asText = current.toString("utf8");
+      if (asText.trim()) return asText;
+    }
+  }
+  return null;
 }
 
 async function acquireSharedBrowser() {
@@ -1634,6 +1707,7 @@ async function runStage2(url) {
   let attempts = 0;
   let lastError = null;
   let lastErrorMessage = null;
+  let lastErrorMeta = null;
   for (const proxyRaw of proxies) {
     let proxy;
     try {
@@ -1646,11 +1720,12 @@ async function runStage2(url) {
     attempts += 1;
     const attemptNumber = attempts;
     const proxyServer = `${proxy.protocol}//${proxy.hostname}${proxy.port ? `:${proxy.port}` : ""}`;
+    const chromiumProxy = normalizeChromiumProxy(proxyServer);
     let browser;
     let page;
     let pageSetup = null;
     try {
-      browser = await launchBrowser(proxyServer);
+      browser = await launchBrowser(chromiumProxy);
       if (!browser) {
         throw new Error("Browser launch failed");
       }
@@ -1684,6 +1759,7 @@ async function runStage2(url) {
       } catch (err) {
         navigationError = err;
         lastError = err;
+        lastErrorMeta = { proxyUsed: chromiumProxy, attemptNumber };
         const navMessage = err?.message || "Unknown navigation error";
         lastErrorMessage = `Navigation error on attempt ${attemptNumber}: ${navMessage}`;
       }
@@ -1706,7 +1782,7 @@ async function runStage2(url) {
           durationSeconds,
           network: { durationSeconds },
           attempts,
-          proxy: proxyServer,
+          proxy: chromiumProxy,
           userAgent,
           navigationWaitUntil,
           navigationTimedOut,
@@ -1721,6 +1797,7 @@ async function runStage2(url) {
       await delay(randomBetween(800, 1500));
     } catch (err) {
       lastError = err;
+      lastErrorMeta = { proxyUsed: chromiumProxy, attemptNumber };
       const message = err?.message || lastErrorMessage || "Stage2 attempt failed";
       lastErrorMessage = message;
     } finally {
@@ -1737,6 +1814,7 @@ async function runStage2(url) {
     stage: "stage2",
     attempts,
     error: lastErrorMessage || lastError?.message || "Stage2 failed",
+    meta: lastErrorMeta,
   };
 }
 
@@ -1763,38 +1841,58 @@ async function runStage3(url) {
     const response = await axios.post(
       "https://api.brightdata.com/request",
       payload,
-      { headers, timeout: NAVIGATION_TIMEOUT }
+      { headers, timeout: NAVIGATION_TIMEOUT, responseType: "arraybuffer" }
     );
 
-    const responseData = response.data;
+    const responseBuffer = Buffer.isBuffer(response.data)
+      ? response.data
+      : response.data instanceof ArrayBuffer
+        ? Buffer.from(response.data)
+        : Buffer.from(response.data || "", "utf8");
+    const utf8Payload = responseBuffer.toString("utf8");
 
     const htmlCandidates = [];
-    if (typeof responseData === "string") {
-      htmlCandidates.push(responseData);
+    if (utf8Payload.trim()) {
+      htmlCandidates.push(utf8Payload);
     }
-    if (Buffer.isBuffer(responseData)) {
-      htmlCandidates.push(responseData.toString("utf8"));
+
+    let parsedPayload = null;
+    try {
+      parsedPayload = JSON.parse(utf8Payload);
+    } catch {
+      parsedPayload = null;
     }
-    if (responseData && typeof responseData === "object") {
-      const html =
-        responseData?.solution?.response?.body ||
-        responseData?.solution?.content ||
-        responseData?.response?.body ||
-        responseData?.body ||
-        "";
-      if (typeof html === "string") {
-        htmlCandidates.push(html);
-      } else if (Buffer.isBuffer(html)) {
-        htmlCandidates.push(html.toString("utf8"));
+
+    if (parsedPayload) {
+      const wrappedCandidate = pickBrightDataHtmlCandidate(parsedPayload);
+      if (wrappedCandidate) {
+        htmlCandidates.push(wrappedCandidate);
       }
     }
 
-    const htmlContent = htmlCandidates.find(
-      (candidate) => typeof candidate === "string" && candidate.trim().length > 0
-    );
+    const decodedCandidates = htmlCandidates
+      .map((candidate) => decodeLikelyBase64(candidate))
+      .filter((candidate) => typeof candidate === "string" && candidate.trim().length > 0);
+    htmlCandidates.push(...decodedCandidates);
+
+    const htmlContent = htmlCandidates.find((candidate) => {
+      if (typeof candidate !== "string") return false;
+      const trimmed = candidate.trim();
+      if (!trimmed) return false;
+      return /<html|<!doctype html|<body|<head/i.test(trimmed) || !trimmed.startsWith("{");
+    });
 
     if (!htmlContent) {
-      return { ok: false, stage: "stage3", attempts, error: "Empty response body" };
+      if (process.env.DEBUG === "true") {
+        const preview = utf8Payload.slice(0, 300);
+        console.log("[runStage3] Empty BrightData body", {
+          status: response.status,
+          contentType: response.headers?.["content-type"] || null,
+          bufferSize: responseBuffer.length,
+          preview,
+        });
+      }
+      return { ok: false, stage: "stage3", attempts, error: "Empty response body from BrightData" };
     }
 
     const extracted = extractFromHtmlContent(htmlContent, url);
