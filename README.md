@@ -80,7 +80,8 @@ docker run --rm -p 8080:8080 \
      --region REGION \
      --allow-unauthenticated \
      --set-env-vars "SCRAPER_PROXY_POOL=http://user:pass@proxy1:1234 http://user:pass@proxy2:1234" \
-     --set-env-vars "DEBUG=false"
+     --set-env-vars "DEBUG=false" \
+     --set-env-vars "DISABLE_STAGE1=true" # optionnel
    ```
 3. Add additional env vars (`SCRAPER_PROXY_FAILURE_COOLDOWN_MS`, etc.) as needed.
 

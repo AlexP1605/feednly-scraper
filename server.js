@@ -1569,6 +1569,10 @@ function buildSuccessPayload(data, meta) {
 }
 
 async function runStage1(url) {
+  if (process.env.DISABLE_STAGE1 === "true") {
+    return { ok: false, stage: "stage1", error: "Stage1 disabled" };
+  }
+
   const stageStart = performance.now();
   let browser;
   let page;
