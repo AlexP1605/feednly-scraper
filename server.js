@@ -1840,6 +1840,42 @@ async function scrapeWithStages(url) {
     return "failed";
   };
 
+  const buildStageLog = (stageName, result, attempted) => {
+    const ok = Boolean(result?.ok);
+    const error = result?.error || null;
+    const errorText = `${error || ""}`.toLowerCase();
+    const missingError = errorText.includes("missing");
+    const status = !attempted ? "skipped" : ok ? "success" : missingError ? "skipped" : "failed";
+    const blocked = Boolean(result?.meta?.blocked || result?.status === "blocked");
+    const durationSeconds = typeof result?.meta?.durationSeconds === "number" ? result.meta.durationSeconds : null;
+    let meta = result?.meta ? { ...result.meta } : null;
+
+    if (stageName === "stage2") {
+      meta = {
+        ...(meta || {}),
+        proxyUsed: result?.meta?.proxy || null,
+      };
+    }
+
+    if (stageName === "stage3") {
+      const brightDataUsed = Boolean(attempted && !missingError);
+      meta = {
+        ...(meta || {}),
+        brightDataUsed,
+      };
+    }
+
+    return {
+      attempted,
+      status,
+      ok,
+      error,
+      blocked,
+      durationSeconds,
+      meta,
+    };
+  };
+
   const stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
   steps.stage1 = resolveStageStatus(stage1Result, true, false);
   let finalResult = null;
@@ -1901,6 +1937,11 @@ async function scrapeWithStages(url) {
       stage1: stage1Result?.meta || null,
       stage2: stage2Result?.meta || null,
       stage3: stage3Result?.meta || null,
+    },
+    stages: {
+      stage1: buildStageLog("stage1", stage1Result, true),
+      stage2: buildStageLog("stage2", stage2Result, stage2Attempted),
+      stage3: buildStageLog("stage3", stage3Result, stage3Attempted),
     },
   };
 
