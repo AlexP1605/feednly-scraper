@@ -44,7 +44,7 @@ const BEST_IMAGE_LIMIT = Math.min(10, MAX_IMAGE_RESULTS);
 
 const PRODUCT_IMAGE_KEYWORDS = [
   "product", "media", "gallery", "item", "detail", "zoom", "images", "photo", "pdp",
-  "swatch", "packshot", "principal", "pim", "published",
+  "swatch", "packshot", "pim", "published",
 ];
 const PLACEHOLDER_KEYWORDS = [
   "placeholder", "transparent", "pixel", "spacer", "blank", "loading", "spinner", "logo", "icon",
@@ -85,15 +85,6 @@ const PRICE_CONTEXT_NEGATIVE_KEYWORDS = [
 const DEFAULT_USD_TO_EUR_RATE = 0.92;
 
 // ─── IMAGE PRIORITY SOURCES ───────────────────────────────────────────────────
-// Source priority (higher = better):
-// 10000 = og:image (chosen by the site itself, always the main product image)
-// 8000  = JSON-LD Product image (structured data, very reliable)
-// 6000  = twitter:image (often same as og:image)
-// 4000  = itemprop="image" in DOM
-// 2000  = img with strong product keywords in URL
-// 1000  = img with weak product keywords
-// 0     = fallback
-
 const SOURCE_PRIORITY = {
   og_image: 10000,
   jsonld_product: 8000,
@@ -104,23 +95,22 @@ const SOURCE_PRIORITY = {
   fallback: 0,
 };
 
-// Strong product URL patterns (regex) — these are very likely the main product image
+// FIX 1: media_principal retiré des strong patterns (c'est souvent une vue secondaire sur Sephora)
 const STRONG_PRODUCT_URL_PATTERNS = [
   /\/pim\//i,
   /\/published\//i,
   /\/pdp\//i,
   /\/packshot/i,
-  /\/media_principal/i,
   /media[-_]swatch/i,
   /\/product[-_]?image/i,
   /[-_]main[-_]/i,
   /[-_]hero[-_]/i,
   /\/gallery\//i,
   /\/zoom\//i,
-  /media[-_]\d+[-_]\d+\./i,  // e.g. media_1-1.jpg (Sephora pattern)
+  /media[-_]\d+[-_]\d+\./i,
 ];
 
-// Marketing/non-product patterns — penalize these heavily
+// FIX 1 (suite): media_principal ajouté dans les patterns à pénaliser
 const MARKETING_URL_PATTERNS = [
   /\/banner/i,
   /\/marketing/i,
@@ -139,7 +129,11 @@ const MARKETING_URL_PATTERNS = [
   /\/icon/i,
   /\/sprite/i,
   /\/avatar/i,
+  /media_principal/i,  // FIX 1: vue secondaire sur Sephora, pas l'image principale
 ];
+
+// FIX 2: Minimum size threshold - images below this are useless
+const MIN_IMAGE_DIMENSION = 300;
 
 function parseNumericPrice(value) {
   if (!value) return null;
@@ -388,26 +382,20 @@ function normalizeUrl(value, baseUrl) {
 function isValidImageUrl(url) {
   if (!url) return false;
   const lower = url.toLowerCase();
-  // Must be a real image format
   if (!/\.(jpe?g|png|webp|gif|avif)(?:$|\?|&)/i.test(lower) && !/\/(image|photo|picture|img)\//i.test(lower)) {
-    // Allow URLs without extension if they clearly look like image endpoints
     if (!/image|photo|picture|img|media|gallery/i.test(lower)) return false;
   }
-  // Filter obvious placeholders
   if (PLACEHOLDER_KEYWORDS.some((kw) => lower.includes(kw))) return false;
   return true;
 }
 
 // ─── CORE: compute image priority score ───────────────────────────────────────
-// This is the main function that determines image quality.
-// Higher score = more likely to be the main product image.
 function computeImagePriorityScore(url, sourcePriority = 0) {
   if (!url) return -Infinity;
-  const lower = url.toLowerCase();
 
   let score = sourcePriority;
 
-  // Heavy penalty for marketing/non-product images
+  // Heavy penalty for marketing/non-product images (includes media_principal now)
   for (const pattern of MARKETING_URL_PATTERNS) {
     if (pattern.test(url)) {
       score -= 5000;
@@ -427,16 +415,16 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
   const dims = extractDimensionsFromUrl(url);
   if (dims.width && dims.height) {
     const area = dims.width * dims.height;
-    score += Math.min(area / 100, 2000); // cap at 2000
-    // Penalize very wide/short images (banners)
+    score += Math.min(area / 100, 2000);
     const ratio = dims.width / dims.height;
     if (ratio > 2.0) score -= 3000;
     if (ratio > 1.6) score -= 1000;
-    // Penalize small images
-    if (dims.width < 400 || dims.height < 400) score -= 2000;
+    // FIX 2: Pénaliser fortement les images trop petites
+    if (dims.width < MIN_IMAGE_DIMENSION || dims.height < MIN_IMAGE_DIMENSION) score -= 9999;
   } else if (dims.width) {
     score += Math.min(dims.width * 2, 1000);
-    if (dims.width < 400) score -= 2000;
+    // FIX 2: Pénaliser fortement les images trop petites
+    if (dims.width < MIN_IMAGE_DIMENSION) score -= 9999;
   }
 
   // Format bonuses
@@ -507,6 +495,9 @@ function extractSrcsetCandidates(value) {
   }).filter((candidate) => candidate.url);
 }
 
+// FIX 3: Déduplication améliorée — déduplique aussi par nom de fichier
+// pour éviter les doublons quand le même fichier est dans des dossiers différents
+// (ex: 797712/398687-media_swatch-0.jpg vs P10063578/398687-media_swatch-0.jpg)
 function createImageDedupKey(url) {
   if (!url) return "";
   try {
@@ -524,6 +515,15 @@ function createImageDedupKey(url) {
       for (const value of values) normalizedSearch.append(key.toLowerCase(), value);
     }
     const normalizedQuery = normalizedSearch.toString();
+
+    // FIX 3: Extraire le nom de fichier pour dédupliquer par fichier
+    // même si le dossier parent est différent (variantes Sephora)
+    const filename = parsed.pathname.split("/").pop() || "";
+    // Si le nom de fichier est significatif (pas juste "image" ou trop court), on l'utilise comme clé
+    if (filename && filename.length > 10 && /\.(jpe?g|png|webp|gif|avif)/i.test(filename)) {
+      return `${parsed.hostname}__${filename}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+    }
+
     return `${parsed.origin}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
   } catch {
     return `${url}`.trim().toLowerCase();
@@ -531,7 +531,6 @@ function createImageDedupKey(url) {
 }
 
 function dedupeImagesByScore(entries) {
-  // entries: [{url, score}]
   const bestByKey = new Map();
   for (const entry of entries) {
     if (!entry.url) continue;
@@ -729,8 +728,7 @@ function extractFromHtmlContent(html, url) {
     pushCurrencyValue(currency);
   });
 
-  // ── Images — collected with priority scores ──────────────────────────────────
-  // All image candidates go into this array: [{url, score}]
+  // ── Images ──────────────────────────────────────────────────────────────────
   const imageCandidates = [];
 
   function addCandidate(rawUrl, sourcePriority = SOURCE_PRIORITY.fallback) {
@@ -742,21 +740,21 @@ function extractFromHtmlContent(html, url) {
     imageCandidates.push({ url: normalized, score });
   }
 
-  // ── PRIORITY 1: og:image — always the main product image chosen by the site ──
+  // PRIORITY 1: og:image
   const ogImage = $("meta[property='og:image']").attr("content") ||
     $("meta[property='og:image:url']").attr("content");
   if (ogImage) addCandidate(ogImage, SOURCE_PRIORITY.og_image);
 
-  // ── PRIORITY 2: twitter:image ──
+  // PRIORITY 2: twitter:image
   const twitterImage = $("meta[name='twitter:image']").attr("content") ||
     $("meta[name='twitter:image:src']").attr("content");
   if (twitterImage) addCandidate(twitterImage, SOURCE_PRIORITY.twitter_image);
 
-  // ── PRIORITY 3: link[rel='image_src'] ──
+  // PRIORITY 3: link[rel='image_src']
   const linkImage = $("link[rel='image_src']").attr("href");
   if (linkImage) addCandidate(linkImage, SOURCE_PRIORITY.twitter_image);
 
-  // ── PRIORITY 4: JSON-LD structured data ──
+  // PRIORITY 4: JSON-LD structured data
   $("script[type='application/ld+json']").toArray().forEach((element) => {
     const text = $(element).text();
     if (!text) return;
@@ -784,11 +782,9 @@ function extractFromHtmlContent(html, url) {
       nodes.forEach((node) => {
         if (!node || typeof node !== "object") return;
 
-        // Extract price
         if (node.price) pushPriceValue(node.price);
         if (node.priceCurrency) pushCurrencyValue(node.priceCurrency);
 
-        // Process @graph
         toArray(node["@graph"]).forEach((graphNode) => {
           if (!graphNode || typeof graphNode !== "object") return;
           if (hasType(graphNode, "Product")) {
@@ -796,16 +792,13 @@ function extractFromHtmlContent(html, url) {
           }
         });
 
-        // Direct Product node
         if (hasType(node, "Product")) {
           toArray(node.image).forEach((img) => processImageValue(img, SOURCE_PRIORITY.jsonld_product));
         } else {
-          // Non-product JSON-LD images (lower priority)
           const imageField = node.image || node.images || node.photo || node.thumbnailUrl;
           toArray(imageField).forEach((img) => processImageValue(img, SOURCE_PRIORITY.itemprop_image));
         }
 
-        // Offers
         [...toArray(node.offers), ...toArray(node.aggregateOffer)].forEach((offer) => {
           if (!offer || typeof offer !== "object") return;
           if (offer.price) pushPriceValue(offer.price);
@@ -822,27 +815,25 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
-  // ── PRIORITY 5: itemprop="image" ──
+  // PRIORITY 5: itemprop="image"
   $("[itemprop='image']").toArray().forEach((element) => {
     const src = $(element).attr("content") || $(element).attr("src");
     if (src) addCandidate(src, SOURCE_PRIORITY.itemprop_image);
   });
 
-  // ── PRIORITY 6: DOM images ──
+  // PRIORITY 6: DOM images
   $("img").toArray().forEach((element) => {
     const el = $(element);
     const src = el.attr("src") || el.attr("data-src") || el.attr("data-lazy-src") || el.attr("data-original");
     if (src) {
       const normalized = normalizeUrl(src, url);
       if (normalized && isValidImageUrl(normalized)) {
-        // Check if it's a strong product pattern
         const isStrong = STRONG_PRODUCT_URL_PATTERNS.some((p) => p.test(normalized));
         const priority = isStrong ? SOURCE_PRIORITY.dom_strong : SOURCE_PRIORITY.dom_weak;
         addCandidate(src, priority);
       }
     }
 
-    // srcset
     const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
     for (const srcset of srcsetValues) {
       extractSrcsetCandidates(srcset).forEach((candidate) => {
@@ -863,7 +854,7 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
-  // ── Sort and deduplicate by score ──
+  // Sort and deduplicate by score
   let finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
 
   // ── Final price ──
