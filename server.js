@@ -24,10 +24,8 @@ const NAVIGATION_TIMEOUT = Math.max(
   Number.parseInt(process.env.SCRAPER_NAVIGATION_TIMEOUT_MS || "40000", 10) || 40000
 );
 const STAGE1_HARD_TIMEOUT_MS = 40000;
-// Stage 2 removed
 const STAGE3_HARD_TIMEOUT_MS = 30000;
 
-// ✅ OPTIMISATION : délais humains réduits (était [1200, 2400])
 const HUMAN_DELAY_RANGE = [400, 800];
 
 const USER_AGENTS = [
@@ -46,6 +44,7 @@ const BEST_IMAGE_LIMIT = Math.min(10, MAX_IMAGE_RESULTS);
 
 const PRODUCT_IMAGE_KEYWORDS = [
   "product", "media", "gallery", "item", "detail", "zoom", "images", "photo", "pdp",
+  "swatch", "packshot", "principal", "pim", "published",
 ];
 const PLACEHOLDER_KEYWORDS = [
   "placeholder", "transparent", "pixel", "spacer", "blank", "loading", "spinner", "logo", "icon",
@@ -84,6 +83,63 @@ const PRICE_CONTEXT_NEGATIVE_KEYWORDS = [
 ];
 
 const DEFAULT_USD_TO_EUR_RATE = 0.92;
+
+// ─── IMAGE PRIORITY SOURCES ───────────────────────────────────────────────────
+// Source priority (higher = better):
+// 10000 = og:image (chosen by the site itself, always the main product image)
+// 8000  = JSON-LD Product image (structured data, very reliable)
+// 6000  = twitter:image (often same as og:image)
+// 4000  = itemprop="image" in DOM
+// 2000  = img with strong product keywords in URL
+// 1000  = img with weak product keywords
+// 0     = fallback
+
+const SOURCE_PRIORITY = {
+  og_image: 10000,
+  jsonld_product: 8000,
+  twitter_image: 6000,
+  itemprop_image: 4000,
+  dom_strong: 2000,
+  dom_weak: 1000,
+  fallback: 0,
+};
+
+// Strong product URL patterns (regex) — these are very likely the main product image
+const STRONG_PRODUCT_URL_PATTERNS = [
+  /\/pim\//i,
+  /\/published\//i,
+  /\/pdp\//i,
+  /\/packshot/i,
+  /\/media_principal/i,
+  /media[-_]swatch/i,
+  /\/product[-_]?image/i,
+  /[-_]main[-_]/i,
+  /[-_]hero[-_]/i,
+  /\/gallery\//i,
+  /\/zoom\//i,
+  /media[-_]\d+[-_]\d+\./i,  // e.g. media_1-1.jpg (Sephora pattern)
+];
+
+// Marketing/non-product patterns — penalize these heavily
+const MARKETING_URL_PATTERNS = [
+  /\/banner/i,
+  /\/marketing/i,
+  /\/campaign/i,
+  /\/editorial/i,
+  /\/homepage/i,
+  /\/landing/i,
+  /\/lookbook/i,
+  /\/promo/i,
+  /\/newsletter/i,
+  /\/carousel/i,
+  /\/slider/i,
+  /library-sites/i,
+  /shade_finder/i,
+  /\/logo/i,
+  /\/icon/i,
+  /\/sprite/i,
+  /\/avatar/i,
+];
 
 function parseNumericPrice(value) {
   if (!value) return null;
@@ -236,7 +292,6 @@ async function acquireSharedBrowser() {
   return sharedBrowserPromise;
 }
 
-// ✅ OPTIMISATION : request interception réactivée (bloque images/CSS/fonts)
 async function enableRequestOptimizations(page) {
   try {
     await page.setRequestInterception(true);
@@ -274,13 +329,11 @@ async function configurePage(page, url, preferredUserAgent) {
   if (typeof page.setDefaultTimeout === "function") {
     page.setDefaultTimeout(Math.max(NAVIGATION_TIMEOUT, 30000));
   }
-  // ✅ OPTIMISATION : request interception réactivée
   await enableRequestOptimizations(page);
   return { userAgent, viewport };
 }
 
 async function navigatePage(page, url) {
-  // ✅ OPTIMISATION : networkidle2 retiré (trop lent)
   const strategies = [
     { waitUntil: "domcontentloaded", label: "domcontentloaded" },
     { waitUntil: "load", label: "load" },
@@ -332,13 +385,70 @@ function normalizeUrl(value, baseUrl) {
   }
 }
 
-function isLikelyProductImage(url, { requireProductKeyword = true } = {}) {
+function isValidImageUrl(url) {
   if (!url) return false;
   const lower = url.toLowerCase();
-  if (!/\.(jpe?g|png|webp|gif)(?:$|\?)/.test(lower)) return false;
-  if (PLACEHOLDER_KEYWORDS.some((keyword) => lower.includes(keyword))) return false;
-  if (!requireProductKeyword) return true;
-  return PRODUCT_IMAGE_KEYWORDS.some((keyword) => lower.includes(keyword));
+  // Must be a real image format
+  if (!/\.(jpe?g|png|webp|gif|avif)(?:$|\?|&)/i.test(lower) && !/\/(image|photo|picture|img)\//i.test(lower)) {
+    // Allow URLs without extension if they clearly look like image endpoints
+    if (!/image|photo|picture|img|media|gallery/i.test(lower)) return false;
+  }
+  // Filter obvious placeholders
+  if (PLACEHOLDER_KEYWORDS.some((kw) => lower.includes(kw))) return false;
+  return true;
+}
+
+// ─── CORE: compute image priority score ───────────────────────────────────────
+// This is the main function that determines image quality.
+// Higher score = more likely to be the main product image.
+function computeImagePriorityScore(url, sourcePriority = 0) {
+  if (!url) return -Infinity;
+  const lower = url.toLowerCase();
+
+  let score = sourcePriority;
+
+  // Heavy penalty for marketing/non-product images
+  for (const pattern of MARKETING_URL_PATTERNS) {
+    if (pattern.test(url)) {
+      score -= 5000;
+      break;
+    }
+  }
+
+  // Bonus for strong product URL patterns
+  for (const pattern of STRONG_PRODUCT_URL_PATTERNS) {
+    if (pattern.test(url)) {
+      score += 3000;
+      break;
+    }
+  }
+
+  // Dimension scoring from URL params
+  const dims = extractDimensionsFromUrl(url);
+  if (dims.width && dims.height) {
+    const area = dims.width * dims.height;
+    score += Math.min(area / 100, 2000); // cap at 2000
+    // Penalize very wide/short images (banners)
+    const ratio = dims.width / dims.height;
+    if (ratio > 2.0) score -= 3000;
+    if (ratio > 1.6) score -= 1000;
+    // Penalize small images
+    if (dims.width < 400 || dims.height < 400) score -= 2000;
+  } else if (dims.width) {
+    score += Math.min(dims.width * 2, 1000);
+    if (dims.width < 400) score -= 2000;
+  }
+
+  // Format bonuses
+  if (/\.webp($|\?)/i.test(url)) score += 200;
+  if (/\.jpe?g($|\?)/i.test(url)) score += 150;
+  if (/\.png($|\?)/i.test(url)) score += 100;
+  if (/\.svg($|\?)/i.test(url)) score -= 500;
+
+  // Quality hints in URL
+  if (/_large|_xl|_2x|@2x|1200|1600|_zoom/i.test(url)) score += 300;
+
+  return score;
 }
 
 function parseDimension(value) {
@@ -356,8 +466,8 @@ function extractDimensionsFromUrl(url) {
   let height = null;
   try {
     const parsed = new URL(url);
-    const widthKeys = ["w", "width", "wid", "rw", "mw"];
-    const heightKeys = ["h", "height", "hei", "rh", "mh"];
+    const widthKeys = ["w", "width", "wid", "rw", "mw", "scalewidth"];
+    const heightKeys = ["h", "height", "hei", "rh", "mh", "scaleheight"];
     for (const key of widthKeys) {
       const candidate = parseDimension(parsed.searchParams.get(key));
       if (candidate) { width = candidate; break; }
@@ -397,81 +507,43 @@ function extractSrcsetCandidates(value) {
   }).filter((candidate) => candidate.url);
 }
 
-function normalizeImageCandidate(candidate, url, options) {
-  const normalized = normalizeUrl(candidate, url);
-  if (normalized && isLikelyProductImage(normalized, options)) return normalized;
-  return null;
+function createImageDedupKey(url) {
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    const normalizedSearch = new URLSearchParams();
+    const skipKeys = new Set([
+      "w", "width", "wid", "rw", "mw", "h", "height", "hei", "rh", "mh",
+      "imwidth", "size", "scale", "scaling", "scalewidth", "scaleheight", "scalemode",
+      "fit", "crop", "dpr", "ts", "timestamp", "cache", "format", "auto", "ext", "quality", "q", "compression",
+    ]);
+    const sortedKeys = Array.from(parsed.searchParams.keys()).sort();
+    for (const key of sortedKeys) {
+      if (skipKeys.has(key.toLowerCase())) continue;
+      const values = parsed.searchParams.getAll(key);
+      for (const value of values) normalizedSearch.append(key.toLowerCase(), value);
+    }
+    const normalizedQuery = normalizedSearch.toString();
+    return `${parsed.origin}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+  } catch {
+    return `${url}`.trim().toLowerCase();
+  }
 }
 
-function addImageCandidate(collection, candidate, url, options) {
-  const normalized = normalizeImageCandidate(candidate, url, options);
-  if (normalized) collection.push(normalized);
-  return normalized;
-}
-
-function computeImageScore(url, meta = {}) {
-  const dimensions = extractDimensionsFromUrl(url);
-  let width = meta.width || dimensions.width || null;
-  let height = meta.height || dimensions.height || null;
-  if (!width && meta.aspectRatio && height) width = Math.round(height * meta.aspectRatio);
-  if (!height && meta.aspectRatio && width) height = Math.round(width / meta.aspectRatio);
-  let score = 0;
-  if (width && height) score = width * height;
-  else if (width) score = width * 800;
-  else if (height) score = height * 800;
-  else {
-    score = 1000 + Math.min(url.length, 500);
-    if (/\b(?:large|xl|zoom|big|hero|main|product|detail)\b/i.test(url)) score += 5000;
+function dedupeImagesByScore(entries) {
+  // entries: [{url, score}]
+  const bestByKey = new Map();
+  for (const entry of entries) {
+    if (!entry.url) continue;
+    const key = createImageDedupKey(entry.url);
+    const existing = bestByKey.get(key);
+    if (!existing || entry.score > existing.score) {
+      bestByKey.set(key, entry);
+    }
   }
-  if (meta.density && meta.density > 0 && Number.isFinite(meta.density)) score *= meta.density;
-  if (meta.order !== undefined && meta.order !== null) score -= meta.order;
-  if (width && height) {
-    const ratio = width / height;
-    if (ratio > 1.8) score -= 4000;
-    if (ratio > 1.6 && width >= 900) score -= 1500;
-    if (height < 250 && width > 800) score -= 1200;
-  }
-  if (width && width < 400) score -= 5000;
-  if (height && height < 400) score -= 5000;
-  if (meta.source === "jsonld_product") score += 5000;
-  score += scoreImage(url, meta);
-  return score;
-}
-
-const IMAGE_KEYWORD_BONUSES = ["meta", "og", "product", "main", "hero", "cover"];
-const IMAGE_QUALITY_HINTS = ["_large", "-large", "_xlarge", "-xlarge", "_2x", "-2x", "@2x", "1200", "1600"];
-const IMAGE_NEGATIVE_KEYWORDS = ["logo", "icon", "nav", "sprite", "small", "thumbnail", "thumb", "avatar"];
-const IMAGE_MARKETING_KEYWORDS = [
-  "banner", "marketing", "campaign", "editorial", "homepage", "landing", "lookbook",
-  "promo", "offer", "newsletter", "hero", "carousel", "slider", "library-sites", "shade_finder",
-];
-const IMAGE_PRODUCT_KEYWORDS = [
-  "pim", "product", "media_principal", "published", "pdp", "gallery", "zoom",
-  "detail", "packshot", "main", "primary", "front", "image",
-];
-
-function scoreImage(url, meta = {}) {
-  if (!url) return 0;
-  const normalized = `${url}`.trim();
-  if (!normalized) return 0;
-  const lower = normalized.toLowerCase();
-  let score = 0;
-  const extensionMatch = lower.match(/\.([a-z0-9]+)(?:[?#]|$)/);
-  if (extensionMatch) {
-    const ext = extensionMatch[1];
-    if (ext === "svg") score -= 250;
-    else if (["jpg", "jpeg", "png", "webp", "avif", "gif", "bmp", "tif", "tiff", "jfif", "pjpeg", "pjp"].includes(ext)) score += 40;
-    else score += 20;
-  } else {
-    score += 15;
-  }
-  for (const keyword of IMAGE_KEYWORD_BONUSES) { if (lower.includes(keyword)) score += 25; }
-  for (const hint of IMAGE_QUALITY_HINTS) { if (lower.includes(hint)) score += 18; }
-  for (const negative of IMAGE_NEGATIVE_KEYWORDS) { if (lower.includes(negative)) score -= 35; }
-  for (const keyword of IMAGE_MARKETING_KEYWORDS) { if (lower.includes(keyword)) score -= 800; }
-  for (const keyword of IMAGE_PRODUCT_KEYWORDS) { if (lower.includes(keyword)) score += 250; }
-  if (meta.source === "jsonld_product") score += 1200;
-  return score;
+  return Array.from(bestByKey.values())
+    .sort((a, b) => b.score - a.score)
+    .map((e) => e.url);
 }
 
 function computePriceContextPenalty(text) {
@@ -594,55 +666,12 @@ function normalizePriceOutput(value, currencyHints = []) {
   return formatPriceNumber(amount);
 }
 
-function createImageDedupKey(url) {
-  if (!url) return "";
-  try {
-    const parsed = new URL(url);
-    const normalizedSearch = new URLSearchParams();
-    const skipKeys = new Set([
-      "w", "width", "wid", "rw", "mw", "h", "height", "hei", "rh", "mh",
-      "imwidth", "size", "scale", "scaling", "scalewidth", "scaleheight", "scalemode",
-      "fit", "crop", "dpr", "ts", "timestamp", "cache", "format", "auto", "ext", "quality", "q", "compression",
-    ]);
-    const sortedKeys = Array.from(parsed.searchParams.keys()).sort();
-    for (const key of sortedKeys) {
-      if (skipKeys.has(key.toLowerCase())) continue;
-      const values = parsed.searchParams.getAll(key);
-      for (const value of values) normalizedSearch.append(key.toLowerCase(), value);
-    }
-    const normalizedQuery = normalizedSearch.toString();
-    return `${parsed.origin}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
-  } catch {
-    return `${url}`.trim().toLowerCase();
-  }
-}
-
-function dedupeImages(values) {
-  const order = [];
-  const seen = new Set();
-  const bestByKey = new Map();
-  for (const value of values || []) {
-    if (!value) continue;
-    const trimmed = `${value}`.trim();
-    if (!trimmed) continue;
-    const key = createImageDedupKey(trimmed);
-    const score = computeImageScore(trimmed);
-    if (!seen.has(key)) {
-      seen.add(key);
-      order.push(key);
-      bestByKey.set(key, { url: trimmed, score });
-      continue;
-    }
-    const current = bestByKey.get(key);
-    if (!current || score > current.score) bestByKey.set(key, { url: trimmed, score });
-  }
-  return order.map((key) => bestByKey.get(key)?.url).filter((url) => typeof url === "string" && url.trim().length > 0);
-}
-
+// ─── MAIN EXTRACTION FUNCTION ─────────────────────────────────────────────────
 function extractFromHtmlContent(html, url) {
   if (!html) return { title: null, description: null, price: null, images: [] };
   const $ = cheerio.load(html);
 
+  // ── Title ──
   const metaTitle =
     $("meta[property='og:title']").attr("content") ||
     $("meta[name='twitter:title']").attr("content") ||
@@ -650,12 +679,14 @@ function extractFromHtmlContent(html, url) {
   const domTitle = $("h1").first().text().trim() || $("title").first().text().trim() || null;
   const title = metaTitle || domTitle || null;
 
+  // ── Description ──
   const description =
     $("meta[property='og:description']").attr("content") ||
     $("meta[name='description']").attr("content") ||
     $("meta[name='twitter:description']").attr("content") ||
     $("p").toArray().map((el) => $(el).text().trim()).find((text) => text.length > 60) || null;
 
+  // ── Price ──
   const priceValues = [];
   const currencyValues = new Set();
 
@@ -664,7 +695,6 @@ function extractFromHtmlContent(html, url) {
     const normalized = `${value}`.replace(/\s+/g, " ").trim();
     if (normalized) priceValues.push(normalized);
   }
-
   function pushCurrencyValue(value) {
     if (!value) return;
     const normalized = `${value}`.replace(/\s+/g, " ").trim();
@@ -699,84 +729,34 @@ function extractFromHtmlContent(html, url) {
     pushCurrencyValue(currency);
   });
 
-  let price = findPriceInTexts(priceValues, Array.from(currencyValues));
+  // ── Images — collected with priority scores ──────────────────────────────────
+  // All image candidates go into this array: [{url, score}]
+  const imageCandidates = [];
 
-  const images = [];
-  const productJsonLdImages = [];
-  const imageMetaByUrl = new Map();
-  const fallbackCandidateMap = new Map();
-  let fallbackOrder = 0;
-
-  function mergeImageMeta(currentMeta = {}, nextMeta = {}) {
-    const merged = { ...currentMeta };
-    for (const [key, value] of Object.entries(nextMeta || {})) {
-      if (value !== undefined && value !== null) merged[key] = value;
-    }
-    return merged;
-  }
-
-  function registerImageMeta(candidate, meta = {}) {
-    const normalized = normalizeImageCandidate(candidate, url, { requireProductKeyword: false });
-    if (!normalized) return null;
-    const existing = imageMetaByUrl.get(normalized) || {};
-    imageMetaByUrl.set(normalized, mergeImageMeta(existing, meta));
-    return normalized;
-  }
-
-  function registerFallbackCandidate(candidate, meta = {}) {
-    const normalized = registerImageMeta(candidate, meta);
+  function addCandidate(rawUrl, sourcePriority = SOURCE_PRIORITY.fallback) {
+    if (!rawUrl) return;
+    const normalized = normalizeUrl(rawUrl, url);
     if (!normalized) return;
-    const order = meta.order ?? fallbackOrder;
-    const score = computeImageScore(normalized, { ...meta, order });
-    const existing = fallbackCandidateMap.get(normalized);
-    if (!existing || existing.score < score) {
-      fallbackCandidateMap.set(normalized, { url: normalized, score, order, meta: { ...meta } });
-    }
-    fallbackOrder += 1;
+    if (!isValidImageUrl(normalized)) return;
+    const score = computeImagePriorityScore(normalized, sourcePriority);
+    imageCandidates.push({ url: normalized, score });
   }
 
-  const imageSelectors = [
-    "meta[property='og:image']", "meta[property='og:image:url']",
-    "meta[name='twitter:image']", "meta[name='twitter:image:src']", "link[rel='image_src']",
-  ];
-  for (const selector of imageSelectors) {
-    $(selector).toArray().forEach((element) => {
-      const candidate = $(element).attr("content") || $(element).attr("href");
-      addImageCandidate(images, candidate, url, { requireProductKeyword: false });
-      if (candidate) registerFallbackCandidate(candidate, { order: fallbackOrder });
-    });
-  }
+  // ── PRIORITY 1: og:image — always the main product image chosen by the site ──
+  const ogImage = $("meta[property='og:image']").attr("content") ||
+    $("meta[property='og:image:url']").attr("content");
+  if (ogImage) addCandidate(ogImage, SOURCE_PRIORITY.og_image);
 
-  $("img").toArray().forEach((element) => {
-    const el = $(element);
-    const src = el.attr("src") || el.attr("data-src");
-    const widthAttr = el.attr("width") || el.attr("data-width") || el.attr("data-original-width") || el.attr("data-large-width") || el.attr("data-zoom-width") || el.attr("data-image-width");
-    const heightAttr = el.attr("height") || el.attr("data-height") || el.attr("data-original-height") || el.attr("data-large-height") || el.attr("data-zoom-height") || el.attr("data-image-height");
-    const width = parseDimension(widthAttr);
-    const height = parseDimension(heightAttr);
-    const aspectRatio = width && height ? width / height : null;
-    addImageCandidate(images, src, url, { requireProductKeyword: true });
-    if (src) registerFallbackCandidate(src, { width, height, aspectRatio });
-    const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
-    for (const srcset of srcsetValues) {
-      extractSrcsetCandidates(srcset).forEach((candidate) => {
-        addImageCandidate(images, candidate.url, url, { requireProductKeyword: true });
-        registerFallbackCandidate(candidate.url, { width: candidate.width || width, height, aspectRatio, density: candidate.density });
-      });
-    }
-  });
+  // ── PRIORITY 2: twitter:image ──
+  const twitterImage = $("meta[name='twitter:image']").attr("content") ||
+    $("meta[name='twitter:image:src']").attr("content");
+  if (twitterImage) addCandidate(twitterImage, SOURCE_PRIORITY.twitter_image);
 
-  $("source").toArray().forEach((element) => {
-    const el = $(element);
-    const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
-    for (const srcset of srcsetValues) {
-      extractSrcsetCandidates(srcset).forEach((candidate) => {
-        addImageCandidate(images, candidate.url, url, { requireProductKeyword: true });
-        registerFallbackCandidate(candidate.url, { width: candidate.width, density: candidate.density });
-      });
-    }
-  });
+  // ── PRIORITY 3: link[rel='image_src'] ──
+  const linkImage = $("link[rel='image_src']").attr("href");
+  if (linkImage) addCandidate(linkImage, SOURCE_PRIORITY.twitter_image);
 
+  // ── PRIORITY 4: JSON-LD structured data ──
   $("script[type='application/ld+json']").toArray().forEach((element) => {
     const text = $(element).text();
     if (!text) return;
@@ -788,49 +768,45 @@ function extractFromHtmlContent(html, url) {
         const types = toArray(node?.["@type"]).map((item) => `${item}`.toLowerCase());
         return types.includes(`${typeName}`.toLowerCase());
       };
-      const gatherProductNodes = (node) => {
-        if (!node || typeof node !== "object") return [];
-        const productNodes = [];
-        if (hasType(node, "Product")) productNodes.push(node);
-        toArray(node["@graph"]).filter((entry) => entry && typeof entry === "object").forEach((graphNode) => {
-          if (hasType(graphNode, "Product")) productNodes.push(graphNode);
-        });
-        return productNodes;
-      };
-      const extractImageValue = (imageValue, meta = {}) => {
-        if (!imageValue) return null;
+
+      const processImageValue = (imageValue, priority) => {
+        if (!imageValue) return;
         if (typeof imageValue === "string") {
-          const normalized = addImageCandidate(images, imageValue, url, { requireProductKeyword: false });
-          if (normalized) registerFallbackCandidate(normalized, meta);
-          return normalized;
+          addCandidate(imageValue, priority);
+          return;
         }
-        if (typeof imageValue !== "object") return null;
-        const imageUrl = imageValue.url || imageValue.contentUrl || imageValue.image || imageValue.thumbnailUrl || imageValue['@id'] || null;
-        const imageWidth = parseDimension(imageValue.width || imageValue.widthInPixels || meta.width);
-        const imageHeight = parseDimension(imageValue.height || imageValue.heightInPixels || meta.height);
-        if (!imageUrl) return null;
-        const normalized = addImageCandidate(images, imageUrl, url, { requireProductKeyword: false });
-        if (normalized) {
-          registerFallbackCandidate(normalized, { ...meta, width: imageWidth, height: imageHeight, aspectRatio: imageWidth && imageHeight ? imageWidth / imageHeight : meta.aspectRatio || null });
+        if (typeof imageValue === "object") {
+          const imageUrl = imageValue.url || imageValue.contentUrl || imageValue.image || imageValue.thumbnailUrl || imageValue['@id'];
+          if (imageUrl) addCandidate(imageUrl, priority);
         }
-        return normalized;
       };
 
       nodes.forEach((node) => {
         if (!node || typeof node !== "object") return;
+
+        // Extract price
         if (node.price) pushPriceValue(node.price);
         if (node.priceCurrency) pushCurrencyValue(node.priceCurrency);
-        const imageField = node.image || node.images || node.photo || node.thumbnailUrl;
-        toArray(imageField).forEach((imageValue) => extractImageValue(imageValue, {}));
-        const productMeta = { source: "jsonld_product", priorityBoost: true };
-        gatherProductNodes(node).forEach((productNode) => {
-          toArray(productNode.image).forEach((productImage) => {
-            const normalized = extractImageValue(productImage, productMeta);
-            if (normalized) productJsonLdImages.push(normalized);
-          });
+
+        // Process @graph
+        toArray(node["@graph"]).forEach((graphNode) => {
+          if (!graphNode || typeof graphNode !== "object") return;
+          if (hasType(graphNode, "Product")) {
+            toArray(graphNode.image).forEach((img) => processImageValue(img, SOURCE_PRIORITY.jsonld_product));
+          }
         });
-        const offerFields = [...toArray(node.offers), ...toArray(node.aggregateOffer)];
-        offerFields.forEach((offer) => {
+
+        // Direct Product node
+        if (hasType(node, "Product")) {
+          toArray(node.image).forEach((img) => processImageValue(img, SOURCE_PRIORITY.jsonld_product));
+        } else {
+          // Non-product JSON-LD images (lower priority)
+          const imageField = node.image || node.images || node.photo || node.thumbnailUrl;
+          toArray(imageField).forEach((img) => processImageValue(img, SOURCE_PRIORITY.itemprop_image));
+        }
+
+        // Offers
+        [...toArray(node.offers), ...toArray(node.aggregateOffer)].forEach((offer) => {
           if (!offer || typeof offer !== "object") return;
           if (offer.price) pushPriceValue(offer.price);
           if (offer.priceCurrency) pushCurrencyValue(offer.priceCurrency);
@@ -846,77 +822,65 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
-  let uniqueImages = dedupeImages(images);
-  if (uniqueImages.length < 5 && fallbackCandidateMap.size) {
-    const fallbackCandidates = Array.from(fallbackCandidateMap.values()).sort((a, b) => b.score - a.score).map((candidate) => candidate.url);
-    for (const candidate of fallbackCandidates) {
-      if (uniqueImages.includes(candidate)) continue;
-      uniqueImages.push(candidate);
-      if (uniqueImages.length >= MAX_IMAGE_RESULTS) break;
-    }
-    uniqueImages = dedupeImages(uniqueImages);
-  }
+  // ── PRIORITY 5: itemprop="image" ──
+  $("[itemprop='image']").toArray().forEach((element) => {
+    const src = $(element).attr("content") || $(element).attr("src");
+    if (src) addCandidate(src, SOURCE_PRIORITY.itemprop_image);
+  });
 
-  if (!uniqueImages.length) {
-    const fallbackImages = [];
-    $("img").toArray().forEach((element) => {
-      const el = $(element);
-      const src = el.attr("src") || el.attr("data-src");
-      addImageCandidate(fallbackImages, src, url, { requireProductKeyword: false });
-      const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
-      for (const srcset of srcsetValues) {
-        extractSrcsetCandidates(srcset).forEach((candidate) => {
-          addImageCandidate(fallbackImages, candidate.url, url, { requireProductKeyword: false });
-        });
+  // ── PRIORITY 6: DOM images ──
+  $("img").toArray().forEach((element) => {
+    const el = $(element);
+    const src = el.attr("src") || el.attr("data-src") || el.attr("data-lazy-src") || el.attr("data-original");
+    if (src) {
+      const normalized = normalizeUrl(src, url);
+      if (normalized && isValidImageUrl(normalized)) {
+        // Check if it's a strong product pattern
+        const isStrong = STRONG_PRODUCT_URL_PATTERNS.some((p) => p.test(normalized));
+        const priority = isStrong ? SOURCE_PRIORITY.dom_strong : SOURCE_PRIORITY.dom_weak;
+        addCandidate(src, priority);
       }
-    });
-    $("source").toArray().forEach((element) => {
-      const el = $(element);
-      const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
-      for (const srcset of srcsetValues) {
-        extractSrcsetCandidates(srcset).forEach((candidate) => {
-          addImageCandidate(fallbackImages, candidate.url, url, { requireProductKeyword: false });
-        });
-      }
-    });
-    uniqueImages = dedupeImages(fallbackImages);
-  }
-
-  if (uniqueImages.length > MAX_IMAGE_RESULTS) uniqueImages = uniqueImages.slice(0, MAX_IMAGE_RESULTS);
-
-  const rankedImages = Array.from(new Set(uniqueImages)).map((imageUrl) => ({
-    url: imageUrl,
-    meta: imageMetaByUrl.get(imageUrl) || {},
-    score: computeImageScore(imageUrl, imageMetaByUrl.get(imageUrl) || {}),
-  })).sort((a, b) => b.score - a.score);
-
-  const bestRankedImages = rankedImages.filter((entry) => entry.score > 0).slice(0, BEST_IMAGE_LIMIT);
-  let bestImages = dedupeImages(bestRankedImages.map((entry) => entry.url));
-
-  const validProductJsonLdImages = dedupeImages(productJsonLdImages);
-  if (validProductJsonLdImages.length) {
-    const bestProductMain = [...validProductJsonLdImages].map((imageUrl) => ({
-      url: imageUrl,
-      score: computeImageScore(imageUrl, imageMetaByUrl.get(imageUrl) || { source: "jsonld_product", priorityBoost: true }),
-    })).sort((a, b) => b.score - a.score)[0];
-    if (bestProductMain?.url) {
-      bestImages = dedupeImages([bestProductMain.url, ...bestImages.filter((imageUrl) => imageUrl !== bestProductMain.url)]).slice(0, BEST_IMAGE_LIMIT);
     }
-  }
 
+    // srcset
+    const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-sources")].filter(Boolean);
+    for (const srcset of srcsetValues) {
+      extractSrcsetCandidates(srcset).forEach((candidate) => {
+        const isStrong = STRONG_PRODUCT_URL_PATTERNS.some((p) => p.test(candidate.url || ""));
+        addCandidate(candidate.url, isStrong ? SOURCE_PRIORITY.dom_strong : SOURCE_PRIORITY.dom_weak);
+      });
+    }
+  });
+
+  // source elements (picture)
+  $("source").toArray().forEach((element) => {
+    const el = $(element);
+    const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
+    for (const srcset of srcsetValues) {
+      extractSrcsetCandidates(srcset).forEach((candidate) => {
+        addCandidate(candidate.url, SOURCE_PRIORITY.dom_weak);
+      });
+    }
+  });
+
+  // ── Sort and deduplicate by score ──
+  let finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
+
+  // ── Final price ──
   const currencyHintList = Array.from(currencyValues);
-  const priceAfterImages = findPriceInTexts(priceValues, currencyHintList);
-  if (!price && priceAfterImages) price = priceAfterImages;
-  if (!price && priceValues.length && currencyHintList.length) {
-    const [firstCurrency] = currencyHintList;
-    const numericCandidate = priceValues.map((value) => value.match(/\d[\d.,]*/)?.[0] || null).find(Boolean);
-    if (numericCandidate) price = combinePriceWithCurrency(numericCandidate, firstCurrency);
-  }
+  const price = findPriceInTexts(priceValues, currencyHintList) ||
+    (priceValues.length && currencyHintList.length
+      ? combinePriceWithCurrency(priceValues.map((v) => v.match(/\d[\d.,]*/)?.[0] || null).find(Boolean), currencyHintList[0])
+      : null);
 
   const normalizedPrice = normalizePriceOutput(price, currencyHintList);
-  const finalPrice = normalizedPrice && `${normalizedPrice}`.trim() ? normalizedPrice : null;
 
-  return { title, description, price: finalPrice, images: bestImages };
+  return {
+    title,
+    description,
+    price: normalizedPrice && `${normalizedPrice}`.trim() ? normalizedPrice : null,
+    images: finalImages,
+  };
 }
 
 function isValidResult(result) {
@@ -1048,8 +1012,6 @@ async function runStage1(url) {
   return { ok: false, stage: "stage1", error: lastErrorMessage || lastError?.message || "Stage1 failed" };
 }
 
-// ✅ Stage 2 supprimé
-
 async function runStage3(url) {
   const apiKey = process.env.BRIGHTDATA_API_KEY;
   if (!apiKey) return { ok: false, stage: "stage3", error: "BRIGHTDATA_API_KEY missing" };
@@ -1136,7 +1098,6 @@ async function scrapeWithStages(url) {
     return { attempted, status, ok, error, blocked, durationSeconds, meta };
   };
 
-  // Stage 1
   const stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
   steps.stage1 = resolveStageStatus(stage1Result, true, false);
   let finalResult = null;
@@ -1146,7 +1107,6 @@ async function scrapeWithStages(url) {
     finalResult = stage1Result;
   }
 
-  // ✅ Stage 2 supprimé → passe directement au stage 3
   let stage3Result = null;
   let stage3Attempted = false;
   if (!finalResult) {
