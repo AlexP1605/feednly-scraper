@@ -397,6 +397,12 @@ function isValidImageUrl(url) {
   // Rejeter logos fidélité/programme
   if (/fid\.(gif|png|jpg|webp)|loyalty|mysephora.*fid|blackfid|goldfid|bronzefid/i.test(lower)) return false;
 
+  // Rejeter thumbnails vidéo (YouTube, Vimeo, etc.)
+  if (/img\.youtube\.com|i\.ytimg\.com|vumbnail\.com|vimeo\.com\/video/i.test(lower)) return false;
+
+  // Rejeter les thumbnails produit (petites pastilles de couleur/variante)
+  if (/media_thumbnail|[-_]thumbnail[-_\d]/i.test(lower)) return false;
+
   if (!/\.(jpe?g|png|webp|avif)(?:$|\?|&)/i.test(lower) && !/\/(image|photo|picture|img)\//i.test(lower)) {
     if (!/image|photo|picture|img|media|gallery/i.test(lower)) return false;
   }
