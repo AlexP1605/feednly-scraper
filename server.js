@@ -129,7 +129,9 @@ const MARKETING_URL_PATTERNS = [
   /\/icon/i,
   /\/sprite/i,
   /\/avatar/i,
-  /media_principal/i,  // FIX 1: vue secondaire sur Sephora, pas l'image principale
+  /media_principal/i,  // vue secondaire sur Sephora, pas l'image principale
+  /media_thumbnail/i,  // petites pastilles de couleur/variante, inutiles
+  /[-_]thumbnail[-_]?/i,  // thumbnails en général
 ];
 
 // FIX 2: Minimum size threshold - images below this are useless
@@ -382,7 +384,20 @@ function normalizeUrl(value, baseUrl) {
 function isValidImageUrl(url) {
   if (!url) return false;
   const lower = url.toLowerCase();
-  if (!/\.(jpe?g|png|webp|gif|avif)(?:$|\?|&)/i.test(lower) && !/\/(image|photo|picture|img)\//i.test(lower)) {
+
+  // Rejeter GIFs (logos, spinners, animations)
+  if (/\.gif($|\?|&)/i.test(lower)) return false;
+
+  // Rejeter SVGs (logos, icônes)
+  if (/\.svg($|\?|&)/i.test(lower)) return false;
+
+  // Rejeter assets statiques de bibliothèque (pas des images produit)
+  if (/library-sites/i.test(lower)) return false;
+
+  // Rejeter logos fidélité/programme
+  if (/fid\.(gif|png|jpg|webp)|loyalty|mysephora.*fid|blackfid|goldfid|bronzefid/i.test(lower)) return false;
+
+  if (!/\.(jpe?g|png|webp|avif)(?:$|\?|&)/i.test(lower) && !/\/(image|photo|picture|img)\//i.test(lower)) {
     if (!/image|photo|picture|img|media|gallery/i.test(lower)) return false;
   }
   if (PLACEHOLDER_KEYWORDS.some((kw) => lower.includes(kw))) return false;
@@ -419,12 +434,12 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
     const ratio = dims.width / dims.height;
     if (ratio > 2.0) score -= 3000;
     if (ratio > 1.6) score -= 1000;
-    // FIX 2: Pénaliser fortement les images trop petites
-    if (dims.width < MIN_IMAGE_DIMENSION || dims.height < MIN_IMAGE_DIMENSION) score -= 9999;
+    // FIX 2: Éliminer complètement les images trop petites (score absolu -Infinity)
+    if (dims.width < MIN_IMAGE_DIMENSION || dims.height < MIN_IMAGE_DIMENSION) return -Infinity;
   } else if (dims.width) {
     score += Math.min(dims.width * 2, 1000);
-    // FIX 2: Pénaliser fortement les images trop petites
-    if (dims.width < MIN_IMAGE_DIMENSION) score -= 9999;
+    // FIX 2: Éliminer complètement les images trop petites
+    if (dims.width < MIN_IMAGE_DIMENSION) return -Infinity;
   }
 
   // Format bonuses
