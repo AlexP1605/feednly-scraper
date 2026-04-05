@@ -892,6 +892,52 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
+  // PRIORITY 7: Extraire les URLs d'images depuis les blocs <script> (JSON embarqué)
+  // Cible: window.__NEXT_DATA__, window.__INITIAL_STATE__, Shopify, Salesforce, etc.
+  // Ces objets contiennent souvent toutes les images produit même celles non rendues dans le DOM
+  $("script").toArray().forEach((element) => {
+    const scriptContent = $(element).html() || "";
+    if (!scriptContent || scriptContent.length < 50) return;
+
+    // Ignorer les scripts externes et les scripts JSON-LD (déjà traités)
+    const type = $(element).attr("type") || "";
+    if (type === "application/ld+json") return;
+
+    // Chercher toutes les URLs d'images dans le contenu du script
+    // Pattern large: capture toutes les URLs qui ressemblent à des images produit
+    const imageUrlPattern = /["']((https?:)?\/\/[^"'\s,]+\.(?:jpe?g|png|webp|avif)[^"'\s,]*?)["']/gi;
+    let match;
+    while ((match = imageUrlPattern.exec(scriptContent)) !== null) {
+      const rawUrl = match[1];
+      if (!rawUrl) continue;
+      const normalized = normalizeUrl(rawUrl, url);
+      if (!normalized) continue;
+      if (!isValidImageUrl(normalized)) continue;
+
+      // Vérifier que c'est une URL produit (pas un asset UI)
+      const isStrong = STRONG_PRODUCT_URL_PATTERNS.some((p) => p.test(normalized));
+      const isMarketing = MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
+      if (isMarketing) continue;
+
+      // Donner une priorité selon le contexte du script
+      const scriptId = $(element).attr("id") || "";
+      const isNextData = scriptId === "__NEXT_DATA__" || scriptContent.includes("__NEXT_DATA__");
+      const isInitialState = scriptContent.includes("__INITIAL_STATE__") || scriptContent.includes("pageData");
+      const isShopify = scriptContent.includes("Shopify.") || scriptContent.includes("ShopifyAnalytics");
+
+      let priority;
+      if (isNextData || isInitialState || isShopify) {
+        // Sources fiables — même priorité que itemprop
+        priority = isStrong ? SOURCE_PRIORITY.dom_strong : SOURCE_PRIORITY.itemprop_image;
+      } else {
+        // Script générique — priorité faible
+        priority = isStrong ? SOURCE_PRIORITY.dom_strong : SOURCE_PRIORITY.dom_weak;
+      }
+
+      addCandidate(normalized, priority);
+    }
+  });
+
   // Sort and deduplicate by score
   let finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
 
