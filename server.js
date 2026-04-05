@@ -132,6 +132,8 @@ const MARKETING_URL_PATTERNS = [
   /media_principal/i,  // vue secondaire sur Sephora, pas l'image principale
   /media_thumbnail/i,  // petites pastilles de couleur/variante, inutiles
   /[-_]thumbnail[-_]?/i,  // thumbnails en général
+  /\/tile_/i,  // tuiles carousel/recommandations (Benefit, etc.)
+  /[-_]tile[-_]/i,  // variante du pattern tile
 ];
 
 // FIX 2: Minimum size threshold - images below this are useless
@@ -559,10 +561,21 @@ function createImageDedupKey(url) {
     }
     const normalizedQuery = normalizedSearch.toString();
 
-    // Clé = hostname + chemin complet (sans params de taille/cache)
-    // Le chemin complet est plus fiable que juste le nom de fichier
-    // car deux produits différents peuvent avoir le même nom de fichier
-    return `${parsed.hostname}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+    // Clé principale = hostname + chemin complet (sans params de taille/cache)
+    const fullKey = `${parsed.hostname}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+
+    // Fix 2: Fallback par nom de fichier
+    // Si deux URLs ont des chemins différents mais le même nom de fichier exact
+    // (ex: /dw/image/v2/.../image.jpg vs /on/demandware.static/.../image.jpg)
+    // on les considère comme la même image — fréquent sur Salesforce/Demandware
+    const filename = parsed.pathname.split("/").pop() || "";
+    const isSignificantFilename = filename.length > 15 && /\.(jpe?g|png|webp|avif)/i.test(filename);
+    if (isSignificantFilename) {
+      // Clé courte = hostname + nom de fichier uniquement
+      return `${parsed.hostname}__file__${filename}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+    }
+
+    return fullKey;
   } catch {
     return `${url}`.trim().toLowerCase();
   }
