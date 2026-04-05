@@ -523,12 +523,34 @@ function createImageDedupKey(url) {
   if (!url) return "";
   try {
     const parsed = new URL(url);
-    const normalizedSearch = new URLSearchParams();
+
+    // Tous les paramètres liés à la taille/qualité/cache sont ignorés pour la dédup
+    // Cela couvre: Shopify, Sephora, Demandware, Cloudinary, Imgix, Fastly, etc.
     const skipKeys = new Set([
-      "w", "width", "wid", "rw", "mw", "h", "height", "hei", "rh", "mh",
-      "imwidth", "size", "scale", "scaling", "scalewidth", "scaleheight", "scalemode",
-      "fit", "crop", "dpr", "ts", "timestamp", "cache", "format", "auto", "ext", "quality", "q", "compression",
+      // Dimensions génériques
+      "w", "width", "wid", "rw", "mw",
+      "h", "height", "hei", "rh", "mh",
+      // Salesforce / Demandware (drunkelephant, sephora...)
+      "sw", "sh", "sm", "frz-v", "frzv",
+      // Sephora spécifique
+      "scalewidth", "scaleheight", "scalemode",
+      // Taille générique
+      "imwidth", "imheight", "size", "scale", "scaling",
+      // Transformations
+      "fit", "crop", "dpr", "ar", "trim",
+      // Qualité
+      "quality", "q", "compression",
+      // Format
+      "format", "auto", "ext", "fm",
+      // Cache busting
+      "ts", "timestamp", "cache", "v", "ver", "version", "cb", "t",
+      // Cloudinary
+      "c", "f", "g",
+      // Autres
+      "bgcolor", "bg", "pad",
     ]);
+
+    const normalizedSearch = new URLSearchParams();
     const sortedKeys = Array.from(parsed.searchParams.keys()).sort();
     for (const key of sortedKeys) {
       if (skipKeys.has(key.toLowerCase())) continue;
@@ -537,15 +559,10 @@ function createImageDedupKey(url) {
     }
     const normalizedQuery = normalizedSearch.toString();
 
-    // FIX 3: Extraire le nom de fichier pour dédupliquer par fichier
-    // même si le dossier parent est différent (variantes Sephora)
-    const filename = parsed.pathname.split("/").pop() || "";
-    // Si le nom de fichier est significatif (pas juste "image" ou trop court), on l'utilise comme clé
-    if (filename && filename.length > 10 && /\.(jpe?g|png|webp|gif|avif)/i.test(filename)) {
-      return `${parsed.hostname}__${filename}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
-    }
-
-    return `${parsed.origin}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+    // Clé = hostname + chemin complet (sans params de taille/cache)
+    // Le chemin complet est plus fiable que juste le nom de fichier
+    // car deux produits différents peuvent avoir le même nom de fichier
+    return `${parsed.hostname}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
   } catch {
     return `${url}`.trim().toLowerCase();
   }
