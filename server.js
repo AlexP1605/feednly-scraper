@@ -88,8 +88,8 @@ const DEFAULT_USD_TO_EUR_RATE = 0.92;
 
 // ─── IMAGE PRIORITY SOURCES ───────────────────────────────────────────────────
 const SOURCE_PRIORITY = {
-  jsonld_product: 8000,   // FIX: JSON-LD produit devient la source la plus fiable
-  og_image: 5000,         // FIX: og:image réduit car souvent image marketing/bundle
+  og_image: 9000,         // og:image = image choisie par le site pour représenter le produit
+  jsonld_product: 8000,   // JSON-LD produit = très fiable aussi
   twitter_image: 4000,
   itemprop_image: 4000,
   dom_strong: 2000,
@@ -176,6 +176,8 @@ const MARKETING_URL_PATTERNS = [
   /[-_]on[-_]skin/i,
   /application/i,
   /swatch/i,
+  // images régionales CT tolérées — ce sont de vraies images produit
+  // /[-_]row[-_]/i retiré car FR-row- = variantes produit valides sur CT
 
   // ── Codes campagne saisonnière ──
   /[-_]fall\d{2}(?!.*(?:product|ecomm|item))/i,
