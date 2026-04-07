@@ -39,9 +39,9 @@ const VIEWPORT_HEIGHTS = [720, 768, 900, 960, 1080];
 
 const MAX_IMAGE_RESULTS = Math.max(
   1,
-  Number.parseInt(process.env.SCRAPER_MAX_IMAGE_RESULTS || "6", 10) || 6
+  Number.parseInt(process.env.SCRAPER_MAX_IMAGE_RESULTS || "10", 10) || 10
 );
-const BEST_IMAGE_LIMIT = Math.min(6, MAX_IMAGE_RESULTS);
+const BEST_IMAGE_LIMIT = Math.min(10, MAX_IMAGE_RESULTS);
 
 const PRODUCT_IMAGE_KEYWORDS = [
   "product", "media", "gallery", "item", "detail", "zoom", "images", "photo", "pdp",
