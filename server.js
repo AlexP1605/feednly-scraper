@@ -140,13 +140,11 @@ const MARKETING_URL_PATTERNS = [
   /shade_finder/i,
 
   // ── Images éditoriales / lookbook ──
-  /look[-_]/i,
-  /[-_]look[-_]/i,
-  /[-_]look\./i,
+  // look: pénalité légère uniquement, pas de blocage dur
+  // car "look" peut être dans le nom du kit produit
   /lifestyle/i,
-  /[-_]bundle[-_]/i,
-  /_bundle/i,
-  /bundle_/i,
+  // bundle: pas bloqué ici car un kit/bundle EST parfois le produit principal
+  // géré par pénalité légère dans computeImagePriorityScore
 
   // ── Photos avec modèle (pas le produit seul) ──
   /[-_]model[-_]/i,
@@ -531,6 +529,18 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
 
   // Quality hints in URL
   if (/_large|_xl|_2x|@2x|1200|1600|_zoom/i.test(url)) score += 300;
+
+  // Pénalité légère pour bundle/look (pas bloquant car peut être le produit lui-même)
+  // mais on préfère un packshot pur si disponible
+  if (/[-_]bundle[-_]|_bundle|bundle_/i.test(url)) score -= 800;
+  if (/look[-_]|[-_]look[-_]|[-_]look\./i.test(url)) score -= 600;
+
+  // Pénalité légère pour images avec code modèle CT (_hm_, _rq_ etc.)
+  // déjà dans MARKETING mais double-vérification par score pour les cas limites
+  if (/[-_](?:hm|rq|rm|hf|em|cm)[-_]/i.test(url)) score -= 3000;
+
+  // Bonus fort pour images packshot identifiées par alt text (via filename)
+  if (/packshot|pack[-_]shot/i.test(url)) score += 2000;
 
   return score;
 }
