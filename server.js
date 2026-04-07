@@ -1002,28 +1002,6 @@ function extractFromHtmlContent(html, url) {
   });
 
   // Sort, deduplicate and limit
-  // ── DEBUG LOG: toutes les images candidates avec leur score ──
-  if (process.env.SCRAPER_DEBUG_IMAGES === "true" || process.env.NODE_ENV === "development") {
-    const sorted = [...imageCandidates].sort((a, b) => b.score - a.score);
-    const dedupKey = createImageDedupKey;
-    const seen = new Map();
-    const dedupedDebug = [];
-    for (const e of sorted) {
-      const k = dedupKey(e.url);
-      if (!seen.has(k)) { seen.set(k, true); dedupedDebug.push(e); }
-    }
-    console.log(JSON.stringify({
-      event: "IMAGE_CANDIDATES",
-      url,
-      total: imageCandidates.length,
-      afterDedup: dedupedDebug.length,
-      top10: dedupedDebug.slice(0, 10).map(e => ({
-        score: Math.round(e.score),
-        filename: (() => { try { return new URL(e.url).pathname.split("/").pop().substring(0, 60); } catch { return e.url.substring(0, 60); } })(),
-        url: e.url.substring(0, 120),
-      })),
-    }));
-  }
   let finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
 
   // ── Final price ──
@@ -1298,6 +1276,9 @@ async function scrapeWithStages(url) {
     blocked,
     duration: durationSeconds,
     imagesCount: Array.isArray(finalResult?.images) ? finalResult.images.length : 0,
+    images: Array.isArray(finalResult?.images) ? finalResult.images.map(img => {
+      try { return new URL(img.url).pathname.split("/").pop().substring(0, 80); } catch { return img.url.substring(0, 80); }
+    }) : [],
     title: finalResult?.title || null,
     price: finalResult?.price || null,
     timestamp: new Date().toISOString(),
