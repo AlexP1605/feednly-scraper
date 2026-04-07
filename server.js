@@ -36,11 +36,13 @@ const USER_AGENTS = [
 ];
 const VIEWPORT_WIDTHS = [1280, 1366, 1440, 1536, 1680, 1920];
 const VIEWPORT_HEIGHTS = [720, 768, 900, 960, 1080];
+
+// FIX: Réduit de 15 à 6 images max
 const MAX_IMAGE_RESULTS = Math.max(
   1,
-  Number.parseInt(process.env.SCRAPER_MAX_IMAGE_RESULTS || "15", 10) || 15
+  Number.parseInt(process.env.SCRAPER_MAX_IMAGE_RESULTS || "6", 10) || 6
 );
-const BEST_IMAGE_LIMIT = Math.min(10, MAX_IMAGE_RESULTS);
+const BEST_IMAGE_LIMIT = Math.min(6, MAX_IMAGE_RESULTS);
 
 const PRODUCT_IMAGE_KEYWORDS = [
   "product", "media", "gallery", "item", "detail", "zoom", "images", "photo", "pdp",
@@ -86,16 +88,15 @@ const DEFAULT_USD_TO_EUR_RATE = 0.92;
 
 // ─── IMAGE PRIORITY SOURCES ───────────────────────────────────────────────────
 const SOURCE_PRIORITY = {
-  og_image: 10000,
-  jsonld_product: 8000,
-  twitter_image: 6000,
+  jsonld_product: 8000,   // FIX: JSON-LD produit devient la source la plus fiable
+  og_image: 5000,         // FIX: og:image réduit car souvent image marketing/bundle
+  twitter_image: 4000,
   itemprop_image: 4000,
   dom_strong: 2000,
   dom_weak: 1000,
   fallback: 0,
 };
 
-// FIX 1: media_principal retiré des strong patterns (c'est souvent une vue secondaire sur Sephora)
 const STRONG_PRODUCT_URL_PATTERNS = [
   /\/pim\//i,
   /\/published\//i,
@@ -110,7 +111,6 @@ const STRONG_PRODUCT_URL_PATTERNS = [
   /media[-_]\d+[-_]\d+\./i,
 ];
 
-// FIX 1 (suite): media_principal ajouté dans les patterns à pénaliser
 const MARKETING_URL_PATTERNS = [
   /\/banner/i,
   /\/marketing/i,
@@ -129,15 +129,47 @@ const MARKETING_URL_PATTERNS = [
   /\/icon/i,
   /\/sprite/i,
   /\/avatar/i,
-  /media_principal/i,  // vue secondaire sur Sephora, pas l'image principale
-  /media_thumbnail/i,  // petites pastilles de couleur/variante, inutiles
-  /[-_]thumbnail[-_]?/i,  // thumbnails en général
-  /\/tile_/i,  // tuiles carousel/recommandations (Benefit, etc.)
-  /[-_]tile[-_]/i,  // variante du pattern tile
+  /media_principal/i,
+  /media_thumbnail/i,
+  /[-_]thumbnail[-_]?/i,
+  /\/tile_/i,
+  /[-_]tile[-_]/i,
+  // FIX: Nouveaux patterns pour exclure images non-produit
+  /before.?after/i,       // images avant/après
+  /after.?before/i,
+  /_bundle/i,             // bundles produits
+  /bundle_/i,
+  /[-_]bundle[-_]/i,
+  /look[-_]/i,            // "look" = image éditoriale (ex: Love_Blushed_Look)
+  /[-_]look[-_]/i,
+  /[-_]look\./i,
+  /lifestyle/i,           // photos lifestyle/ambiance
+  /model[-_]/i,           // photos avec modèle (pas le produit seul)
+  /[-_]model[-_]/i,
+  /how[-_]?to/i,          // tutoriels
+  /tutorial/i,
+  /routine/i,
+  /texture/i,             // gros plans texture (pas l'image produit principale)
+  /swatch/i,              // pastilles de couleur
+  /[-_]on[-_]skin/i,      // application sur peau
+  /application/i,
 ];
 
-// FIX 2: Minimum size threshold - images below this are useless
+// FIX: Minimum size threshold
 const MIN_IMAGE_DIMENSION = 300;
+
+// FIX: Patterns qui indiquent une image produit "pure" (fond blanc/neutre, produit seul)
+const PURE_PRODUCT_URL_PATTERNS = [
+  /[-_]\d{3,}x\d{3,}[-_.]/i,   // dimensions dans le nom (ex: 1000x1000)
+  /\/products?\//i,              // /product/ ou /products/ dans le chemin
+  /[-_]front[-_.]/i,             // vue de face
+  /[-_]main[-_.]/i,              // image principale
+  /[-_]primary[-_.]/i,           // image primaire
+  /[-_]default[-_.]/i,           // image par défaut
+  /\/packshot/i,                 // packshot = photo produit pure
+  /\/pim\//i,                    // PIM = Product Information Management
+  /fit=fill/i,                   // Charlotte Tilbury: fit=fill = image carrée produit
+];
 
 function parseNumericPrice(value) {
   if (!value) return null;
@@ -387,22 +419,11 @@ function isValidImageUrl(url) {
   if (!url) return false;
   const lower = url.toLowerCase();
 
-  // Rejeter GIFs (logos, spinners, animations)
   if (/\.gif($|\?|&)/i.test(lower)) return false;
-
-  // Rejeter SVGs (logos, icônes)
   if (/\.svg($|\?|&)/i.test(lower)) return false;
-
-  // Rejeter assets statiques de bibliothèque (pas des images produit)
   if (/library-sites/i.test(lower)) return false;
-
-  // Rejeter logos fidélité/programme
   if (/fid\.(gif|png|jpg|webp)|loyalty|mysephora.*fid|blackfid|goldfid|bronzefid/i.test(lower)) return false;
-
-  // Rejeter thumbnails vidéo (YouTube, Vimeo, etc.)
   if (/img\.youtube\.com|i\.ytimg\.com|vumbnail\.com|vimeo\.com\/video/i.test(lower)) return false;
-
-  // Rejeter les thumbnails produit (petites pastilles de couleur/variante)
   if (/media_thumbnail|[-_]thumbnail[-_\d]/i.test(lower)) return false;
 
   if (!/\.(jpe?g|png|webp|avif)(?:$|\?|&)/i.test(lower) && !/\/(image|photo|picture|img)\//i.test(lower)) {
@@ -412,13 +433,13 @@ function isValidImageUrl(url) {
   return true;
 }
 
-// ─── CORE: compute image priority score ───────────────────────────────────────
+// FIX: Calcul du score d'image amélioré
 function computeImagePriorityScore(url, sourcePriority = 0) {
   if (!url) return -Infinity;
 
   let score = sourcePriority;
 
-  // Heavy penalty for marketing/non-product images (includes media_principal now)
+  // Pénalité lourde pour images marketing/non-produit
   for (const pattern of MARKETING_URL_PATTERNS) {
     if (pattern.test(url)) {
       score -= 5000;
@@ -426,7 +447,15 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
     }
   }
 
-  // Bonus for strong product URL patterns
+  // Bonus fort pour patterns d'images produit pures
+  for (const pattern of PURE_PRODUCT_URL_PATTERNS) {
+    if (pattern.test(url)) {
+      score += 4000;
+      break;
+    }
+  }
+
+  // Bonus pour patterns URL produit forts
   for (const pattern of STRONG_PRODUCT_URL_PATTERNS) {
     if (pattern.test(url)) {
       score += 3000;
@@ -434,19 +463,21 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
     }
   }
 
-  // Dimension scoring from URL params
+  // Scoring par dimensions
   const dims = extractDimensionsFromUrl(url);
   if (dims.width && dims.height) {
     const area = dims.width * dims.height;
     score += Math.min(area / 100, 2000);
     const ratio = dims.width / dims.height;
-    if (ratio > 2.0) score -= 3000;
-    if (ratio > 1.6) score -= 1000;
-    // FIX 2: Éliminer complètement les images trop petites (score absolu -Infinity)
+    // FIX: Pénaliser les images très larges (bannières) mais pas les images carrées (produit)
+    if (ratio > 2.5) score -= 4000;
+    else if (ratio > 1.8) score -= 2000;
+    else if (ratio > 1.5) score -= 500;
+    // Bonus pour images carrées ou quasi-carrées (typique produit cosmétique)
+    else if (ratio >= 0.8 && ratio <= 1.2) score += 1000;
     if (dims.width < MIN_IMAGE_DIMENSION || dims.height < MIN_IMAGE_DIMENSION) return -Infinity;
   } else if (dims.width) {
     score += Math.min(dims.width * 2, 1000);
-    // FIX 2: Éliminer complètement les images trop petites
     if (dims.width < MIN_IMAGE_DIMENSION) return -Infinity;
   }
 
@@ -518,37 +549,21 @@ function extractSrcsetCandidates(value) {
   }).filter((candidate) => candidate.url);
 }
 
-// FIX 3: Déduplication améliorée — déduplique aussi par nom de fichier
-// pour éviter les doublons quand le même fichier est dans des dossiers différents
-// (ex: 797712/398687-media_swatch-0.jpg vs P10063578/398687-media_swatch-0.jpg)
 function createImageDedupKey(url) {
   if (!url) return "";
   try {
     const parsed = new URL(url);
-
-    // Tous les paramètres liés à la taille/qualité/cache sont ignorés pour la dédup
-    // Cela couvre: Shopify, Sephora, Demandware, Cloudinary, Imgix, Fastly, etc.
     const skipKeys = new Set([
-      // Dimensions génériques
       "w", "width", "wid", "rw", "mw",
       "h", "height", "hei", "rh", "mh",
-      // Salesforce / Demandware (drunkelephant, sephora...)
       "sw", "sh", "sm", "frz-v", "frzv",
-      // Sephora spécifique
       "scalewidth", "scaleheight", "scalemode",
-      // Taille générique
       "imwidth", "imheight", "size", "scale", "scaling",
-      // Transformations
       "fit", "crop", "dpr", "ar", "trim",
-      // Qualité
       "quality", "q", "compression",
-      // Format
       "format", "auto", "ext", "fm",
-      // Cache busting
       "ts", "timestamp", "cache", "v", "ver", "version", "cb", "t",
-      // Cloudinary
       "c", "f", "g",
-      // Autres
       "bgcolor", "bg", "pad",
     ]);
 
@@ -560,21 +575,14 @@ function createImageDedupKey(url) {
       for (const value of values) normalizedSearch.append(key.toLowerCase(), value);
     }
     const normalizedQuery = normalizedSearch.toString();
-
-    // Clé principale = hostname + chemin complet (sans params de taille/cache)
     const fullKey = `${parsed.hostname}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
-
-    // Fix 2: Fallback par nom de fichier
-    // Si deux URLs ont des chemins différents mais le même nom de fichier exact
-    // (ex: /dw/image/v2/.../image.jpg vs /on/demandware.static/.../image.jpg)
-    // on les considère comme la même image — fréquent sur Salesforce/Demandware
     const filename = parsed.pathname.split("/").pop() || "";
     const isSignificantFilename = filename.length > 15 && /\.(jpe?g|png|webp|avif)/i.test(filename);
     if (isSignificantFilename) {
-      // Clé courte = hostname + nom de fichier uniquement
-      return `${parsed.hostname}__file__${filename}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+      // FIX: strip dimensions from filename before dedup
+      const filenameNoDims = filename.replace(/_\d{2,4}x\d{2,4}/gi, "").replace(/\d{2,4}x\d{2,4}_/gi, "").replace(/-\d{2,4}x\d{2,4}/gi, "").replace(/\d{2,4}x\d{2,4}-/gi, "");
+      return `${parsed.hostname}__file__${filenameNoDims}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
     }
-
     return fullKey;
   } catch {
     return `${url}`.trim().toLowerCase();
@@ -791,21 +799,7 @@ function extractFromHtmlContent(html, url) {
     imageCandidates.push({ url: normalized, score });
   }
 
-  // PRIORITY 1: og:image
-  const ogImage = $("meta[property='og:image']").attr("content") ||
-    $("meta[property='og:image:url']").attr("content");
-  if (ogImage) addCandidate(ogImage, SOURCE_PRIORITY.og_image);
-
-  // PRIORITY 2: twitter:image
-  const twitterImage = $("meta[name='twitter:image']").attr("content") ||
-    $("meta[name='twitter:image:src']").attr("content");
-  if (twitterImage) addCandidate(twitterImage, SOURCE_PRIORITY.twitter_image);
-
-  // PRIORITY 3: link[rel='image_src']
-  const linkImage = $("link[rel='image_src']").attr("href");
-  if (linkImage) addCandidate(linkImage, SOURCE_PRIORITY.twitter_image);
-
-  // PRIORITY 4: JSON-LD structured data
+  // PRIORITY 1: JSON-LD structured data (FIX: maintenant la source la plus fiable)
   $("script[type='application/ld+json']").toArray().forEach((element) => {
     const text = $(element).text();
     if (!text) return;
@@ -866,6 +860,20 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
+  // PRIORITY 2: og:image (FIX: priorité réduite, soumis au scoring marketing)
+  const ogImage = $("meta[property='og:image']").attr("content") ||
+    $("meta[property='og:image:url']").attr("content");
+  if (ogImage) addCandidate(ogImage, SOURCE_PRIORITY.og_image);
+
+  // PRIORITY 3: twitter:image
+  const twitterImage = $("meta[name='twitter:image']").attr("content") ||
+    $("meta[name='twitter:image:src']").attr("content");
+  if (twitterImage) addCandidate(twitterImage, SOURCE_PRIORITY.twitter_image);
+
+  // PRIORITY 4: link[rel='image_src']
+  const linkImage = $("link[rel='image_src']").attr("href");
+  if (linkImage) addCandidate(linkImage, SOURCE_PRIORITY.twitter_image);
+
   // PRIORITY 5: itemprop="image"
   $("[itemprop='image']").toArray().forEach((element) => {
     const src = $(element).attr("content") || $(element).attr("src");
@@ -905,19 +913,13 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
-  // PRIORITY 7: Extraire les URLs d'images depuis les blocs <script> (JSON embarqué)
-  // Cible: window.__NEXT_DATA__, window.__INITIAL_STATE__, Shopify, Salesforce, etc.
-  // Ces objets contiennent souvent toutes les images produit même celles non rendues dans le DOM
+  // PRIORITY 7: Scripts JSON embarqués
   $("script").toArray().forEach((element) => {
     const scriptContent = $(element).html() || "";
     if (!scriptContent || scriptContent.length < 50) return;
-
-    // Ignorer les scripts externes et les scripts JSON-LD (déjà traités)
     const type = $(element).attr("type") || "";
     if (type === "application/ld+json") return;
 
-    // Chercher toutes les URLs d'images dans le contenu du script
-    // Pattern large: capture toutes les URLs qui ressemblent à des images produit
     const imageUrlPattern = /["']((https?:)?\/\/[^"'\s,]+\.(?:jpe?g|png|webp|avif)[^"'\s,]*?)["']/gi;
     let match;
     while ((match = imageUrlPattern.exec(scriptContent)) !== null) {
@@ -927,12 +929,10 @@ function extractFromHtmlContent(html, url) {
       if (!normalized) continue;
       if (!isValidImageUrl(normalized)) continue;
 
-      // Vérifier que c'est une URL produit (pas un asset UI)
       const isStrong = STRONG_PRODUCT_URL_PATTERNS.some((p) => p.test(normalized));
       const isMarketing = MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
       if (isMarketing) continue;
 
-      // Donner une priorité selon le contexte du script
       const scriptId = $(element).attr("id") || "";
       const isNextData = scriptId === "__NEXT_DATA__" || scriptContent.includes("__NEXT_DATA__");
       const isInitialState = scriptContent.includes("__INITIAL_STATE__") || scriptContent.includes("pageData");
@@ -940,10 +940,8 @@ function extractFromHtmlContent(html, url) {
 
       let priority;
       if (isNextData || isInitialState || isShopify) {
-        // Sources fiables — même priorité que itemprop
         priority = isStrong ? SOURCE_PRIORITY.dom_strong : SOURCE_PRIORITY.itemprop_image;
       } else {
-        // Script générique — priorité faible
         priority = isStrong ? SOURCE_PRIORITY.dom_strong : SOURCE_PRIORITY.dom_weak;
       }
 
@@ -951,7 +949,7 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
-  // Sort and deduplicate by score
+  // Sort, deduplicate and limit
   let finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
 
   // ── Final price ──
