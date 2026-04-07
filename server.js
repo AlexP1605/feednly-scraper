@@ -37,7 +37,6 @@ const USER_AGENTS = [
 const VIEWPORT_WIDTHS = [1280, 1366, 1440, 1536, 1680, 1920];
 const VIEWPORT_HEIGHTS = [720, 768, 900, 960, 1080];
 
-// FIX: Réduit de 15 à 6 images max
 const MAX_IMAGE_RESULTS = Math.max(
   1,
   Number.parseInt(process.env.SCRAPER_MAX_IMAGE_RESULTS || "6", 10) || 6
@@ -88,8 +87,8 @@ const DEFAULT_USD_TO_EUR_RATE = 0.92;
 
 // ─── IMAGE PRIORITY SOURCES ───────────────────────────────────────────────────
 const SOURCE_PRIORITY = {
-  og_image: 9000,         // og:image = image choisie par le site pour représenter le produit
-  jsonld_product: 8000,   // JSON-LD produit = très fiable aussi
+  og_image: 9000,
+  jsonld_product: 8000,
   twitter_image: 4000,
   itemprop_image: 4000,
   dom_strong: 2000,
@@ -115,7 +114,6 @@ const STRONG_PRODUCT_URL_PATTERNS = [
 ];
 
 const MARKETING_URL_PATTERNS = [
-  // ── UI / assets non-produit ──
   /\/banner/i,
   /\/marketing/i,
   /\/campaign/i,
@@ -138,48 +136,30 @@ const MARKETING_URL_PATTERNS = [
   /\/tile_/i,
   /[-_]tile[-_]/i,
   /shade_finder/i,
-
-  // ── Images éditoriales / lookbook ──
-  // look: pénalité légère uniquement, pas de blocage dur
-  // car "look" peut être dans le nom du kit produit
   /lifestyle/i,
-  // bundle: pas bloqué ici car un kit/bundle EST parfois le produit principal
-  // géré par pénalité légère dans computeImagePriorityScore
-
-  // ── Photos avec modèle (pas le produit seul) ──
   /[-_]model[-_]/i,
   /model_shoot/i,
   /[-_]hm[-_]/i,
   /[-_]rq[-_]/i,
   /[-_]rm[-_]/i,
   /[-_]hf[-_]/i,
-
-  // ── Codes géographiques = variantes éditoriales régionales ──
   /middle.?east/i,
   /north.?africa/i,
   /[-_]apac[-_]/i,
   /[-_]emea[-_]/i,
   /[-_]latam[-_]/i,
   /[-_]mena[-_]/i,
-
-  // ── Contenu tutorial / avant-après ──
   /before.?after/i,
   /after.?before/i,
   /how[-_]?to/i,
   /tutorial/i,
   /routine/i,
   /grwm/i,
-
-  // ── Gros plans non-produit ──
   /texture/i,
   /close.?up/i,
   /[-_]on[-_]skin/i,
   /application/i,
   /swatch/i,
-  // images régionales CT tolérées — ce sont de vraies images produit
-  // /[-_]row[-_]/i retiré car FR-row- = variantes produit valides sur CT
-
-  // ── Codes campagne saisonnière ──
   /[-_]fall\d{2}(?!.*(?:product|ecomm|item))/i,
   /[-_]spring\d{2}(?!.*(?:product|ecomm|item))/i,
   /[-_]summer\d{2}(?!.*(?:product|ecomm|item))/i,
@@ -189,15 +169,11 @@ const MARKETING_URL_PATTERNS = [
   /[-_]holiday[-_]/i,
   /[-_]xmas[-_]/i,
   /[-_]festive[-_]/i,
-
-  // ── Dates dans le nom de fichier = photos de campagne datées ──
   /[-_]20\d{2}(?:0[1-9]|1[0-2])[-_]/i,
 ];
 
-// Minimum size threshold
 const MIN_IMAGE_DIMENSION = 300;
 
-// Patterns qui indiquent une image produit pure (fond blanc/neutre, produit seul)
 const PURE_PRODUCT_URL_PATTERNS = [
   /\/products?\//i,
   /\/packshot/i,
@@ -211,6 +187,48 @@ const PURE_PRODUCT_URL_PATTERNS = [
   /[-_]\d{1,4}g[-_.]/i,
   /[-_]\d{1,4}oz[-_.]/i,
   /ecomm.*product|product.*ecomm/i,
+];
+
+// ─── GALLERY ORDERED SELECTORS ────────────────────────────────────────────────
+// Ordered by specificity — first match with >= 2 images wins
+// These selectors target the actual product gallery in DOM order
+const GALLERY_SELECTORS = [
+  // Charlotte Tilbury — galerie <ul><li><img> principale
+  "ul li img[src*='ctfassets']",
+  // Sephora FR/US
+  "[data-comp='ProductMediaSlider'] img",
+  "[class*='productImage'] img",
+  "[data-testid='product-image-thumbnail'] img",
+  // Marionnaud / Douglas
+  "[class*='product-gallery'] img",
+  "[class*='ProductGallery'] img",
+  // ASOS
+  "[class*='product-gallery-thumbnail'] img",
+  // Zalando
+  "[data-testid='pdp-media-gallery'] img",
+  // Shopify générique
+  "[class*='product__media'] img",
+  "[id*='ProductMedia'] img",
+  "[class*='product-single__media'] img",
+  // WooCommerce générique
+  ".woocommerce-product-gallery img",
+  "[class*='woocommerce-product-gallery'] img",
+  // Magento générique
+  "[data-gallery-role='gallery'] img",
+  "[class*='fotorama'] img",
+  // Patterns génériques galerie produit
+  "[class*='pdp-gallery'] img",
+  "[class*='pdp_gallery'] img",
+  "[class*='product-photos'] img",
+  "[class*='product_photos'] img",
+  "[class*='product-images'] img",
+  "[class*='product_images'] img",
+  "[class*='gallery-thumbs'] img",
+  "[class*='gallery_thumbs'] img",
+  "[class*='image-gallery'] img",
+  "[class*='image_gallery'] img",
+  // Fallback — ul avec plusieurs li contenant des images
+  "ul li img",
 ];
 
 function parseNumericPrice(value) {
@@ -475,13 +493,11 @@ function isValidImageUrl(url) {
   return true;
 }
 
-// FIX: Calcul du score d'image amélioré
 function computeImagePriorityScore(url, sourcePriority = 0) {
   if (!url) return -Infinity;
 
   let score = sourcePriority;
 
-  // Pénalité lourde pour images marketing/non-produit
   for (const pattern of MARKETING_URL_PATTERNS) {
     if (pattern.test(url)) {
       score -= 5000;
@@ -489,7 +505,6 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
     }
   }
 
-  // Bonus fort pour patterns d'images produit pures
   for (const pattern of PURE_PRODUCT_URL_PATTERNS) {
     if (pattern.test(url)) {
       score += 4000;
@@ -497,7 +512,6 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
     }
   }
 
-  // Bonus pour patterns URL produit forts
   for (const pattern of STRONG_PRODUCT_URL_PATTERNS) {
     if (pattern.test(url)) {
       score += 3000;
@@ -505,17 +519,14 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
     }
   }
 
-  // Scoring par dimensions
   const dims = extractDimensionsFromUrl(url);
   if (dims.width && dims.height) {
     const area = dims.width * dims.height;
     score += Math.min(area / 100, 2000);
     const ratio = dims.width / dims.height;
-    // FIX: Pénaliser les images très larges (bannières) mais pas les images carrées (produit)
     if (ratio > 2.5) score -= 4000;
     else if (ratio > 1.8) score -= 2000;
     else if (ratio > 1.5) score -= 500;
-    // Bonus pour images carrées ou quasi-carrées (typique produit cosmétique)
     else if (ratio >= 0.8 && ratio <= 1.2) score += 1000;
     if (dims.width < MIN_IMAGE_DIMENSION || dims.height < MIN_IMAGE_DIMENSION) return -Infinity;
   } else if (dims.width) {
@@ -523,28 +534,20 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
     if (dims.width < MIN_IMAGE_DIMENSION) return -Infinity;
   }
 
-  // Format bonuses
   if (/\.webp($|\?)/i.test(url)) score += 200;
   if (/\.jpe?g($|\?)/i.test(url)) score += 150;
   if (/\.png($|\?)/i.test(url)) score += 100;
   if (/\.svg($|\?)/i.test(url)) score -= 500;
 
-  // Quality hints in URL
   if (/_large|_xl|_2x|@2x|1200|1600|_zoom/i.test(url)) score += 300;
 
-  // Pénalité légère pour bundle/look — préférer packshot pur si dispo
   if (/[-_]bundle[-_]|_bundle|bundle_/i.test(url)) score -= 800;
   if (/look[-_]|[-_]look[-_]|[-_]look\./i.test(url)) score -= 600;
 
-  // Pénalité pour infographies / images régionales CT
-  // gardées dans les résultats mais après le packshot principal
   if (/[-_]row[-_]/i.test(url)) score -= 4000;
   if (/infographi|[-_]claims[-_]|pdp[-_]\d/i.test(url)) score -= 3000;
   if (/fair\d[-_]|dark[-_]spot/i.test(url)) score -= 3000;
 
-  // codes modèle CT (_hm_, _rm_ etc.) : pas de pénalité, images valides
-
-  // Bonus fort pour packshot
   if (/packshot|pack[-_]shot/i.test(url)) score += 2000;
 
   return score;
@@ -636,8 +639,11 @@ function createImageDedupKey(url) {
     const filename = parsed.pathname.split("/").pop() || "";
     const isSignificantFilename = filename.length > 15 && /\.(jpe?g|png|webp|avif)/i.test(filename);
     if (isSignificantFilename) {
-      // FIX: strip dimensions from filename before dedup
-      const filenameNoDims = filename.replace(/_\d{2,4}x\d{2,4}/gi, "").replace(/\d{2,4}x\d{2,4}_/gi, "").replace(/-\d{2,4}x\d{2,4}/gi, "").replace(/\d{2,4}x\d{2,4}-/gi, "");
+      const filenameNoDims = filename
+        .replace(/_\d{2,4}x\d{2,4}/gi, "")
+        .replace(/\d{2,4}x\d{2,4}_/gi, "")
+        .replace(/-\d{2,4}x\d{2,4}/gi, "")
+        .replace(/\d{2,4}x\d{2,4}-/gi, "");
       return `${parsed.hostname}__file__${filenameNoDims}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
     }
     return fullKey;
@@ -781,6 +787,64 @@ function normalizePriceOutput(value, currencyHints = []) {
   return formatPriceNumber(amount);
 }
 
+// ─── ORDERED GALLERY EXTRACTION ───────────────────────────────────────────────
+// Tente de trouver la galerie produit dans l'ordre du DOM.
+// Retourne un tableau d'URLs dans l'ordre d'affichage du site, ou [] si non trouvée.
+function extractOrderedGallery($, pageUrl) {
+  for (const selector of GALLERY_SELECTORS) {
+    const elements = $(selector).toArray();
+    if (elements.length < 2) continue;
+
+    const galleryImages = [];
+    const seenKeys = new Set();
+
+    for (const element of elements) {
+      const el = $(element);
+
+      // Récupère src en priorité, puis les attributs lazy
+      const src =
+        el.attr("src") ||
+        el.attr("data-src") ||
+        el.attr("data-lazy-src") ||
+        el.attr("data-original") ||
+        // srcset → prend la plus grande image
+        (() => {
+          const srcset = el.attr("srcset") || el.attr("data-srcset");
+          if (!srcset) return null;
+          const candidates = extractSrcsetCandidates(srcset);
+          if (!candidates.length) return null;
+          // Prend le candidat avec la plus grande largeur déclarée, sinon le dernier
+          const withWidth = candidates.filter((c) => c.width);
+          return withWidth.length
+            ? withWidth.sort((a, b) => b.width - a.width)[0].url
+            : candidates[candidates.length - 1].url;
+        })();
+
+      if (!src) continue;
+
+      const normalized = normalizeUrl(src, pageUrl);
+      if (!normalized || !isValidImageUrl(normalized)) continue;
+
+      // Filtre les vraies mauvaises images (score = -Infinity)
+      const score = computeImagePriorityScore(normalized, SOURCE_PRIORITY.dom_strong);
+      if (score === -Infinity) continue;
+
+      const key = createImageDedupKey(normalized);
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      galleryImages.push(normalized);
+    }
+
+    // On valide : au moins 2 images uniques trouvées
+    if (galleryImages.length >= 2) {
+      return galleryImages;
+    }
+  }
+
+  return [];
+}
+
 // ─── MAIN EXTRACTION FUNCTION ─────────────────────────────────────────────────
 function extractFromHtmlContent(html, url) {
   if (!html) return { title: null, description: null, price: null, images: [] };
@@ -856,7 +920,7 @@ function extractFromHtmlContent(html, url) {
     imageCandidates.push({ url: normalized, score });
   }
 
-  // PRIORITY 1: JSON-LD structured data (FIX: maintenant la source la plus fiable)
+  // PRIORITY 1: JSON-LD structured data
   $("script[type='application/ld+json']").toArray().forEach((element) => {
     const text = $(element).text();
     if (!text) return;
@@ -917,7 +981,7 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
-  // PRIORITY 2: og:image (FIX: priorité réduite, soumis au scoring marketing)
+  // PRIORITY 2: og:image
   const ogImage = $("meta[property='og:image']").attr("content") ||
     $("meta[property='og:image:url']").attr("content");
   if (ogImage) addCandidate(ogImage, SOURCE_PRIORITY.og_image);
@@ -1006,8 +1070,23 @@ function extractFromHtmlContent(html, url) {
     }
   });
 
-  // Sort, deduplicate and limit
-  let finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
+  // ── GALERIE ORDONNÉE ─────────────────────────────────────────────────────────
+  // Tente d'extraire la galerie produit dans l'ordre DOM exact du site.
+  // Si trouvée (>= 2 images), elle prime sur le tri par score.
+  const orderedGallery = extractOrderedGallery($, url);
+
+  let finalImages;
+  if (orderedGallery.length >= 2) {
+    // Galerie ordonnée trouvée → on l'utilise comme base dans l'ordre du site
+    // On complète avec les autres candidats scorés si on n'a pas encore MAX_IMAGE_RESULTS
+    const galleryKeys = new Set(orderedGallery.map(createImageDedupKey));
+    const extras = dedupeImagesByScore(imageCandidates)
+      .filter((imgUrl) => !galleryKeys.has(createImageDedupKey(imgUrl)));
+    finalImages = [...orderedGallery, ...extras].slice(0, MAX_IMAGE_RESULTS);
+  } else {
+    // Pas de galerie claire → fallback tri par score (comportement original)
+    finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
+  }
 
   // ── Final price ──
   const currencyHintList = Array.from(currencyValues);
