@@ -532,16 +532,20 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
   // Quality hints in URL
   if (/_large|_xl|_2x|@2x|1200|1600|_zoom/i.test(url)) score += 300;
 
-  // Pénalité légère pour bundle/look (pas bloquant car peut être le produit lui-même)
-  // mais on préfère un packshot pur si disponible
+  // Pénalité légère pour bundle/look — préférer packshot pur si dispo
   if (/[-_]bundle[-_]|_bundle|bundle_/i.test(url)) score -= 800;
   if (/look[-_]|[-_]look[-_]|[-_]look\./i.test(url)) score -= 600;
 
-  // Pénalité légère pour images avec code modèle CT (_hm_, _rq_ etc.)
-  // déjà dans MARKETING mais double-vérification par score pour les cas limites
+  // Pénalité pour infographies / images régionales CT
+  // gardées dans les résultats mais après le packshot principal
+  if (/[-_]row[-_]/i.test(url)) score -= 4000;
+  if (/infographi|[-_]claims[-_]|pdp[-_]\d/i.test(url)) score -= 3000;
+  if (/fair\d[-_]|dark[-_]spot/i.test(url)) score -= 3000;
+
+  // Pénalité forte pour images avec code modèle CT
   if (/[-_](?:hm|rq|rm|hf|em|cm)[-_]/i.test(url)) score -= 3000;
 
-  // Bonus fort pour images packshot identifiées par alt text (via filename)
+  // Bonus fort pour packshot
   if (/packshot|pack[-_]shot/i.test(url)) score += 2000;
 
   return score;
