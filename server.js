@@ -102,16 +102,20 @@ const STRONG_PRODUCT_URL_PATTERNS = [
   /\/published\//i,
   /\/pdp\//i,
   /\/packshot/i,
-  /media[-_]swatch/i,
   /\/product[-_]?image/i,
-  /[-_]main[-_]/i,
-  /[-_]hero[-_]/i,
+  /[-_]main[-_.]/i,
+  /[-_]primary[-_.]/i,
+  /[-_]front[-_.]/i,
+  /[-_]default[-_.]/i,
   /\/gallery\//i,
   /\/zoom\//i,
   /media[-_]\d+[-_]\d+\./i,
+  /\/ecomm\//i,
+  /[-_]ecomm[-_]/i,
 ];
 
 const MARKETING_URL_PATTERNS = [
+  // ── UI / assets non-produit ──
   /\/banner/i,
   /\/marketing/i,
   /\/campaign/i,
@@ -124,7 +128,6 @@ const MARKETING_URL_PATTERNS = [
   /\/carousel/i,
   /\/slider/i,
   /library-sites/i,
-  /shade_finder/i,
   /\/logo/i,
   /\/icon/i,
   /\/sprite/i,
@@ -134,41 +137,80 @@ const MARKETING_URL_PATTERNS = [
   /[-_]thumbnail[-_]?/i,
   /\/tile_/i,
   /[-_]tile[-_]/i,
-  // FIX: Nouveaux patterns pour exclure images non-produit
-  /before.?after/i,       // images avant/après
-  /after.?before/i,
-  /_bundle/i,             // bundles produits
-  /bundle_/i,
-  /[-_]bundle[-_]/i,
-  /look[-_]/i,            // "look" = image éditoriale (ex: Love_Blushed_Look)
+  /shade_finder/i,
+
+  // ── Images éditoriales / lookbook ──
+  /look[-_]/i,
   /[-_]look[-_]/i,
   /[-_]look\./i,
-  /lifestyle/i,           // photos lifestyle/ambiance
-  /model[-_]/i,           // photos avec modèle (pas le produit seul)
+  /lifestyle/i,
+  /[-_]bundle[-_]/i,
+  /_bundle/i,
+  /bundle_/i,
+
+  // ── Photos avec modèle (pas le produit seul) ──
   /[-_]model[-_]/i,
-  /how[-_]?to/i,          // tutoriels
+  /model_shoot/i,
+  /[-_]hm[-_]/i,
+  /[-_]rq[-_]/i,
+  /[-_]rm[-_]/i,
+  /[-_]hf[-_]/i,
+
+  // ── Codes géographiques = variantes éditoriales régionales ──
+  /middle.?east/i,
+  /north.?africa/i,
+  /[-_]apac[-_]/i,
+  /[-_]emea[-_]/i,
+  /[-_]latam[-_]/i,
+  /[-_]mena[-_]/i,
+
+  // ── Contenu tutorial / avant-après ──
+  /before.?after/i,
+  /after.?before/i,
+  /how[-_]?to/i,
   /tutorial/i,
   /routine/i,
-  /texture/i,             // gros plans texture (pas l'image produit principale)
-  /swatch/i,              // pastilles de couleur
-  /[-_]on[-_]skin/i,      // application sur peau
+  /grwm/i,
+
+  // ── Gros plans non-produit ──
+  /texture/i,
+  /close.?up/i,
+  /[-_]on[-_]skin/i,
   /application/i,
+  /swatch/i,
+
+  // ── Codes campagne saisonnière ──
+  /[-_]fall\d{2}(?!.*(?:product|ecomm|item))/i,
+  /[-_]spring\d{2}(?!.*(?:product|ecomm|item))/i,
+  /[-_]summer\d{2}(?!.*(?:product|ecomm|item))/i,
+  /[-_]winter\d{2}(?!.*(?:product|ecomm|item))/i,
+  /[-_]aw\d{2}[-_]/i,
+  /[-_]ss\d{2}[-_]/i,
+  /[-_]holiday[-_]/i,
+  /[-_]xmas[-_]/i,
+  /[-_]festive[-_]/i,
+
+  // ── Dates dans le nom de fichier = photos de campagne datées ──
+  /[-_]20\d{2}(?:0[1-9]|1[0-2])[-_]/i,
 ];
 
-// FIX: Minimum size threshold
+// Minimum size threshold
 const MIN_IMAGE_DIMENSION = 300;
 
-// FIX: Patterns qui indiquent une image produit "pure" (fond blanc/neutre, produit seul)
+// Patterns qui indiquent une image produit pure (fond blanc/neutre, produit seul)
 const PURE_PRODUCT_URL_PATTERNS = [
-  /[-_]\d{3,}x\d{3,}[-_.]/i,   // dimensions dans le nom (ex: 1000x1000)
-  /\/products?\//i,              // /product/ ou /products/ dans le chemin
-  /[-_]front[-_.]/i,             // vue de face
-  /[-_]main[-_.]/i,              // image principale
-  /[-_]primary[-_.]/i,           // image primaire
-  /[-_]default[-_.]/i,           // image par défaut
-  /\/packshot/i,                 // packshot = photo produit pure
-  /\/pim\//i,                    // PIM = Product Information Management
-  /fit=fill/i,                   // Charlotte Tilbury: fit=fill = image carrée produit
+  /\/products?\//i,
+  /\/packshot/i,
+  /\/pim\//i,
+  /fit=fill/i,
+  /[-_]main[-_.]/i,
+  /[-_]primary[-_.]/i,
+  /[-_]front[-_.]/i,
+  /[-_]default[-_.]/i,
+  /[-_]\d{1,5}ml[-_.]/i,
+  /[-_]\d{1,4}g[-_.]/i,
+  /[-_]\d{1,4}oz[-_.]/i,
+  /ecomm.*product|product.*ecomm/i,
 ];
 
 function parseNumericPrice(value) {
