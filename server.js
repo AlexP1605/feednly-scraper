@@ -542,8 +542,7 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
   if (/infographi|[-_]claims[-_]|pdp[-_]\d/i.test(url)) score -= 3000;
   if (/fair\d[-_]|dark[-_]spot/i.test(url)) score -= 3000;
 
-  // Pénalité forte pour images avec code modèle CT
-  if (/[-_](?:hm|rq|rm|hf|em|cm)[-_]/i.test(url)) score -= 3000;
+  // codes modèle CT (_hm_, _rm_ etc.) : pas de pénalité, images valides
 
   // Bonus fort pour packshot
   if (/packshot|pack[-_]shot/i.test(url)) score += 2000;
