@@ -1342,8 +1342,24 @@ async function scrapeWithStages(url) {
   steps.stage3 = resolveStageStatus(stage3Result, stage3Attempted, true);
 
   if (!finalResult) {
-    finalResult = { ok: false, status: "blocked" };
     finalStage = "failed";
+    finalResult = {
+      ok: false,
+      title: null,
+      description: null,
+      price: null,
+      images: [],
+      meta: {
+        stage: "failed",
+        blocked: true,
+        fallbackUsed: false,
+        durationSeconds: 0,
+        network: { durationSeconds: 0 },
+        userAgent: "",
+        navigationWaitUntil: "",
+        navigationTimedOut: false,
+      }
+    };
   }
 
   const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
