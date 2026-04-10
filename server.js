@@ -1325,10 +1325,67 @@ async function runStage3(url) {
   }
 }
 
+// ─── DOMAINES NON SUPPORTÉS ─────────────────────────────────────────────────
+// Ces sites chargent leurs images produit en JS dynamique et ne peuvent pas
+// être scrapés correctement. On retourne false directement.
+const UNSUPPORTED_DOMAINS = [
+  "chanel.com",
+];
+
+function isUnsupportedDomain(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return UNSUPPORTED_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
 async function scrapeWithStages(url) {
   if (!url) throw new Error("URL is required");
   const requestStart = performance.now();
   const steps = { stage1: "skipped", stage3: "skipped" };
+
+  // Vérifier si le domaine est supporté
+  if (isUnsupportedDomain(url)) {
+    const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
+    const logEntry = {
+      event: "SCRAPE",
+      url,
+      stage: "unsupported_domain",
+      ok: false,
+      blocked: false,
+      duration: durationSeconds,
+      imagesCount: 0,
+      images: [],
+      title: null,
+      price: null,
+      timestamp: new Date().toISOString(),
+      steps: { stage1: "skipped", stage3: "skipped" },
+      stages: {
+        stage1: { attempted: false, status: "skipped", ok: false, error: "unsupported_domain", blocked: false, durationSeconds: null, meta: null },
+        stage3: { attempted: false, status: "skipped", ok: false, error: null, blocked: false, durationSeconds: null, meta: { brightDataUsed: false } },
+      },
+    };
+    console.log(JSON.stringify(logEntry));
+    return {
+      ok: false,
+      title: null,
+      description: null,
+      price: null,
+      images: [],
+      meta: {
+        stage: "unsupported_domain",
+        blocked: false,
+        fallbackUsed: false,
+        durationSeconds: 0,
+        network: { durationSeconds: 0 },
+        userAgent: "",
+        navigationWaitUntil: "",
+        navigationTimedOut: false,
+      }
+    };
+  }
 
   const resolveStageStatus = (result, attempted, allowMissingAsSkipped) => {
     if (!attempted) return "skipped";
