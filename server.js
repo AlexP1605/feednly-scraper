@@ -810,6 +810,9 @@ function extractOrderedGallery($, pageUrl) {
     for (const element of elements) {
       const el = $(element);
 
+      // Ignorer les images du mega menu Chanel
+      if (el.hasClass("js-megamenu-image")) continue;
+
       // Récupère src en priorité, puis les attributs lazy
       const src =
         el.attr("src") ||
@@ -1013,6 +1016,8 @@ function extractFromHtmlContent(html, url) {
   // PRIORITY 6: DOM images
   $("img").toArray().forEach((element) => {
     const el = $(element);
+    // Ignorer les images du mega menu Chanel (classe js-megamenu-image)
+    if (el.hasClass("js-megamenu-image")) return;
     const src = el.attr("src") || el.attr("data-src") || el.attr("data-lazy-src") || el.attr("data-original");
     if (src) {
       const normalized = normalizeUrl(src, url);
@@ -1035,6 +1040,8 @@ function extractFromHtmlContent(html, url) {
   // source elements (picture)
   $("source").toArray().forEach((element) => {
     const el = $(element);
+    // Ignorer les sources du mega menu Chanel
+    if (el.hasClass("js-megamenu-image")) return;
     const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
     for (const srcset of srcsetValues) {
       extractSrcsetCandidates(srcset).forEach((candidate) => {
