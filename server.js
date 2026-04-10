@@ -1117,11 +1117,22 @@ function extractFromHtmlContent(html, url) {
 function isValidResult(result) {
   if (!result || !result.title) return false;
   if (!Array.isArray(result.images) || result.images.length === 0) return false;
-  // Vérifie qu'au moins une image a une extension reconnue et n'est pas marketing
+  // Vérifie qu'au moins une image est valide et non marketing
+  // Accepte les URLs sans extension (CDN Contentful, Cloudinary, Imgix avec fm=jpg)
   const hasValidImage = result.images.some((img) => {
     const url = typeof img === 'string' ? img : img?.url;
     if (!url) return false;
-    if (!/\.(jpe?g|png|webp|avif)(\?|$)/i.test(url)) return false;
+    const looksLikeImage =
+      /\.(jpe?g|png|webp|avif)/i.test(url) ||
+      /[?&]f[mo]=(jpe?g|png|webp|avif)/i.test(url) ||
+      /[?&]format=(jpe?g|png|webp|avif)/i.test(url) ||
+      /\/image\//i.test(url) ||
+      /\/images\//i.test(url) ||
+      /\/media\//i.test(url) ||
+      /ctfassets\.net/i.test(url) ||
+      /cloudinary\.com/i.test(url) ||
+      /imgix\.net/i.test(url);
+    if (!looksLikeImage) return false;
     return !MARKETING_URL_PATTERNS.some((p) => p.test(url));
   });
   return hasValidImage;
