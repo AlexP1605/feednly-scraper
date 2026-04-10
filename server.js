@@ -170,6 +170,15 @@ const MARKETING_URL_PATTERNS = [
   /[-_]xmas[-_]/i,
   /[-_]festive[-_]/i,
   /[-_]20\d{2}(?:0[1-9]|1[0-2])[-_]/i,
+  // Chanel — images mega menu navigation (pas des images produit)
+  /MegaMenu/i,
+  /megamenu/i,
+  /sys-master\/content/i,
+  /Format=Mobile/i,
+  /MM_Mobile/i,
+  /ONE_MegaMenu/i,
+  /PUSH_megaMenu/i,
+  /puls-img\.chanel\.com/i,
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
@@ -1106,7 +1115,16 @@ function extractFromHtmlContent(html, url) {
 }
 
 function isValidResult(result) {
-  return Boolean(result && result.title && Array.isArray(result.images) && result.images.length > 0);
+  if (!result || !result.title) return false;
+  if (!Array.isArray(result.images) || result.images.length === 0) return false;
+  // Vérifie qu'au moins une image a une extension reconnue et n'est pas marketing
+  const hasValidImage = result.images.some((img) => {
+    const url = typeof img === 'string' ? img : img?.url;
+    if (!url) return false;
+    if (!/\.(jpe?g|png|webp|avif)(\?|$)/i.test(url)) return false;
+    return !MARKETING_URL_PATTERNS.some((p) => p.test(url));
+  });
+  return hasValidImage;
 }
 
 function roundDuration(seconds) {
