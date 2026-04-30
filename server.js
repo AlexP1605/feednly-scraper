@@ -310,16 +310,10 @@ async function runShopifyApi(url) {
       ? cheerio.load(product.body_html).text().replace(/\s+/g, " ").trim().slice(0, 300) || null
       : null;
 
-    // Prix depuis la première variant + devise locale
+    // Prix depuis la première variant — retourné tel quel, sans conversion de devise
     const variant = product.variants?.[0];
-    const localeCurrency = detectCurrencyFromShopifyLocale(url);
     const rawPrice = variant?.price ? `${variant.price}` : null;
-    const price = rawPrice
-      ? normalizePriceOutput(
-          localeCurrency ? `${rawPrice} ${localeCurrency}` : rawPrice,
-          localeCurrency ? [localeCurrency] : []
-        )
-      : null;
+    const price = rawPrice ? formatPriceNumber(parseNumericPrice(rawPrice)) : null;
 
     // Images — exactement dans l'ordre Shopify admin, sans filtre marketing
     const images = (product.images || [])
