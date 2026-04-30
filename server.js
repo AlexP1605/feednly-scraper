@@ -310,11 +310,10 @@ async function runShopifyApi(url) {
       ? cheerio.load(product.body_html).text().replace(/\s+/g, " ").trim().slice(0, 300) || null
       : null;
 
-    // Prix depuis la première variant — retourné tel quel, sans conversion de devise
-    const variant = product.variants?.[0];
-    const rawPrice = variant?.price ? `${variant.price}` : null;
-    console.log(JSON.stringify({ event: "SHOPIFY_PRICE_DEBUG", url, rawPrice, presentmentPrices: variant?.presentment_prices?.length || 0 }));
-    const price = rawPrice ? formatPriceNumber(parseNumericPrice(rawPrice)) : null;
+    // Prix : on ne retourne pas le prix depuis l'API Shopify car elle retourne
+    // toujours la devise de base du shop (ex: GBP) indépendamment de la locale URL.
+    // Le prix affiché sur la page peut être dans une devise différente (ex: NZD).
+    const price = null;
 
     // Images — exactement dans l'ordre Shopify admin, sans filtre marketing
     const images = (product.images || [])
@@ -675,6 +674,10 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
 
   if (/packshot|pack[-_]shot/i.test(url)) score += 2000;
 
+  // Favoriser les grandes tailles, pénaliser les petites
+  if (/[-_](?:xl|lg|large)(?=[._-]|$)/i.test(url)) score += 500;
+  if (/[-_](?:sm|xs|small|thumb|mini)(?=[._-]|$)/i.test(url)) score -= 500;
+
   return score;
 }
 
@@ -770,7 +773,8 @@ function createImageDedupKey(url) {
         .replace(/-\d{2,4}x\d{2,4}/gi, "")
         .replace(/\d{2,4}x\d{2,4}-/gi, "")
         .replace(/_\d{3,4}x(?=[._]|$)/gi, "")  // Shopify: _1440x _2000x _300x
-        .replace(/@\d+x(?=[._]|$)/gi, "");      // @2x @3x
+        .replace(/@\d+x(?=[._]|$)/gi, "")       // @2x @3x
+        .replace(/[-_](?:xl|lg|md|sm|xs|large|medium|small|thumb|mini)(?=[._-]|$)/gi, "");  // -sm -lg -large etc
       return `${parsed.hostname}__file__${filenameNoDims}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
     }
     return fullKey;
