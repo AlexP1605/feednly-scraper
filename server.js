@@ -199,10 +199,11 @@ const PURE_PRODUCT_URL_PATTERNS = [
 ];
 
 // ─── GALLERY ORDERED SELECTORS ────────────────────────────────────────────────
-// Ordered by specificity — first match with >= 2 images wins
-// These selectors target the actual product gallery in DOM order
 const GALLERY_SELECTORS = [
-  // Charlotte Tilbury — galerie <ul><li><img> principale
+  // Shopify Dawn / generic — ajoutés en tête
+  "[class*='product__media-item'] img",
+  "[class*='product-media-container'] img",
+  // Charlotte Tilbury
   "ul li img[src*='ctfassets']",
   // Sephora FR/US
   "[data-comp='ProductMediaSlider'] img",
@@ -236,9 +237,129 @@ const GALLERY_SELECTORS = [
   "[class*='gallery_thumbs'] img",
   "[class*='image-gallery'] img",
   "[class*='image_gallery'] img",
-  // Fallback — ul avec plusieurs li contenant des images
+  // Fallback
   "ul li img",
 ];
+
+// ─── SHOPIFY API (STAGE 0) ────────────────────────────────────────────────────
+
+/**
+ * Extrait le handle produit depuis une URL Shopify.
+ * Supporte les locales : /en-nz/products/handle, /products/handle
+ */
+function extractShopifyHandle(url) {
+  try {
+    const parsed = new URL(url);
+    const match = parsed.pathname.match(/\/products\/([^/?#]+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Détecte la devise depuis la locale dans l'URL Shopify.
+ * Ex: /en-nz/ → NZD, /en-gb/ → GBP
+ */
+function detectCurrencyFromShopifyLocale(url) {
+  const localeMap = {
+    "en-nz": "NZD", "en-gb": "GBP", "en-au": "AUD", "en-ca": "CAD",
+    "en-us": "USD", "fr": "EUR", "de": "EUR", "it": "EUR", "es": "EUR",
+    "en-ie": "EUR", "en-sg": "SGD", "en-hk": "HKD", "en-jp": "JPY",
+    "en-kr": "KRW", "en-ch": "CHF", "en-se": "SEK", "en-dk": "DKK",
+    "en-no": "NOK",
+  };
+  try {
+    const match = new URL(url).pathname.match(/^\/([a-z]{2}-[a-z]{2}|[a-z]{2})\//);
+    if (!match) return null;
+    return localeMap[match[1].toLowerCase()] || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stage 0 : tente de récupérer les données produit via l'API JSON native Shopify.
+ * Tous les shops Shopify exposent /products/{handle}.json publiquement.
+ * Retourne ok:true avec title + images dans l'ordre Shopify si succès.
+ */
+async function runShopifyApi(url) {
+  const handle = extractShopifyHandle(url);
+  if (!handle) return { ok: false, stage: "shopify_api", error: "Not a Shopify product URL" };
+
+  const stageStart = performance.now();
+  try {
+    const parsed = new URL(url);
+    const apiUrl = `${parsed.protocol}//${parsed.hostname}/products/${handle}.json`;
+
+    const response = await axios.get(apiUrl, {
+      timeout: 10000,
+      headers: {
+        "User-Agent": pickUserAgent(),
+        "Accept": "application/json",
+      },
+    });
+
+    const product = response.data?.product;
+    if (!product) return { ok: false, stage: "shopify_api", error: "No product in response" };
+
+    const title = product.title || null;
+
+    // Description : strip HTML du body_html
+    const description = product.body_html
+      ? cheerio.load(product.body_html).text().replace(/\s+/g, " ").trim().slice(0, 300) || null
+      : null;
+
+    // Prix depuis la première variant + devise locale
+    const variant = product.variants?.[0];
+    const localeCurrency = detectCurrencyFromShopifyLocale(url);
+    const rawPrice = variant?.price ? `${variant.price}` : null;
+    const price = rawPrice
+      ? normalizePriceOutput(
+          localeCurrency ? `${rawPrice} ${localeCurrency}` : rawPrice,
+          localeCurrency ? [localeCurrency] : []
+        )
+      : null;
+
+    // Images — exactement dans l'ordre Shopify admin, sans filtre marketing
+    const images = (product.images || [])
+      .map((img) => img.src)
+      .filter(Boolean)
+      .filter((src) => {
+        if (/\.gif($|\?)/i.test(src)) return false;
+        if (/\.svg($|\?)/i.test(src)) return false;
+        return true;
+      })
+      .slice(0, MAX_IMAGE_RESULTS);
+
+    if (!title || !images.length) {
+      return { ok: false, stage: "shopify_api", error: "Incomplete Shopify data" };
+    }
+
+    const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
+    return buildSuccessPayload(
+      { title, description, price, images },
+      {
+        stage: "shopify_api",
+        blocked: false,
+        fallbackUsed: false,
+        durationSeconds,
+        network: { durationSeconds },
+        userAgent: null,
+        navigationWaitUntil: null,
+        navigationTimedOut: false,
+      }
+    );
+  } catch (err) {
+    const status = err?.response?.status;
+    const message = err?.message
+      ? `${err.message}${status ? ` (status ${status})` : ""}`
+      : "Shopify API failed";
+    return { ok: false, stage: "shopify_api", error: message };
+  }
+}
+
+// ─── PRICE HELPERS ────────────────────────────────────────────────────────────
 
 function parseNumericPrice(value) {
   if (!value) return null;
@@ -649,10 +770,12 @@ function createImageDedupKey(url) {
     const isSignificantFilename = filename.length > 15 && /\.(jpe?g|png|webp|avif)/i.test(filename);
     if (isSignificantFilename) {
       const filenameNoDims = filename
-        .replace(/_\d{2,4}x\d{2,4}/gi, "")
+        .replace(/_\d{2,4}x\d{2,4}/gi, "")    // _2000x2000
         .replace(/\d{2,4}x\d{2,4}_/gi, "")
         .replace(/-\d{2,4}x\d{2,4}/gi, "")
-        .replace(/\d{2,4}x\d{2,4}-/gi, "");
+        .replace(/\d{2,4}x\d{2,4}-/gi, "")
+        .replace(/_\d{3,4}x(?=[._]|$)/gi, "")  // Shopify: _1440x _2000x _300x
+        .replace(/@\d+x(?=[._]|$)/gi, "");      // @2x @3x
       return `${parsed.hostname}__file__${filenameNoDims}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
     }
     return fullKey;
@@ -797,8 +920,6 @@ function normalizePriceOutput(value, currencyHints = []) {
 }
 
 // ─── ORDERED GALLERY EXTRACTION ───────────────────────────────────────────────
-// Tente de trouver la galerie produit dans l'ordre du DOM.
-// Retourne un tableau d'URLs dans l'ordre d'affichage du site, ou [] si non trouvée.
 function extractOrderedGallery($, pageUrl) {
   for (const selector of GALLERY_SELECTORS) {
     const elements = $(selector).toArray();
@@ -810,22 +931,18 @@ function extractOrderedGallery($, pageUrl) {
     for (const element of elements) {
       const el = $(element);
 
-      // Ignorer les images du mega menu Chanel
       if (el.hasClass("js-megamenu-image")) continue;
 
-      // Récupère src en priorité, puis les attributs lazy
       const src =
         el.attr("src") ||
         el.attr("data-src") ||
         el.attr("data-lazy-src") ||
         el.attr("data-original") ||
-        // srcset → prend la plus grande image
         (() => {
           const srcset = el.attr("srcset") || el.attr("data-srcset");
           if (!srcset) return null;
           const candidates = extractSrcsetCandidates(srcset);
           if (!candidates.length) return null;
-          // Prend le candidat avec la plus grande largeur déclarée, sinon le dernier
           const withWidth = candidates.filter((c) => c.width);
           return withWidth.length
             ? withWidth.sort((a, b) => b.width - a.width)[0].url
@@ -837,7 +954,6 @@ function extractOrderedGallery($, pageUrl) {
       const normalized = normalizeUrl(src, pageUrl);
       if (!normalized || !isValidImageUrl(normalized)) continue;
 
-      // Filtre les vraies mauvaises images (score = -Infinity)
       const score = computeImagePriorityScore(normalized, SOURCE_PRIORITY.dom_strong);
       if (score === -Infinity) continue;
 
@@ -848,7 +964,6 @@ function extractOrderedGallery($, pageUrl) {
       galleryImages.push(normalized);
     }
 
-    // On valide : au moins 2 images uniques trouvées
     if (galleryImages.length >= 2) {
       return galleryImages;
     }
@@ -1016,7 +1131,6 @@ function extractFromHtmlContent(html, url) {
   // PRIORITY 6: DOM images
   $("img").toArray().forEach((element) => {
     const el = $(element);
-    // Ignorer les images du mega menu Chanel (classe js-megamenu-image)
     if (el.hasClass("js-megamenu-image")) return;
     const src = el.attr("src") || el.attr("data-src") || el.attr("data-lazy-src") || el.attr("data-original");
     if (src) {
@@ -1040,7 +1154,6 @@ function extractFromHtmlContent(html, url) {
   // source elements (picture)
   $("source").toArray().forEach((element) => {
     const el = $(element);
-    // Ignorer les sources du mega menu Chanel
     if (el.hasClass("js-megamenu-image")) return;
     const srcsetValues = [el.attr("srcset"), el.attr("data-srcset"), el.attr("data-src")].filter(Boolean);
     for (const srcset of srcsetValues) {
@@ -1087,20 +1200,15 @@ function extractFromHtmlContent(html, url) {
   });
 
   // ── GALERIE ORDONNÉE ─────────────────────────────────────────────────────────
-  // Tente d'extraire la galerie produit dans l'ordre DOM exact du site.
-  // Si trouvée (>= 2 images), elle prime sur le tri par score.
   const orderedGallery = extractOrderedGallery($, url);
 
   let finalImages;
   if (orderedGallery.length >= 2) {
-    // Galerie ordonnée trouvée → on l'utilise comme base dans l'ordre du site
-    // On complète avec les autres candidats scorés si on n'a pas encore MAX_IMAGE_RESULTS
     const galleryKeys = new Set(orderedGallery.map(createImageDedupKey));
     const extras = dedupeImagesByScore(imageCandidates)
       .filter((imgUrl) => !galleryKeys.has(createImageDedupKey(imgUrl)));
     finalImages = [...orderedGallery, ...extras].slice(0, MAX_IMAGE_RESULTS);
   } else {
-    // Pas de galerie claire → fallback tri par score (comportement original)
     finalImages = dedupeImagesByScore(imageCandidates).slice(0, MAX_IMAGE_RESULTS);
   }
 
@@ -1124,8 +1232,6 @@ function extractFromHtmlContent(html, url) {
 function isValidResult(result) {
   if (!result || !result.title) return false;
   if (!Array.isArray(result.images) || result.images.length === 0) return false;
-  // Vérifie qu'au moins une image est valide et non marketing
-  // Accepte les URLs sans extension (CDN Contentful, Cloudinary, Imgix avec fm=jpg)
   const hasValidImage = result.images.some((img) => {
     const url = typeof img === 'string' ? img : img?.url;
     if (!url) return false;
@@ -1326,8 +1432,6 @@ async function runStage3(url) {
 }
 
 // ─── DOMAINES NON SUPPORTÉS ─────────────────────────────────────────────────
-// Ces sites chargent leurs images produit en JS dynamique et ne peuvent pas
-// être scrapés correctement. On retourne false directement.
 const UNSUPPORTED_DOMAINS = [
   "chanel.com",
 ];
@@ -1344,7 +1448,7 @@ function isUnsupportedDomain(url) {
 async function scrapeWithStages(url) {
   if (!url) throw new Error("URL is required");
   const requestStart = performance.now();
-  const steps = { stage1: "skipped", stage3: "skipped" };
+  const steps = { shopify_api: "skipped", stage1: "skipped", stage3: "skipped" };
 
   // Vérifier si le domaine est supporté
   if (isUnsupportedDomain(url)) {
@@ -1361,8 +1465,9 @@ async function scrapeWithStages(url) {
       title: null,
       price: null,
       timestamp: new Date().toISOString(),
-      steps: { stage1: "skipped", stage3: "skipped" },
+      steps: { shopify_api: "skipped", stage1: "skipped", stage3: "skipped" },
       stages: {
+        shopify_api: { attempted: false, status: "skipped", ok: false, error: "unsupported_domain", blocked: false, durationSeconds: null, meta: null },
         stage1: { attempted: false, status: "skipped", ok: false, error: "unsupported_domain", blocked: false, durationSeconds: null, meta: null },
         stage3: { attempted: false, status: "skipped", ok: false, error: null, blocked: false, durationSeconds: null, meta: { brightDataUsed: false } },
       },
@@ -1413,6 +1518,45 @@ async function scrapeWithStages(url) {
     return { attempted, status, ok, error, blocked, durationSeconds, meta };
   };
 
+  // ── STAGE 0 : Shopify API ──────────────────────────────────────────────────
+  // Tentative rapide via l'API JSON native Shopify avant tout scraping DOM.
+  // Ne coûte rien, < 1s, retourne les vraies images dans le bon ordre.
+  let shopifyResult = null;
+  let shopifyAttempted = false;
+  const shopifyHandle = extractShopifyHandle(url);
+  if (shopifyHandle) {
+    shopifyAttempted = true;
+    shopifyResult = await runShopifyApi(url);
+    steps.shopify_api = resolveStageStatus(shopifyResult, true, false);
+    if (shopifyResult?.ok) {
+      const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
+      const logEntry = {
+        event: "SCRAPE",
+        url,
+        stage: "shopify_api",
+        ok: true,
+        blocked: false,
+        duration: durationSeconds,
+        imagesCount: Array.isArray(shopifyResult?.images) ? shopifyResult.images.length : 0,
+        images: Array.isArray(shopifyResult?.images) ? shopifyResult.images.map(img => {
+          try { return new URL(img.url).pathname.split("/").pop().substring(0, 80); } catch { return img.url.substring(0, 80); }
+        }) : [],
+        title: shopifyResult?.title || null,
+        price: shopifyResult?.price || null,
+        timestamp: new Date().toISOString(),
+        steps,
+        stages: {
+          shopify_api: buildStageLog("shopify_api", shopifyResult, true),
+          stage1: buildStageLog("stage1", null, false),
+          stage3: buildStageLog("stage3", null, false),
+        },
+      };
+      console.log(JSON.stringify(logEntry));
+      return shopifyResult;
+    }
+  }
+
+  // ── STAGE 1 : Puppeteer ────────────────────────────────────────────────────
   const stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
   steps.stage1 = resolveStageStatus(stage1Result, true, false);
   let finalResult = null;
@@ -1422,6 +1566,7 @@ async function scrapeWithStages(url) {
     finalResult = stage1Result;
   }
 
+  // ── STAGE 3 : BrightData ───────────────────────────────────────────────────
   let stage3Result = null;
   let stage3Attempted = false;
   if (!finalResult) {
@@ -1477,6 +1622,7 @@ async function scrapeWithStages(url) {
     timestamp: new Date().toISOString(),
     steps,
     stages: {
+      shopify_api: buildStageLog("shopify_api", shopifyResult, shopifyAttempted),
       stage1: buildStageLog("stage1", stage1Result, true),
       stage3: buildStageLog("stage3", stage3Result, stage3Attempted),
     },
@@ -1484,6 +1630,7 @@ async function scrapeWithStages(url) {
 
   if (!finalResult.ok) {
     logEntry.errors = {
+      shopify_api: shopifyResult?.error || null,
       stage1: stage1Result?.error || null,
       stage3: stage3Result?.error || null,
     };
