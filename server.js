@@ -696,8 +696,8 @@ function extractDimensionsFromUrl(url) {
   let height = null;
   try {
     const parsed = new URL(url);
-    const widthKeys = ["w", "width", "wid", "rw", "mw", "scalewidth"];
-    const heightKeys = ["h", "height", "hei", "rh", "mh", "scaleheight"];
+    const widthKeys = ["w", "width", "wid", "rw", "mw", "scalewidth", "sw"];
+    const heightKeys = ["h", "height", "hei", "rh", "mh", "scaleheight", "sh"];
     for (const key of widthKeys) {
       const candidate = parseDimension(parsed.searchParams.get(key));
       if (candidate) { width = candidate; break; }
