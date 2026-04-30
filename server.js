@@ -313,6 +313,7 @@ async function runShopifyApi(url) {
     // Prix depuis la première variant — retourné tel quel, sans conversion de devise
     const variant = product.variants?.[0];
     const rawPrice = variant?.price ? `${variant.price}` : null;
+    console.log(JSON.stringify({ event: "SHOPIFY_PRICE_DEBUG", url, rawPrice, presentmentPrices: variant?.presentment_prices?.length || 0 }));
     const price = rawPrice ? formatPriceNumber(parseNumericPrice(rawPrice)) : null;
 
     // Images — exactement dans l'ordre Shopify admin, sans filtre marketing
