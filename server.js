@@ -914,7 +914,7 @@ function normalizePriceOutput(value, currencyHints = []) {
     }
   }
   const detectedCurrency = detectCurrencyFromText(value, currencyHints);
-  if (detectedCurrency === "USD") amount *= getUsdToEurRate();
+  // Pas de conversion de devise — on retourne le prix tel qu'affiché sur le site
   return formatPriceNumber(amount);
 }
 
