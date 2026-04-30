@@ -1527,6 +1527,7 @@ async function scrapeWithStages(url) {
   if (shopifyHandle) {
     shopifyAttempted = true;
     shopifyResult = await runShopifyApi(url);
+    console.log(JSON.stringify({ event: "SHOPIFY_API_DEBUG", url, ok: shopifyResult?.ok, error: shopifyResult?.error, stage: shopifyResult?.stage }));
     steps.shopify_api = resolveStageStatus(shopifyResult, true, false);
     if (shopifyResult?.ok) {
       const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
