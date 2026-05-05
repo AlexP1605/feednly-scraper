@@ -310,10 +310,18 @@ async function runShopifyApi(url) {
       ? cheerio.load(product.body_html).text().replace(/\s+/g, " ").trim().slice(0, 300) || null
       : null;
 
-    // Prix : on ne retourne pas le prix depuis l'API Shopify car elle retourne
-    // toujours la devise de base du shop (ex: GBP) indépendamment de la locale URL.
-    // Le prix affiché sur la page peut être dans une devise différente (ex: NZD).
-    const price = null;
+    // Prix depuis la première variant — retourné tel quel sans conversion
+    // sauf pour USD qui est converti en EUR
+    const variant = product.variants?.[0];
+    const rawPrice = variant?.price ? `${variant.price}` : null;
+    const localeCurrency = detectCurrencyFromShopifyLocale(url);
+    let price = null;
+    if (rawPrice) {
+      const amount = parseNumericPrice(rawPrice);
+      if (amount !== null) {
+        price = formatPriceNumber(amount);
+      }
+    }
 
     // Images — exactement dans l'ordre Shopify admin, sans filtre marketing
     const images = (product.images || [])
