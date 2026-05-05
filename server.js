@@ -962,6 +962,10 @@ function extractOrderedGallery($, pageUrl) {
       const normalized = normalizeUrl(src, pageUrl);
       if (!normalized || !isValidImageUrl(normalized)) continue;
 
+      // Exclure les images marketing même dans la galerie ordonnée
+      const isMarketing = MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
+      if (isMarketing) continue;
+
       const score = computeImagePriorityScore(normalized, SOURCE_PRIORITY.dom_strong);
       if (score === -Infinity) continue;
 
