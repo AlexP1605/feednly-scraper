@@ -898,8 +898,7 @@ function detectCurrencyFromText(value, currencyHints = []) {
 function formatPriceNumber(value) {
   if (!Number.isFinite(value)) return null;
   const rounded = Math.round(value * 100) / 100;
-  const fixed = rounded.toFixed(2);
-  return fixed.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  return rounded.toFixed(2);
 }
 
 function normalizePriceOutput(value, currencyHints = []) {
