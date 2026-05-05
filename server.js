@@ -179,6 +179,8 @@ const MARKETING_URL_PATTERNS = [
   /ONE_MegaMenu/i,
   /PUSH_megaMenu/i,
   /puls-img\.chanel\.com/i,
+  // Navigation images
+  /[-_\/]nav[-_]/i,
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
