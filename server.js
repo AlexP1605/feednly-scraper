@@ -1451,6 +1451,40 @@ function isUnsupportedDomain(url) {
   }
 }
 
+// ─── DOMAINES QUI FORCENT BRIGHTDATA (skip stage1) ───────────────────────────
+// Ces sites chargent leurs images en JS dynamique — Puppeteer ne les voit pas.
+// On skip stage1 et on va directement en BrightData.
+const BRIGHTDATA_FORCED_DOMAINS = [
+  // Groupe L'Oréal — même plateforme, même CDN /media/project/loreal/
+  "maybelline.fr",
+  "maybelline.com",
+  "loreal-paris.fr",
+  "loreal-paris.com",
+  "garnier.fr",
+  "garnier.com",
+  "nyxcosmetics.fr",
+  "nyxcosmetics.com",
+  "lancome.fr",
+  "lancome.com",
+  "armanibeauty.fr",
+  "armanibeauty.com",
+  "kiehls.fr",
+  "kiehls.com",
+  "urbandecay.fr",
+  "urbandecay.com",
+  "yslbeauty.fr",
+  "yslbeauty.com",
+];
+
+function isBrightDataForcedDomain(url) {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return BRIGHTDATA_FORCED_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
 async function scrapeWithStages(url) {
   if (!url) throw new Error("URL is required");
   const requestStart = performance.now();
@@ -1527,6 +1561,9 @@ async function scrapeWithStages(url) {
   // ── STAGE 0 : Shopify API ──────────────────────────────────────────────────
   // Tentative rapide via l'API JSON native Shopify avant tout scraping DOM.
   // Ne coûte rien, < 1s, retourne les vraies images dans le bon ordre.
+  // Si le domaine force BrightData, on skip stage1 mais on tente quand même Shopify API.
+  const forceBrightData = isBrightDataForcedDomain(url);
+
   let shopifyResult = null;
   let shopifyAttempted = false;
   const shopifyHandle = extractShopifyHandle(url);
@@ -1564,8 +1601,11 @@ async function scrapeWithStages(url) {
   }
 
   // ── STAGE 1 : Puppeteer ────────────────────────────────────────────────────
-  const stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
-  steps.stage1 = resolveStageStatus(stage1Result, true, false);
+  // Skip stage1 pour les domaines qui forcent BrightData (JS dynamique)
+  const stage1Result = forceBrightData
+    ? { ok: false, stage: "stage1", error: "Skipped: BrightData forced domain" }
+    : await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
+  steps.stage1 = forceBrightData ? "skipped" : resolveStageStatus(stage1Result, true, false);
   let finalResult = null;
   let finalStage = stage1Result?.meta?.stage || "stage1";
 
@@ -1574,9 +1614,10 @@ async function scrapeWithStages(url) {
   }
 
   // ── STAGE 3 : BrightData ───────────────────────────────────────────────────
+  // Toujours tenté si pas de résultat, ou forcé pour certains domaines
   let stage3Result = null;
   let stage3Attempted = false;
-  if (!finalResult) {
+  if (!finalResult || forceBrightData) {
     stage3Attempted = true;
     stage3Result = await runStageWithHardTimeout("stage3", STAGE3_HARD_TIMEOUT_MS, () => runStage3(url));
     if (stage3Result?.ok) {
