@@ -1440,6 +1440,8 @@ async function runStage3(url) {
 // ─── DOMAINES NON SUPPORTÉS ─────────────────────────────────────────────────
 const UNSUPPORTED_DOMAINS = [
   "chanel.com",
+  "maybelline.fr",
+  "maybelline.com",
 ];
 
 function isUnsupportedDomain(url) {
@@ -1455,25 +1457,7 @@ function isUnsupportedDomain(url) {
 // Ces sites chargent leurs images en JS dynamique — Puppeteer ne les voit pas.
 // On skip stage1 et on va directement en BrightData.
 const BRIGHTDATA_FORCED_DOMAINS = [
-  // Groupe L'Oréal — même plateforme, même CDN /media/project/loreal/
-  "maybelline.fr",
-  "maybelline.com",
-  "loreal-paris.fr",
-  "loreal-paris.com",
-  "garnier.fr",
-  "garnier.com",
-  "nyxcosmetics.fr",
-  "nyxcosmetics.com",
-  "lancome.fr",
-  "lancome.com",
-  "armanibeauty.fr",
-  "armanibeauty.com",
-  "kiehls.fr",
-  "kiehls.com",
-  "urbandecay.fr",
-  "urbandecay.com",
-  "yslbeauty.fr",
-  "yslbeauty.com",
+  // Aucun domaine pour l'instant — à compléter si besoin
 ];
 
 function isBrightDataForcedDomain(url) {
