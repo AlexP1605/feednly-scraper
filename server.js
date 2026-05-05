@@ -1176,6 +1176,26 @@ function extractFromHtmlContent(html, url) {
     const type = $(element).attr("type") || "";
     if (type === "application/ld+json") return;
 
+    // Shopify price patterns dans les scripts embarqués
+    // Shopify stocke les prix en centimes (3800 = 38.00)
+    if (scriptContent.includes("Shopify") || scriptContent.includes("shopify")) {
+      const shopifyPricePattern = /"price"\s*:\s*(\d+)/g;
+      let priceMatch;
+      while ((priceMatch = shopifyPricePattern.exec(scriptContent)) !== null) {
+        const rawVal = priceMatch[1];
+        if (!rawVal) continue;
+        const numVal = parseNumericPrice(rawVal);
+        if (numVal !== null && numVal > 0) {
+          // Shopify stocke en centimes si valeur entière > 100
+          if (Number.isInteger(numVal) && numVal > 100) {
+            pushPriceValue(`${(numVal / 100).toFixed(2)}`);
+          } else {
+            pushPriceValue(rawVal);
+          }
+        }
+      }
+    }
+
     const imageUrlPattern = /["']((https?:)?\/\/[^"'\s,]+\.(?:jpe?g|png|webp|avif)[^"'\s,]*?)["']/gi;
     let match;
     while ((match = imageUrlPattern.exec(scriptContent)) !== null) {
