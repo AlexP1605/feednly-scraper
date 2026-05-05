@@ -1567,7 +1567,7 @@ async function scrapeWithStages(url) {
     shopifyResult = await runShopifyApi(url);
     console.log(JSON.stringify({ event: "SHOPIFY_API_DEBUG", url, ok: shopifyResult?.ok, error: shopifyResult?.error, stage: shopifyResult?.stage }));
     steps.shopify_api = resolveStageStatus(shopifyResult, true, false);
-    if (shopifyResult?.ok) {
+    if (shopifyResult?.ok && (shopifyResult?.images?.length ?? 0) >= 3) {
       const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
       const logEntry = {
         event: "SCRAPE",
@@ -1605,7 +1605,24 @@ async function scrapeWithStages(url) {
   let finalStage = stage1Result?.meta?.stage || "stage1";
 
   if (stage1Result?.ok) {
-    finalResult = stage1Result;
+    if (shopifyResult?.ok) {
+      // Fusion : on combine les images des deux sources (dédupliquées)
+      // Shopify en priorité pour titre/prix/description
+      const shopifyImageUrls = new Set(
+        (shopifyResult.images || []).map(img => img.url).filter(Boolean)
+      );
+      const stage1Images = (stage1Result.images || []).filter(img => !shopifyImageUrls.has(img.url));
+      const mergedImages = [...(shopifyResult.images || []), ...stage1Images].slice(0, MAX_IMAGE_RESULTS);
+      finalResult = {
+        ...stage1Result,
+        images: mergedImages,
+        title: shopifyResult.title || stage1Result.title,
+        price: shopifyResult.price || stage1Result.price,
+        description: shopifyResult.description || stage1Result.description,
+      };
+    } else {
+      finalResult = stage1Result;
+    }
   }
 
   // ── STAGE 3 : BrightData ───────────────────────────────────────────────────
