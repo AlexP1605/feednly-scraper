@@ -1177,22 +1177,13 @@ function extractFromHtmlContent(html, url) {
     if (type === "application/ld+json") return;
 
     // Shopify price patterns dans les scripts embarqués
-    // Shopify stocke les prix en centimes (3800 = 38.00)
+    // Cherche "price": <valeur> dans les scripts Shopify et l'ajoute comme candidat
     if (scriptContent.includes("Shopify") || scriptContent.includes("shopify")) {
-      const shopifyPricePattern = /"price"\s*:\s*(\d+)/g;
+      const shopifyPricePattern = /"price"\s*:\s*(\d+(?:\.\d+)?)/g;
       let priceMatch;
       while ((priceMatch = shopifyPricePattern.exec(scriptContent)) !== null) {
         const rawVal = priceMatch[1];
-        if (!rawVal) continue;
-        const numVal = parseNumericPrice(rawVal);
-        if (numVal !== null && numVal > 0) {
-          // Shopify stocke en centimes si valeur entière > 100
-          if (Number.isInteger(numVal) && numVal > 100) {
-            pushPriceValue(`${(numVal / 100).toFixed(2)}`);
-          } else {
-            pushPriceValue(rawVal);
-          }
-        }
+        if (rawVal) pushPriceValue(rawVal);
       }
     }
 
