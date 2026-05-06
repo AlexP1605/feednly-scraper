@@ -181,6 +181,8 @@ const MARKETING_URL_PATTERNS = [
   /puls-img\.chanel\.com/i,
   // Navigation images
   /[-_\/]nav[-_]/i,
+  // Images format desktop editorial (pas des images produit)
+  /[-_]Desktop\./i,
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
@@ -292,15 +294,32 @@ async function runShopifyApi(url) {
   const stageStart = performance.now();
   try {
     const parsed = new URL(url);
-    const apiUrl = `${parsed.protocol}//${parsed.hostname}/products/${handle}.json`;
 
-    const response = await axios.get(apiUrl, {
-      timeout: 10000,
-      headers: {
-        "User-Agent": pickUserAgent(),
-        "Accept": "application/json",
-      },
-    });
+    // Génère plusieurs handles à essayer :
+    // 1. Le handle original (ex: the-minimalist-eu)
+    // 2. Sans suffixe de région (-eu, -uk, -us, -fr, -de, -ca, -au)
+    // 3. Sans locale dans le path (/fr-fr/, /en-gb/ etc.)
+    const handlesToTry = new Set([handle]);
+    const handleWithoutRegion = handle.replace(/-(?:eu|uk|us|fr|de|ca|au|nz|jp|kr|sg|hk|ch|se|dk|no|be|nl|it|es|pt|pl|br|mx)$/i, "");
+    if (handleWithoutRegion !== handle) handlesToTry.add(handleWithoutRegion);
+
+    let response = null;
+    let usedHandle = handle;
+    for (const h of handlesToTry) {
+      try {
+        const apiUrl = `${parsed.protocol}//${parsed.hostname}/products/${h}.json`;
+        response = await axios.get(apiUrl, {
+          timeout: 10000,
+          headers: { "User-Agent": pickUserAgent(), "Accept": "application/json" },
+        });
+        usedHandle = h;
+        break;
+      } catch (err) {
+        if (err?.response?.status === 404) continue;
+        throw err;
+      }
+    }
+    if (!response) throw Object.assign(new Error("Not found"), { response: { status: 404 } });
 
     const product = response.data?.product;
     if (!product) return { ok: false, stage: "shopify_api", error: "No product in response" };
@@ -618,6 +637,9 @@ function isValidImageUrl(url) {
   if (/library-sites/i.test(lower)) return false;
   if (/fid\.(gif|png|jpg|webp)|loyalty|mysephora.*fid|blackfid|goldfid|bronzefid/i.test(lower)) return false;
   if (/img\.youtube\.com|i\.ytimg\.com|vumbnail\.com|vimeo\.com\/video/i.test(lower)) return false;
+
+  // CDN Paula's Choice — URLs sans extension reconnues comme images
+  if (/paulaschoice-eu\.com/i.test(lower)) return true;
   if (/media_thumbnail|[-_]thumbnail[-_\d]/i.test(lower)) return false;
 
   if (!/\.(jpe?g|png|webp|avif)(?:$|\?|&)/i.test(lower) && !/\/(image|photo|picture|img)\//i.test(lower)) {
@@ -1267,7 +1289,8 @@ function isValidResult(result) {
       /\/media\//i.test(url) ||
       /ctfassets\.net/i.test(url) ||
       /cloudinary\.com/i.test(url) ||
-      /imgix\.net/i.test(url);
+      /imgix\.net/i.test(url) ||
+      /paulaschoice-eu\.com/i.test(url);
     if (!looksLikeImage) return false;
     return !MARKETING_URL_PATTERNS.some((p) => p.test(url));
   });
