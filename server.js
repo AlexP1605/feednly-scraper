@@ -1502,6 +1502,7 @@ const UNSUPPORTED_DOMAINS = [
   "chanel.com",
   "maybelline.fr",
   "maybelline.com",
+  "guerlain.com",
 ];
 
 function isUnsupportedDomain(url) {
