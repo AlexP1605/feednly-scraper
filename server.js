@@ -193,6 +193,8 @@ const MARKETING_URL_PATTERNS = [
   // Lancôme navigation / merchandising
   /[\/\-_]Menu_/i,
   /Merch[-_]/i,
+  // Guerlain swatches de couleur
+  /_csw\./i,
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
