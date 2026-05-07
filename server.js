@@ -805,7 +805,9 @@ function createImageDedupKey(url) {
       for (const value of values) normalizedSearch.append(key.toLowerCase(), value);
     }
     const normalizedQuery = normalizedSearch.toString();
-    const fullKey = `${parsed.hostname}${parsed.pathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
+    // Normalise les hash de cache Demandware/Salesforce (/dw6174e84c/ etc.)
+    const normalizedPathname = parsed.pathname.replace(/\/dw[a-f0-9]{8,}\//gi, "/dw_cache/");
+    const fullKey = `${parsed.hostname}${normalizedPathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
     const filename = parsed.pathname.split("/").pop() || "";
     const isSignificantFilename = filename.length > 15 && /\.(jpe?g|png|webp|avif)/i.test(filename);
     if (isSignificantFilename) {
