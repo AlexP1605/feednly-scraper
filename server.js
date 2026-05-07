@@ -1017,14 +1017,31 @@ function extractFromHtmlContent(html, url) {
     $("meta[name='twitter:title']").attr("content") ||
     $("meta[name='title']").attr("content") || null;
   const domTitle = $("h1").first().text().trim() || $("title").first().text().trim() || null;
-  const title = metaTitle || domTitle || null;
+  const title = (metaTitle || domTitle || null)
+    ? (metaTitle || domTitle).replace(/[
+	]+/g, " ").replace(/  +/g, " ").trim()
+    : null;
 
   // ── Description ──
-  const description =
+  const rawDescription =
     $("meta[property='og:description']").attr("content") ||
     $("meta[name='description']").attr("content") ||
     $("meta[name='twitter:description']").attr("content") ||
     $("p").toArray().map((el) => $(el).text().trim()).find((text) => text.length > 60) || null;
+  // Normalise la description : max 1 saut de ligne, pas d'espaces multiples
+  const description = rawDescription
+    ? rawDescription
+        .replace(/
+/g, "
+")
+        .replace(//g, "
+")
+        .replace(/
+{2,}/g, "
+")
+        .replace(/[ 	]+/g, " ")
+        .trim()
+    : null;
 
   // ── Price ──
   const priceValues = [];
