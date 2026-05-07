@@ -183,6 +183,13 @@ const MARKETING_URL_PATTERNS = [
   /[-_\/]nav[-_]/i,
   // Images format desktop editorial (pas des images produit)
   /[-_]Desktop\./i,
+  // Givenchy / marketing
+  /[-_]PDM\b/i,
+  /PUSHMENU/i,
+  /PUSH.MENU/i,
+  /MOTHERSDAY/i,
+  // Tutorial step-by-step
+  /step.?by.?step/i,
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
