@@ -190,6 +190,9 @@ const MARKETING_URL_PATTERNS = [
   /MOTHERSDAY/i,
   // Tutorial step-by-step
   /step.?by.?step/i,
+  // Lancôme navigation / merchandising
+  /[\/\-_]Menu_/i,
+  /Merch[-_]/i,
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
