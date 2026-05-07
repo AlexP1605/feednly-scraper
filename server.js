@@ -1018,29 +1018,17 @@ function extractFromHtmlContent(html, url) {
     $("meta[name='title']").attr("content") || null;
   const domTitle = $("h1").first().text().trim() || $("title").first().text().trim() || null;
   const title = (metaTitle || domTitle || null)
-    ? (metaTitle || domTitle).replace(/[
-	]+/g, " ").replace(/  +/g, " ").trim()
+    ? (metaTitle || domTitle).replace(/\s+/g, " ").trim()
     : null;
 
   // ── Description ──
-  const rawDescription =
+  const rawDesc =
     $("meta[property='og:description']").attr("content") ||
     $("meta[name='description']").attr("content") ||
     $("meta[name='twitter:description']").attr("content") ||
     $("p").toArray().map((el) => $(el).text().trim()).find((text) => text.length > 60) || null;
-  // Normalise la description : max 1 saut de ligne, pas d'espaces multiples
-  const description = rawDescription
-    ? rawDescription
-        .replace(/
-/g, "
-")
-        .replace(//g, "
-")
-        .replace(/
-{2,}/g, "
-")
-        .replace(/[ 	]+/g, " ")
-        .trim()
+  const description = rawDesc
+    ? rawDesc.replace(/\n{2,}/g, "\n").replace(/[ \t]+/g, " ").trim()
     : null;
 
   // ── Price ──
