@@ -795,6 +795,7 @@ function createImageDedupKey(url) {
       "ts", "timestamp", "cache", "v", "ver", "version", "cb", "t",
       "c", "f", "g",
       "bgcolor", "bg", "pad",
+      "sfrm", "strip", "sm",
     ]);
 
     const normalizedSearch = new URLSearchParams();
