@@ -25,7 +25,6 @@ const NAVIGATION_TIMEOUT = Math.max(
 );
 const STAGE1_HARD_TIMEOUT_MS = 15000;
 const STAGE3_HARD_TIMEOUT_MS = 30000;
-const STAGE3_MAX_RETRIES = 2;
 
 const HUMAN_DELAY_RANGE = [400, 800];
 
@@ -1022,7 +1021,8 @@ function extractOrderedGallery($, pageUrl) {
       const normalized = normalizeUrl(src, pageUrl);
       if (!normalized || !isValidImageUrl(normalized)) continue;
 
-      const isMarketing = MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
+      const isSephoraPim = /media\.sephora\.eu.*\/pim\/published/i.test(normalized);
+      const isMarketing = !isSephoraPim && MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
       if (isMarketing) continue;
 
       const score = computeImagePriorityScore(normalized, SOURCE_PRIORITY.dom_strong);
@@ -1291,7 +1291,8 @@ function extractFromHtmlContent(html, url) {
       if (!isValidImageUrl(normalized)) continue;
 
       const isStrong = STRONG_PRODUCT_URL_PATTERNS.some((p) => p.test(normalized));
-      const isMarketing = MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
+      const isSephoraPim = /media\.sephora\.eu.*\/pim\/published/i.test(normalized);
+      const isMarketing = !isSephoraPim && MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
       if (isMarketing) continue;
 
       const scriptId = $(element).attr("id") || "";
@@ -1359,7 +1360,8 @@ function isValidResult(result) {
       /paulaschoice-eu\.com/i.test(url) ||
       /media\.sephora\.eu/i.test(url); // ✅ PATCH
     if (!looksLikeImage) return false;
-    return !MARKETING_URL_PATTERNS.some((p) => p.test(url));
+    const isSephoraPim = /media\.sephora\.eu.*\/pim\/published/i.test(url);
+    return isSephoraPim || !MARKETING_URL_PATTERNS.some((p) => p.test(url));
   });
   return hasValidImage;
 }
@@ -1805,7 +1807,7 @@ async function scrapeWithStages(url) {
         steps,
         stages: {
           shopify_api: buildStageLog("shopify_api", shopifyResult, true),
-          stage0: buildStageLog("stage0", stage0Result, stage0Attempted),
+          stage0: buildStageLog("stage0", null, false),
           stage1: buildStageLog("stage1", null, false),
           stage3: buildStageLog("stage3", null, false),
           stage4: buildStageLog("stage4", null, false),
@@ -1861,23 +1863,16 @@ async function scrapeWithStages(url) {
     steps.stage1 = "skipped";
   }
 
-  // ── STAGE 3 : BrightData (avec retry) ───────────────────────────────────
+  // ── STAGE 3 : BrightData Web Unlocker (une seule tentative) ────────────────
   let stage3Result = null;
   let stage3Attempted = false;
   if (!finalResult) {
     stage3Attempted = true;
-    for (let attempt = 1; attempt <= STAGE3_MAX_RETRIES; attempt++) {
-      console.log(JSON.stringify({ event: "STAGE3_ATTEMPT", attempt, maxAttempts: STAGE3_MAX_RETRIES, url }));
-      stage3Result = await runStageWithHardTimeout("stage3", STAGE3_HARD_TIMEOUT_MS, () => runStage3(url));
-      if (stage3Result?.ok) {
-        finalResult = stage3Result;
-        finalStage = stage3Result?.meta?.stage || "brightdata";
-        break;
-      }
-      if (attempt < STAGE3_MAX_RETRIES) {
-        console.log(JSON.stringify({ event: "STAGE3_RETRY", attempt, error: stage3Result?.error, url }));
-        await new Promise(r => setTimeout(r, 2000)); // pause 2s avant retry
-      }
+    console.log(JSON.stringify({ event: "STAGE3_ATTEMPT", url }));
+    stage3Result = await runStageWithHardTimeout("stage3", STAGE3_HARD_TIMEOUT_MS, () => runStage3(url));
+    if (stage3Result?.ok) {
+      finalResult = stage3Result;
+      finalStage = stage3Result?.meta?.stage || "brightdata";
     }
   }
   steps.stage3 = resolveStageStatus(stage3Result, stage3Attempted, true);
