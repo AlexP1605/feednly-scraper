@@ -23,8 +23,9 @@ const NAVIGATION_TIMEOUT = Math.max(
   5000,
   Number.parseInt(process.env.SCRAPER_NAVIGATION_TIMEOUT_MS || "40000", 10) || 40000
 );
-const STAGE1_HARD_TIMEOUT_MS = 40000;
+const STAGE1_HARD_TIMEOUT_MS = 15000;
 const STAGE3_HARD_TIMEOUT_MS = 30000;
+const STAGE3_MAX_RETRIES = 2;
 
 const HUMAN_DELAY_RANGE = [400, 800];
 
@@ -1488,6 +1489,52 @@ async function runStage1(url) {
   return { ok: false, stage: "stage1", error: lastErrorMessage || lastError?.message || "Stage1 failed" };
 }
 
+// ─── STAGE 0 : fetch HTTP simple (gratuit, ~1-2s) ───────────────────────────
+// Fonctionne sur les sites SSR (Next.js, Nuxt) qui envoient le HTML complet
+// sans JavaScript. Sephora utilise Next.js SSR → bonne chance de succès.
+async function runStage0(url) {
+  const stageStart = performance.now();
+  try {
+    const ua = pickUserAgent();
+    const response = await axios.get(url, {
+      timeout: 5000,
+      responseType: "text",
+      headers: {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+      },
+      maxRedirects: 5,
+    });
+    const html = response.data;
+    if (!html || html.length < 1000) {
+      return { ok: false, stage: "stage0", error: "Response too short" };
+    }
+    if (/<title>.*?access denied.*?<\/title>/i.test(html) || /blocked/i.test(html.substring(0, 500))) {
+      return { ok: false, stage: "stage0", error: "Blocked by server" };
+    }
+    const extracted = extractFromHtmlContent(html, url);
+    if (!isValidResult(extracted)) {
+      return { ok: false, stage: "stage0", error: "Stage0 extraction invalid or incomplete" };
+    }
+    const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
+    return buildSuccessPayload(extracted, {
+      stage: "stage0", fallbackUsed: false, blocked: false,
+      durationSeconds, network: { durationSeconds },
+      userAgent: ua, navigationWaitUntil: "fetch", navigationTimedOut: false,
+    });
+  } catch (err) {
+    const status = err?.response?.status;
+    const message = status
+      ? `Stage0 HTTP ${status}`
+      : `Stage0 fetch failed: ${err?.message || "unknown"}`;
+    return { ok: false, stage: "stage0", error: message };
+  }
+}
+
 async function runStage3(url) {
   const apiKey = process.env.BRIGHTDATA_API_KEY;
   if (!apiKey) return { ok: false, stage: "stage3", error: "BRIGHTDATA_API_KEY missing" };
@@ -1594,10 +1641,74 @@ function isBrightDataForcedDomain(url) {
   }
 }
 
+// ─── STAGE 4 : BrightData Scraping Browser (dernier recours) ────────────────
+// Vrai Chrome hébergé chez BrightData — quasi impossible à bloquer par Akamai.
+// Activé seulement si BRIGHTDATA_SCRAPING_BROWSER_ENDPOINT est défini.
+async function runStage4(url) {
+  const wsEndpoint = process.env.BRIGHTDATA_SCRAPING_BROWSER_ENDPOINT;
+  if (!wsEndpoint) {
+    return { ok: false, stage: "stage4", error: "BRIGHTDATA_SCRAPING_BROWSER_ENDPOINT not configured" };
+  }
+
+  const stageStart = performance.now();
+  let browser = null;
+  try {
+    browser = await puppeteer.connect({
+      browserWSEndpoint: wsEndpoint,
+      defaultViewport: null,
+    });
+
+    const page = await browser.newPage();
+    page.setDefaultTimeout(45000);
+
+    // Headers réalistes
+    await page.setExtraHTTPHeaders({
+      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    });
+
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+    // Attendre que le contenu principal soit chargé
+    await page.waitForSelector("body", { timeout: 10000 }).catch(() => {});
+
+    const html = await page.content();
+    await page.close();
+
+    if (!html || html.length < 1000) {
+      return { ok: false, stage: "stage4", error: "Empty response from Scraping Browser" };
+    }
+
+    const extracted = extractFromHtmlContent(html, url);
+    if (!isValidResult(extracted)) {
+      return { ok: false, stage: "stage4", error: "Stage4 extraction invalid or incomplete" };
+    }
+
+    const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
+    return buildSuccessPayload(extracted, {
+      stage: "scraping_browser",
+      fallbackUsed: true,
+      blocked: false,
+      durationSeconds,
+      network: { durationSeconds },
+      userAgent: "BrightData-ScrapingBrowser",
+      navigationWaitUntil: "domcontentloaded",
+      navigationTimedOut: false,
+    });
+  } catch (err) {
+    const message = err?.message || "Scraping Browser failed";
+    return { ok: false, stage: "stage4", error: message };
+  } finally {
+    if (browser) {
+      try { await browser.disconnect(); } catch {}
+    }
+  }
+}
+
 async function scrapeWithStages(url) {
   if (!url) throw new Error("URL is required");
   const requestStart = performance.now();
-  const steps = { shopify_api: "skipped", stage1: "skipped", stage3: "skipped" };
+  const steps = { shopify_api: "skipped", stage0: "skipped", stage1: "skipped", stage3: "skipped", stage4: "skipped" };
 
   if (isUnsupportedDomain(url)) {
     const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
@@ -1613,9 +1724,10 @@ async function scrapeWithStages(url) {
       title: null,
       price: null,
       timestamp: new Date().toISOString(),
-      steps: { shopify_api: "skipped", stage1: "skipped", stage3: "skipped" },
+      steps: { shopify_api: "skipped", stage0: "skipped", stage1: "skipped", stage3: "skipped" },
       stages: {
         shopify_api: { attempted: false, status: "skipped", ok: false, error: "unsupported_domain", blocked: false, durationSeconds: null, meta: null },
+        stage0: { attempted: false, status: "skipped", ok: false, error: "unsupported_domain", blocked: false, durationSeconds: null, meta: null },
         stage1: { attempted: false, status: "skipped", ok: false, error: "unsupported_domain", blocked: false, durationSeconds: null, meta: null },
         stage3: { attempted: false, status: "skipped", ok: false, error: null, blocked: false, durationSeconds: null, meta: { brightDataUsed: false } },
       },
@@ -1693,8 +1805,10 @@ async function scrapeWithStages(url) {
         steps,
         stages: {
           shopify_api: buildStageLog("shopify_api", shopifyResult, true),
+          stage0: buildStageLog("stage0", stage0Result, stage0Attempted),
           stage1: buildStageLog("stage1", null, false),
           stage3: buildStageLog("stage3", null, false),
+          stage4: buildStageLog("stage4", null, false),
         },
       };
       console.log(JSON.stringify(logEntry));
@@ -1702,41 +1816,85 @@ async function scrapeWithStages(url) {
     }
   }
 
-  const stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
-  steps.stage1 = resolveStageStatus(stage1Result, true, false);
+  // ── STAGE 0 : fetch HTTP simple (gratuit, ~1-2s) ─────────────────────────
+  let stage0Result = null;
+  let stage0Attempted = false;
+  // Tenter stage0 seulement si ce n'est pas un domaine qui force BrightData d'emblée
+  // (on le tente quand même sur Sephora car c'est SSR Next.js)
+  stage0Attempted = true;
+  stage0Result = await runStage0(url);
+  steps.stage0 = resolveStageStatus(stage0Result, true, false);
   let finalResult = null;
-  let finalStage = stage1Result?.meta?.stage || "stage1";
+  let finalStage = "stage0";
 
-  if (stage1Result?.ok) {
-    if (shopifyResult?.ok) {
-      const shopifyImageUrls = new Set(
-        (shopifyResult.images || []).map(img => img.url).filter(Boolean)
-      );
-      const stage1Images = (stage1Result.images || []).filter(img => !shopifyImageUrls.has(img.url));
-      const mergedImages = [...(shopifyResult.images || []), ...stage1Images].slice(0, MAX_IMAGE_RESULTS);
-      finalResult = {
-        ...stage1Result,
-        images: mergedImages,
-        title: shopifyResult.title || stage1Result.title,
-        price: shopifyResult.price || stage1Result.price,
-        description: shopifyResult.description || stage1Result.description,
-      };
-    } else {
-      finalResult = stage1Result;
-    }
+  if (stage0Result?.ok) {
+    finalResult = stage0Result;
+    finalStage = "stage0";
   }
 
+  // ── STAGE 1 : Puppeteer ──────────────────────────────────────────────────
+  let stage1Result = null;
+  if (!finalResult) {
+    stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
+    steps.stage1 = resolveStageStatus(stage1Result, true, false);
+    finalStage = stage1Result?.meta?.stage || "stage1";
+
+    if (stage1Result?.ok) {
+      if (shopifyResult?.ok) {
+        const shopifyImageUrls = new Set(
+          (shopifyResult.images || []).map(img => img.url).filter(Boolean)
+        );
+        const stage1Images = (stage1Result.images || []).filter(img => !shopifyImageUrls.has(img.url));
+        const mergedImages = [...(shopifyResult.images || []), ...stage1Images].slice(0, MAX_IMAGE_RESULTS);
+        finalResult = {
+          ...stage1Result,
+          images: mergedImages,
+          title: shopifyResult.title || stage1Result.title,
+          price: shopifyResult.price || stage1Result.price,
+          description: shopifyResult.description || stage1Result.description,
+        };
+      } else {
+        finalResult = stage1Result;
+      }
+    }
+  } else {
+    steps.stage1 = "skipped";
+  }
+
+  // ── STAGE 3 : BrightData (avec retry) ───────────────────────────────────
   let stage3Result = null;
   let stage3Attempted = false;
   if (!finalResult) {
     stage3Attempted = true;
-    stage3Result = await runStageWithHardTimeout("stage3", STAGE3_HARD_TIMEOUT_MS, () => runStage3(url));
-    if (stage3Result?.ok) {
-      finalResult = stage3Result;
-      finalStage = stage3Result?.meta?.stage || "brightdata";
+    for (let attempt = 1; attempt <= STAGE3_MAX_RETRIES; attempt++) {
+      console.log(JSON.stringify({ event: "STAGE3_ATTEMPT", attempt, maxAttempts: STAGE3_MAX_RETRIES, url }));
+      stage3Result = await runStageWithHardTimeout("stage3", STAGE3_HARD_TIMEOUT_MS, () => runStage3(url));
+      if (stage3Result?.ok) {
+        finalResult = stage3Result;
+        finalStage = stage3Result?.meta?.stage || "brightdata";
+        break;
+      }
+      if (attempt < STAGE3_MAX_RETRIES) {
+        console.log(JSON.stringify({ event: "STAGE3_RETRY", attempt, error: stage3Result?.error, url }));
+        await new Promise(r => setTimeout(r, 2000)); // pause 2s avant retry
+      }
     }
   }
   steps.stage3 = resolveStageStatus(stage3Result, stage3Attempted, true);
+
+  // ── STAGE 4 : BrightData Scraping Browser (dernier recours) ─────────────
+  let stage4Result = null;
+  let stage4Attempted = false;
+  if (!finalResult && process.env.BRIGHTDATA_SCRAPING_BROWSER_ENDPOINT) {
+    stage4Attempted = true;
+    console.log(JSON.stringify({ event: "STAGE4_ATTEMPT", url }));
+    stage4Result = await runStageWithHardTimeout("stage4", 25000, () => runStage4(url));
+    if (stage4Result?.ok) {
+      finalResult = stage4Result;
+      finalStage = stage4Result?.meta?.stage || "scraping_browser";
+    }
+  }
+  steps.stage4 = resolveStageStatus(stage4Result, stage4Attempted, true);
 
   if (!finalResult) {
     finalStage = "failed";
@@ -1782,8 +1940,10 @@ async function scrapeWithStages(url) {
     steps,
     stages: {
       shopify_api: buildStageLog("shopify_api", shopifyResult, shopifyAttempted),
-      stage1: buildStageLog("stage1", stage1Result, true),
+      stage0: buildStageLog("stage0", stage0Result, stage0Attempted),
+      stage1: buildStageLog("stage1", stage1Result, !!stage1Result),
       stage3: buildStageLog("stage3", stage3Result, stage3Attempted),
+      stage4: buildStageLog("stage4", stage4Result, stage4Attempted),
     },
   };
 
