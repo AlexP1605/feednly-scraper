@@ -111,6 +111,7 @@ const STRONG_PRODUCT_URL_PATTERNS = [
   /media[-_]\d+[-_]\d+\./i,
   /\/ecomm\//i,
   /[-_]ecomm[-_]/i,
+  /media\.sephora\.eu.*\/pim\//i, // ✅ PATCH: Sephora PIM images
 ];
 
 const MARKETING_URL_PATTERNS = [
@@ -170,7 +171,6 @@ const MARKETING_URL_PATTERNS = [
   /[-_]xmas[-_]/i,
   /[-_]festive[-_]/i,
   /[-_]20\d{2}(?:0[1-9]|1[0-2])[-_]/i,
-  // Chanel — images mega menu navigation (pas des images produit)
   /MegaMenu/i,
   /megamenu/i,
   /sys-master\/content/i,
@@ -179,22 +179,24 @@ const MARKETING_URL_PATTERNS = [
   /ONE_MegaMenu/i,
   /PUSH_megaMenu/i,
   /puls-img\.chanel\.com/i,
-  // Navigation images
   /[-_\/]nav[-_]/i,
-  // Images format desktop editorial (pas des images produit)
   /[-_]Desktop\./i,
-  // Givenchy / marketing
   /[-_]PDM\b/i,
   /PUSHMENU/i,
   /PUSH.MENU/i,
   /MOTHERSDAY/i,
-  // Tutorial step-by-step
   /step.?by.?step/i,
-  // Lancôme navigation / merchandising
   /[\/\-_]Menu_/i,
   /Merch[-_]/i,
-  // Guerlain swatches de couleur
   /_csw\./i,
+  // ✅ PATCH: Sephora brand corner / editorial images (pas des images produit)
+  /BrandCorner/i,
+  /brand_corner/i,
+  /Library-Sites-SephoraV2/i,
+  /GWP_W\d+/i,           // cadeaux avec achat
+  /dw\/image\/v2.*Library/i,
+  /mysephora.*fid/i,
+  /blackfid|goldfid|bronzefid/i,
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
@@ -212,11 +214,16 @@ const PURE_PRODUCT_URL_PATTERNS = [
   /[-_]\d{1,4}g[-_.]/i,
   /[-_]\d{1,4}oz[-_.]/i,
   /ecomm.*product|product.*ecomm/i,
+  /media\.sephora\.eu.*\/pim\/published/i, // ✅ PATCH: Sephora PIM published
 ];
 
 // ─── GALLERY ORDERED SELECTORS ────────────────────────────────────────────────
 const GALLERY_SELECTORS = [
-  // Shopify Dawn / generic — ajoutés en tête
+  // ✅ PATCH: Sephora spécifique — images dans les li button img (carrousel produit)
+  "li button img[src*='sephora.eu']",
+  "li button img[src*='media.sephora']",
+  "li img[src*='sephora.eu']",
+  // Shopify Dawn / generic
   "[class*='product__media-item'] img",
   "[class*='product-media-container'] img",
   // Charlotte Tilbury
@@ -258,11 +265,6 @@ const GALLERY_SELECTORS = [
 ];
 
 // ─── SHOPIFY API (STAGE 0) ────────────────────────────────────────────────────
-
-/**
- * Extrait le handle produit depuis une URL Shopify.
- * Supporte les locales : /en-nz/products/handle, /products/handle
- */
 function extractShopifyHandle(url) {
   try {
     const parsed = new URL(url);
@@ -273,10 +275,6 @@ function extractShopifyHandle(url) {
   }
 }
 
-/**
- * Détecte la devise depuis la locale dans l'URL Shopify.
- * Ex: /en-nz/ → NZD, /en-gb/ → GBP
- */
 function detectCurrencyFromShopifyLocale(url) {
   const localeMap = {
     "en-nz": "NZD", "en-gb": "GBP", "en-au": "AUD", "en-ca": "CAD",
@@ -294,11 +292,6 @@ function detectCurrencyFromShopifyLocale(url) {
   }
 }
 
-/**
- * Stage 0 : tente de récupérer les données produit via l'API JSON native Shopify.
- * Tous les shops Shopify exposent /products/{handle}.json publiquement.
- * Retourne ok:true avec title + images dans l'ordre Shopify si succès.
- */
 async function runShopifyApi(url) {
   const handle = extractShopifyHandle(url);
   if (!handle) return { ok: false, stage: "shopify_api", error: "Not a Shopify product URL" };
@@ -306,11 +299,6 @@ async function runShopifyApi(url) {
   const stageStart = performance.now();
   try {
     const parsed = new URL(url);
-
-    // Génère plusieurs handles à essayer :
-    // 1. Le handle original (ex: the-minimalist-eu)
-    // 2. Sans suffixe de région (-eu, -uk, -us, -fr, -de, -ca, -au)
-    // 3. Sans locale dans le path (/fr-fr/, /en-gb/ etc.)
     const handlesToTry = new Set([handle]);
     const handleWithoutRegion = handle.replace(/-(?:eu|uk|us|fr|de|ca|au|nz|jp|kr|sg|hk|ch|se|dk|no|be|nl|it|es|pt|pl|br|mx)$/i, "");
     if (handleWithoutRegion !== handle) handlesToTry.add(handleWithoutRegion);
@@ -337,17 +325,12 @@ async function runShopifyApi(url) {
     if (!product) return { ok: false, stage: "shopify_api", error: "No product in response" };
 
     const title = product.title || null;
-
-    // Description : strip HTML du body_html
     const description = product.body_html
       ? cheerio.load(product.body_html).text().replace(/\s+/g, " ").trim().slice(0, 300) || null
       : null;
 
-    // Prix depuis la première variant — retourné tel quel sans conversion
-    // sauf pour USD qui est converti en EUR
     const variant = product.variants?.[0];
     const rawPrice = variant?.price ? `${variant.price}` : null;
-    const localeCurrency = detectCurrencyFromShopifyLocale(url);
     let price = null;
     if (rawPrice) {
       const amount = parseNumericPrice(rawPrice);
@@ -356,7 +339,6 @@ async function runShopifyApi(url) {
       }
     }
 
-    // Images — exactement dans l'ordre Shopify admin, sans filtre marketing
     const images = (product.images || [])
       .map((img) => img.src)
       .filter(Boolean)
@@ -395,7 +377,6 @@ async function runShopifyApi(url) {
 }
 
 // ─── PRICE HELPERS ────────────────────────────────────────────────────────────
-
 function parseNumericPrice(value) {
   if (!value) return null;
   const digits = `${value}`.match(/[\d]/g);
@@ -578,6 +559,21 @@ async function configurePage(page, url, preferredUserAgent) {
   await page.setUserAgent(userAgent);
   await page.setViewport(viewport);
   await page.setJavaScriptEnabled(true);
+
+  // ✅ PATCH: Headers réalistes pour bypasser les anti-bots (Akamai, etc.)
+  await page.setExtraHTTPHeaders({
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "sec-ch-ua": `"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"`,
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+  });
+
   if (typeof page.setDefaultNavigationTimeout === "function") {
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT);
   }
@@ -650,7 +646,10 @@ function isValidImageUrl(url) {
   if (/fid\.(gif|png|jpg|webp)|loyalty|mysephora.*fid|blackfid|goldfid|bronzefid/i.test(lower)) return false;
   if (/img\.youtube\.com|i\.ytimg\.com|vumbnail\.com|vimeo\.com\/video/i.test(lower)) return false;
 
-  // CDN Paula's Choice — URLs sans extension reconnues comme images
+  // ✅ PATCH: Sephora PIM images — toujours valides
+  if (/media\.sephora\.eu.*\/pim\/published/i.test(lower)) return true;
+
+  // CDN Paula's Choice
   if (/paulaschoice-eu\.com/i.test(lower)) return true;
   if (/media_thumbnail|[-_]thumbnail[-_\d]/i.test(lower)) return false;
 
@@ -665,6 +664,11 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
   if (!url) return -Infinity;
 
   let score = sourcePriority;
+
+  // ✅ PATCH: Sephora PIM published — fort bonus
+  if (/media\.sephora\.eu.*\/pim\/published/i.test(url)) {
+    score += 6000;
+  }
 
   for (const pattern of MARKETING_URL_PATTERNS) {
     if (pattern.test(url)) {
@@ -718,7 +722,6 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
 
   if (/packshot|pack[-_]shot/i.test(url)) score += 2000;
 
-  // Favoriser les grandes tailles, pénaliser les petites
   if (/[-_](?:xl|lg|large)(?=[._-]|$)/i.test(url)) score += 500;
   if (/[-_](?:sm|xs|small|thumb|mini)(?=[._-]|$)/i.test(url)) score -= 500;
 
@@ -808,20 +811,19 @@ function createImageDedupKey(url) {
       for (const value of values) normalizedSearch.append(key.toLowerCase(), value);
     }
     const normalizedQuery = normalizedSearch.toString();
-    // Normalise les hash de cache Demandware/Salesforce (/dw6174e84c/ etc.)
     const normalizedPathname = parsed.pathname.replace(/\/dw[a-f0-9]{8,}\//gi, "/dw_cache/");
     const fullKey = `${parsed.hostname}${normalizedPathname}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
     const filename = parsed.pathname.split("/").pop() || "";
     const isSignificantFilename = filename.length > 15 && /\.(jpe?g|png|webp|avif)/i.test(filename);
     if (isSignificantFilename) {
       const filenameNoDims = filename
-        .replace(/_\d{2,4}x\d{2,4}/gi, "")    // _2000x2000
+        .replace(/_\d{2,4}x\d{2,4}/gi, "")
         .replace(/\d{2,4}x\d{2,4}_/gi, "")
         .replace(/-\d{2,4}x\d{2,4}/gi, "")
         .replace(/\d{2,4}x\d{2,4}-/gi, "")
-        .replace(/_\d{3,4}x(?=[._]|$)/gi, "")  // Shopify: _1440x _2000x _300x
-        .replace(/@\d+x(?=[._]|$)/gi, "")       // @2x @3x
-        .replace(/[-_](?:xl|lg|md|sm|xs|large|medium|small|thumb|mini)(?=[._-]|$)/gi, "");  // -sm -lg -large etc
+        .replace(/_\d{3,4}x(?=[._]|$)/gi, "")
+        .replace(/@\d+x(?=[._]|$)/gi, "")
+        .replace(/[-_](?:xl|lg|md|sm|xs|large|medium|small|thumb|mini)(?=[._-]|$)/gi, "");
       return `${parsed.hostname}__file__${filenameNoDims}${normalizedQuery ? `?${normalizedQuery}` : ""}`.toLowerCase();
     }
     return fullKey;
@@ -959,8 +961,6 @@ function normalizePriceOutput(value, currencyHints = []) {
       return sanitized || null;
     }
   }
-  const detectedCurrency = detectCurrencyFromText(value, currencyHints);
-  // Pas de conversion de devise — on retourne le prix tel qu'affiché sur le site
   return formatPriceNumber(amount);
 }
 
@@ -999,7 +999,6 @@ function extractOrderedGallery($, pageUrl) {
       const normalized = normalizeUrl(src, pageUrl);
       if (!normalized || !isValidImageUrl(normalized)) continue;
 
-      // Exclure les images marketing même dans la galerie ordonnée
       const isMarketing = MARKETING_URL_PATTERNS.some((p) => p.test(normalized));
       if (isMarketing) continue;
 
@@ -1100,6 +1099,15 @@ function extractFromHtmlContent(html, url) {
     const score = computeImagePriorityScore(normalized, sourcePriority);
     imageCandidates.push({ url: normalized, score });
   }
+
+  // ✅ PATCH: Sephora — extraire les images depuis les <link rel="preload"> dans le head
+  // Ces liens contiennent les images produit haute résolution préchargées
+  $("link[rel='preload'][as='image']").toArray().forEach((element) => {
+    const href = $(element).attr("href");
+    if (href && /media\.sephora\.eu.*\/pim\/published/i.test(href)) {
+      addCandidate(href, SOURCE_PRIORITY.jsonld_product + 1000); // priorité maximale
+    }
+  });
 
   // PRIORITY 1: JSON-LD structured data
   $("script[type='application/ld+json']").toArray().forEach((element) => {
@@ -1224,14 +1232,21 @@ function extractFromHtmlContent(html, url) {
     const type = $(element).attr("type") || "";
     if (type === "application/ld+json") return;
 
-    // Shopify price patterns dans les scripts embarqués
-    // Cherche "price": <valeur> dans les scripts Shopify et l'ajoute comme candidat
     if (scriptContent.includes("Shopify") || scriptContent.includes("shopify")) {
       const shopifyPricePattern = /"price"\s*:\s*(\d+(?:\.\d+)?)/g;
       let priceMatch;
       while ((priceMatch = shopifyPricePattern.exec(scriptContent)) !== null) {
         const rawVal = priceMatch[1];
         if (rawVal) pushPriceValue(rawVal);
+      }
+    }
+
+    // ✅ PATCH: Sephora — extraire prix depuis JSON embarqué Next.js (__next_f)
+    if (scriptContent.includes("sephora") || scriptContent.includes("Sephora")) {
+      const sephoraPricePattern = /"price"\s*:\s*([\d.]+)/g;
+      let m;
+      while ((m = sephoraPricePattern.exec(scriptContent)) !== null) {
+        if (m[1]) pushPriceValue(m[1] + " EUR");
       }
     }
 
@@ -1310,7 +1325,8 @@ function isValidResult(result) {
       /ctfassets\.net/i.test(url) ||
       /cloudinary\.com/i.test(url) ||
       /imgix\.net/i.test(url) ||
-      /paulaschoice-eu\.com/i.test(url);
+      /paulaschoice-eu\.com/i.test(url) ||
+      /media\.sephora\.eu/i.test(url); // ✅ PATCH
     if (!looksLikeImage) return false;
     return !MARKETING_URL_PATTERNS.some((p) => p.test(url));
   });
@@ -1446,11 +1462,25 @@ async function runStage3(url) {
   const apiKey = process.env.BRIGHTDATA_API_KEY;
   if (!apiKey) return { ok: false, stage: "stage3", error: "BRIGHTDATA_API_KEY missing" };
   const stageStart = performance.now();
+
+  // ✅ PATCH: payload enrichi avec headers browser pour Sephora / Akamai
   const payload = {
     zone: process.env.BRIGHTDATA_ZONE || "web_unlocker1",
     url,
     format: "raw",
+    // Headers browser réalistes pour passer Akamai Bot Manager
+    headers: {
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+      "User-Agent": pickUserAgent(),
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1",
+    },
   };
+
   const headers = {
     Authorization: `Bearer ${process.env.BRIGHTDATA_API_KEY}`,
     "Content-Type": "application/json",
@@ -1514,11 +1544,15 @@ function isUnsupportedDomain(url) {
   }
 }
 
-// ─── DOMAINES QUI FORCENT BRIGHTDATA (skip stage1) ───────────────────────────
-// Ces sites chargent leurs images en JS dynamique — Puppeteer ne les voit pas.
-// On skip stage1 et on va directement en BrightData.
+// ✅ PATCH: Sephora ajouté dans les domaines qui forcent BrightData (JS dynamique + Akamai)
 const BRIGHTDATA_FORCED_DOMAINS = [
-  // Aucun domaine pour l'instant — à compléter si besoin
+  "sephora.fr",
+  "sephora.com",
+  "sephora.es",
+  "sephora.it",
+  "sephora.pl",
+  "sephora.pt",
+  "sephora.cz",
 ];
 
 function isBrightDataForcedDomain(url) {
@@ -1535,7 +1569,6 @@ async function scrapeWithStages(url) {
   const requestStart = performance.now();
   const steps = { shopify_api: "skipped", stage1: "skipped", stage3: "skipped" };
 
-  // Vérifier si le domaine est supporté
   if (isUnsupportedDomain(url)) {
     const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
     const logEntry = {
@@ -1603,12 +1636,6 @@ async function scrapeWithStages(url) {
     return { attempted, status, ok, error, blocked, durationSeconds, meta };
   };
 
-  // ── STAGE 0 : Shopify API ──────────────────────────────────────────────────
-  // Tentative rapide via l'API JSON native Shopify avant tout scraping DOM.
-  // Ne coûte rien, < 1s, retourne les vraies images dans le bon ordre.
-  // Si le domaine force BrightData, on skip stage1 mais on tente quand même Shopify API.
-  const forceBrightData = isBrightDataForcedDomain(url);
-
   let shopifyResult = null;
   let shopifyAttempted = false;
   const shopifyHandle = extractShopifyHandle(url);
@@ -1645,19 +1672,13 @@ async function scrapeWithStages(url) {
     }
   }
 
-  // ── STAGE 1 : Puppeteer ────────────────────────────────────────────────────
-  // Skip stage1 pour les domaines qui forcent BrightData (JS dynamique)
-  const stage1Result = forceBrightData
-    ? { ok: false, stage: "stage1", error: "Skipped: BrightData forced domain" }
-    : await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
-  steps.stage1 = forceBrightData ? "skipped" : resolveStageStatus(stage1Result, true, false);
+  const stage1Result = await runStageWithHardTimeout("stage1", STAGE1_HARD_TIMEOUT_MS, () => runStage1(url));
+  steps.stage1 = resolveStageStatus(stage1Result, true, false);
   let finalResult = null;
   let finalStage = stage1Result?.meta?.stage || "stage1";
 
   if (stage1Result?.ok) {
     if (shopifyResult?.ok) {
-      // Fusion : on combine les images des deux sources (dédupliquées)
-      // Shopify en priorité pour titre/prix/description
       const shopifyImageUrls = new Set(
         (shopifyResult.images || []).map(img => img.url).filter(Boolean)
       );
@@ -1675,11 +1696,9 @@ async function scrapeWithStages(url) {
     }
   }
 
-  // ── STAGE 3 : BrightData ───────────────────────────────────────────────────
-  // Toujours tenté si pas de résultat, ou forcé pour certains domaines
   let stage3Result = null;
   let stage3Attempted = false;
-  if (!finalResult || forceBrightData) {
+  if (!finalResult) {
     stage3Attempted = true;
     stage3Result = await runStageWithHardTimeout("stage3", STAGE3_HARD_TIMEOUT_MS, () => runStage3(url));
     if (stage3Result?.ok) {
