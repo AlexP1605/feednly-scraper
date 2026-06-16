@@ -1663,12 +1663,6 @@ async function runStage4(url) {
     const page = await browser.newPage();
     page.setDefaultTimeout(45000);
 
-    // Headers réalistes
-    await page.setExtraHTTPHeaders({
-      "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    });
-
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
     // Attendre que le contenu principal soit chargé
