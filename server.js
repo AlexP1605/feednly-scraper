@@ -83,6 +83,32 @@ const PRICE_CONTEXT_NEGATIVE_KEYWORDS = [
   "subscription", "abonnement", "support", "service", "plan",
 ];
 
+// Prix unitaires/comparatifs à exclure (100ml, par litre, etc.)
+const UNIT_PRICE_PATTERNS = [
+  /\/\s*100\s*ml/i,
+  /\/\s*100\s*g/i,
+  /\/\s*1\s*l/i,
+  /\/\s*litre/i,
+  /\/\s*liter/i,
+  /\/\s*kg/i,
+  /\/\s*piece/i,
+  /\/\s*pièce/i,
+  /\/\s*unité/i,
+  /\/\s*unit/i,
+  /prix au/i,
+  /coût au/i,
+  /soit\s+\d/i,
+  /équivalent/i,
+  /par rapport/i,
+  /le\s+\d+\s*(?:ml|g|l)/i,
+];
+
+function isUnitPrice(text) {
+  if (!text) return false;
+  const str = `${text}`;
+  return UNIT_PRICE_PATTERNS.some((p) => p.test(str));
+}
+
 const DEFAULT_USD_TO_EUR_RATE = 0.92;
 
 // ─── IMAGE PRIORITY SOURCES ───────────────────────────────────────────────────
@@ -417,13 +443,7 @@ function scorePriceCandidate(rawValue, { order = 0, currencyHints = [], contextP
   else if (decimalDigits === 1) score += 1;
   if (digitsCount >= 4) score += 3;
   else if (digitsCount >= 3) score += 2;
-  if (numericValue !== null) {
-    if (numericValue >= 1000) score += 3;
-    else if (numericValue >= 100) score += 2;
-    else if (numericValue >= 20) score += 1;
-    else if (numericValue < 5) score -= 2;
-    else if (numericValue < 10) score -= 1;
-  }
+  // Pas de bonus/malus sur la valeur numérique — on se fie aux balises (itemprop, JSON-LD, meta)
   if (Number.isFinite(contextPenalty) && contextPenalty !== 0) score += contextPenalty;
   const tieBreaker = order * 0.01;
   return { value, score: score - tieBreaker, order };
@@ -665,15 +685,17 @@ function computeImagePriorityScore(url, sourcePriority = 0) {
 
   let score = sourcePriority;
 
-  // ✅ PATCH: Sephora PIM published — fort bonus
-  if (/media\.sephora\.eu.*\/pim\/published/i.test(url)) {
+  // ✅ PATCH: Sephora PIM published — court-circuit du filtre marketing
+  // Les swatches Sephora (media_swatch) sont l'image principale, pas du marketing
+  const isSephoraPim = /media\.sephora\.eu.*\/pim\/published/i.test(url);
+  if (isSephoraPim) {
     score += 6000;
-  }
-
-  for (const pattern of MARKETING_URL_PATTERNS) {
-    if (pattern.test(url)) {
-      score -= 5000;
-      break;
+  } else {
+    for (const pattern of MARKETING_URL_PATTERNS) {
+      if (pattern.test(url)) {
+        score -= 5000;
+        break;
+      }
     }
   }
 
@@ -1052,7 +1074,10 @@ function extractFromHtmlContent(html, url) {
   function pushPriceValue(value) {
     if (!value) return;
     const normalized = `${value}`.replace(/\s+/g, " ").trim();
-    if (normalized) priceValues.push(normalized);
+    if (!normalized) return;
+    // Ignorer les prix unitaires (prix/100ml, prix/kg, etc.)
+    if (isUnitPrice(normalized)) return;
+    priceValues.push(normalized);
   }
   function pushCurrencyValue(value) {
     if (!value) return;
@@ -1101,12 +1126,17 @@ function extractFromHtmlContent(html, url) {
   }
 
   // ✅ PATCH: Sephora — extraire les images depuis les <link rel="preload"> dans le head
-  // Ces liens contiennent les images produit haute résolution préchargées
+  // fetchPriority="high" = image principale affichée en premier dans le carrousel
   $("link[rel='preload'][as='image']").toArray().forEach((element) => {
     const href = $(element).attr("href");
-    if (href && /media\.sephora\.eu.*\/pim\/published/i.test(href)) {
-      addCandidate(href, SOURCE_PRIORITY.jsonld_product + 1000); // priorité maximale
-    }
+    if (!href || !/media\.sephora\.eu.*\/pim\/published/i.test(href)) return;
+    const fetchPriority = $(element).attr("fetchpriority") || $(element).attr("fetchPriority") || "";
+    const isMainImage = fetchPriority.toLowerCase() === "high";
+    // Image principale (fetchPriority="high") → score maximal → sera images[0]
+    const priority = isMainImage
+      ? SOURCE_PRIORITY.jsonld_product + 5000
+      : SOURCE_PRIORITY.jsonld_product + 1000;
+    addCandidate(href, priority);
   });
 
   // PRIORITY 1: JSON-LD structured data
