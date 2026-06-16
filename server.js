@@ -1995,7 +1995,7 @@ function generateJobId() {
 
 // POST /scrape-async — démarre le scrape en arrière-plan, répond immédiatement
 app.get("/scrape-async", async (req, res) => {
-  const { url } = req.query;
+  const { url, callback_url } = req.query;
   if (!url) {
     res.status(400).json({ ok: false, error: "Missing url query parameter" });
     return;
@@ -2006,19 +2006,69 @@ app.get("/scrape-async", async (req, res) => {
   }
 
   const jobId = generateJobId();
-  jobs.set(jobId, { status: "pending", result: null, createdAt: Date.now() });
+  jobs.set(jobId, { status: "pending", result: null, createdAt: Date.now(), callback_url });
 
   // Lancer le scrape en arrière-plan sans attendre
   scrapeWithStages(`${url}`)
-    .then((result) => {
-      jobs.set(jobId, { status: "done", result, createdAt: jobs.get(jobId)?.createdAt });
+    .then(async (result) => {
+      jobs.set(jobId, { status: "done", result, createdAt: jobs.get(jobId)?.createdAt, callback_url });
+      
+      // Si un callback_url est fourni, l'appeler avec le résultat
+      if (callback_url) {
+        try {
+          await axios.post(`${callback_url}`, {
+            job_id: jobId,
+            ok: result.ok,
+            title: result.title || null,
+            price: result.price || null,
+            images: result.images || [],
+            imagesCount: result.imagesCount || 0,
+            url,
+            stage: result.stage,
+            blocked: result.blocked,
+            duration: result.duration,
+            error: result.error || null,
+          }, {
+            timeout: 10000,
+            headers: { "Content-Type": "application/json" }
+          });
+        } catch (err) {
+          console.error(`Webhook callback failed for job ${jobId}:`, err.message);
+        }
+      }
     })
-    .catch((err) => {
+    .catch(async (err) => {
+      const errorResult = { ok: false, error: err.message || "Scrape failed" };
       jobs.set(jobId, {
         status: "failed",
-        result: { ok: false, error: err.message || "Scrape failed" },
+        result: errorResult,
         createdAt: jobs.get(jobId)?.createdAt,
+        callback_url
       });
+      
+      // Même en cas d'erreur, appeler le callback
+      if (callback_url) {
+        try {
+          await axios.post(`${callback_url}`, {
+            job_id: jobId,
+            ok: false,
+            title: null,
+            price: null,
+            images: [],
+            imagesCount: 0,
+            url,
+            stage: "failed",
+            blocked: false,
+            duration: null,
+            error: err.message || "Scrape failed",
+          }, {
+            timeout: 10000,
+            headers: { "Content-Type": "application/json" }
+          });
+        } catch (callbackErr) {
+          console.error(`Webhook callback failed for job ${jobId}:`, callbackErr.message);
+        }
+      }
     });
 
   // Nettoyer les vieux jobs après 10 minutes
