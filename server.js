@@ -1672,7 +1672,10 @@ async function runStage4(url) {
     // Pause pour laisser le JS s'exécuter
     await new Promise(r => setTimeout(r, 2000));
 
-    const html = await page.content();
+    // BrightData recommande page.evaluate plutôt que page.content()
+    const html = await page.evaluate(() => document.documentElement.outerHTML).catch(async () => {
+      return await page.content();
+    });
     await page.close();
 
     if (!html || html.length < 5000) {
