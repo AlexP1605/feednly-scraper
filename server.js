@@ -1547,6 +1547,7 @@ async function runStage3(url) {
     zone: process.env.BRIGHTDATA_ZONE || "web_unlocker1",
     url,
     format: "raw",
+    country: "fr",
     // Headers browser réalistes pour passer Akamai Bot Manager
     headers: {
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -1981,8 +1982,74 @@ app.get("/scrape", async (req, res) => {
   }
 });
 
+// ─── MODE ASYNCHRONE ─────────────────────────────────────────────────────────
+// Stockage en mémoire des jobs (réinitialisé au redémarrage de l'instance)
+const jobs = new Map();
+
+function generateJobId() {
+  return `job_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+
+// POST /scrape-async — démarre le scrape en arrière-plan, répond immédiatement
+app.get("/scrape-async", async (req, res) => {
+  const { url } = req.query;
+  if (!url) {
+    res.status(400).json({ ok: false, error: "Missing url query parameter" });
+    return;
+  }
+  if (!isAllowedScrapeUrl(`${url}`)) {
+    res.status(400).json({ ok: false, error: "Invalid or disallowed URL" });
+    return;
+  }
+
+  const jobId = generateJobId();
+  jobs.set(jobId, { status: "pending", result: null, createdAt: Date.now() });
+
+  // Lancer le scrape en arrière-plan sans attendre
+  scrapeWithStages(`${url}`)
+    .then((result) => {
+      jobs.set(jobId, { status: "done", result, createdAt: jobs.get(jobId)?.createdAt });
+    })
+    .catch((err) => {
+      jobs.set(jobId, {
+        status: "failed",
+        result: { ok: false, error: err.message || "Scrape failed" },
+        createdAt: jobs.get(jobId)?.createdAt,
+      });
+    });
+
+  // Nettoyer les vieux jobs après 10 minutes
+  setTimeout(() => jobs.delete(jobId), 10 * 60 * 1000);
+
+  // Répondre immédiatement avec le job_id
+  res.json({ ok: true, job_id: jobId, status: "pending" });
+});
+
+// GET /status?job_id=xxx — retourne l'état du scrape
+app.get("/status", (req, res) => {
+  const { job_id } = req.query;
+  if (!job_id) {
+    res.status(400).json({ ok: false, error: "Missing job_id query parameter" });
+    return;
+  }
+
+  const job = jobs.get(`${job_id}`);
+  if (!job) {
+    res.status(404).json({ ok: false, error: "Job not found or expired" });
+    return;
+  }
+
+  if (job.status === "pending") {
+    res.json({ ok: true, job_id, status: "pending" });
+    return;
+  }
+
+  res.json({ ok: true, job_id, status: job.status, result: job.result });
+});
+
 const portValue = process.env.PORT;
 let PORT = Number.parseInt(`${portValue ?? ""}`.trim(), 10);
 if (!Number.isFinite(PORT) || PORT <= 0) PORT = 8080;
 
 app.listen(PORT, "0.0.0.0");
+
