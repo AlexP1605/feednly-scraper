@@ -1668,10 +1668,13 @@ async function runStage4(url) {
     // Attendre que le contenu principal soit chargé
     await page.waitForSelector("body", { timeout: 10000 }).catch(() => {});
 
+    // Pause supplémentaire pour laisser le JS s'exécuter
+    await new Promise(r => setTimeout(r, 3000));
+
     const html = await page.content();
     await page.close();
 
-    if (!html || html.length < 1000) {
+    if (!html || html.length < 5000) {
       return { ok: false, stage: "stage4", error: "Empty response from Scraping Browser" };
     }
 
@@ -1877,7 +1880,7 @@ async function scrapeWithStages(url) {
   if (!finalResult && process.env.BRIGHTDATA_SCRAPING_BROWSER_ENDPOINT) {
     stage4Attempted = true;
     console.log(JSON.stringify({ event: "STAGE4_ATTEMPT", url }));
-    stage4Result = await runStageWithHardTimeout("stage4", 25000, () => runStage4(url));
+    stage4Result = await runStageWithHardTimeout("stage4", 45000, () => runStage4(url));
     if (stage4Result?.ok) {
       finalResult = stage4Result;
       finalStage = stage4Result?.meta?.stage || "scraping_browser";
