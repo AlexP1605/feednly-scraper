@@ -1662,15 +1662,15 @@ async function runStage4(url) {
     });
 
     const page = await browser.newPage();
-    page.setDefaultTimeout(45000);
+    page.setDefaultTimeout(40000);
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    // networkidle2 = attend que le réseau soit calme (Next.js a fini de charger)
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 35000 }).catch(async () => {
+      // Si networkidle2 timeout, on essaie quand même de récupérer le contenu
+    });
 
-    // Attendre que le contenu principal soit chargé
-    await page.waitForSelector("body", { timeout: 10000 }).catch(() => {});
-
-    // Pause supplémentaire pour laisser le JS s'exécuter
-    await new Promise(r => setTimeout(r, 3000));
+    // Pause pour laisser le JS s'exécuter
+    await new Promise(r => setTimeout(r, 2000));
 
     const html = await page.content();
     await page.close();
@@ -1692,7 +1692,7 @@ async function runStage4(url) {
       durationSeconds,
       network: { durationSeconds },
       userAgent: "BrightData-ScrapingBrowser",
-      navigationWaitUntil: "domcontentloaded",
+      navigationWaitUntil: "networkidle2",
       navigationTimedOut: false,
     });
   } catch (err) {
