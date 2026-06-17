@@ -1494,47 +1494,74 @@ async function runStage1(url) {
 // ─── STAGE 0 : fetch HTTP simple (gratuit, ~1-2s) ───────────────────────────
 // Fonctionne sur les sites SSR (Next.js, Nuxt) qui envoient le HTML complet
 // sans JavaScript. Sephora utilise Next.js SSR → bonne chance de succès.
+// User-Agents de crawlers sociaux — whitelistés par Akamai et la plupart des anti-bots
+// car les sites ont besoin qu'ils fonctionnent pour les previews réseaux sociaux
+const CRAWLER_USER_AGENTS = [
+  "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+  "Twitterbot/1.0",
+  "WhatsApp/2.23.24.82 A",
+  "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)",
+  "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+  "TelegramBot (like TwitterBot)",
+  "Pinterest/0.2 (+http://www.pinterest.com/bot.html)",
+];
+
+function pickCrawlerUserAgent() {
+  return CRAWLER_USER_AGENTS[Math.floor(Math.random() * CRAWLER_USER_AGENTS.length)];
+}
+
 async function runStage0(url) {
   const stageStart = performance.now();
-  try {
-    const ua = pickUserAgent();
-    const response = await axios.get(url, {
-      timeout: 5000,
-      responseType: "text",
-      headers: {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-      },
-      maxRedirects: 5,
-    });
-    const html = response.data;
-    if (!html || html.length < 1000) {
-      return { ok: false, stage: "stage0", error: "Response too short" };
+
+  // Essayer d'abord avec un User-Agent crawler (whitelisté par Akamai)
+  // puis fallback sur un User-Agent browser classique
+  const attemptsConfig = [
+    { ua: pickCrawlerUserAgent(), label: "crawler" },
+    { ua: pickUserAgent(), label: "browser" },
+  ];
+
+  for (const { ua, label } of attemptsConfig) {
+    try {
+      const response = await axios.get(url, {
+        timeout: 8000,
+        responseType: "text",
+        headers: {
+          "User-Agent": ua,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+          "Accept-Encoding": "gzip, deflate, br",
+          "Cache-Control": "no-cache",
+        },
+        maxRedirects: 5,
+      });
+
+      const html = response.data;
+      if (!html || html.length < 1000) continue;
+      if (/<title>.*?access denied.*?<\/title>/i.test(html) || /blocked/i.test(html.substring(0, 500))) continue;
+
+      const extracted = extractFromHtmlContent(html, url);
+      if (!isValidResult(extracted)) continue;
+
+      const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
+      return buildSuccessPayload(extracted, {
+        stage: "stage0", fallbackUsed: false, blocked: false,
+        durationSeconds, network: { durationSeconds },
+        userAgent: ua, navigationWaitUntil: "fetch", navigationTimedOut: false,
+        crawlerUa: label,
+      });
+    } catch (err) {
+      const status = err?.response?.status;
+      // Si 403 avec crawler UA → essayer browser UA
+      if (status === 403 || status === 429) continue;
+      // Autre erreur → abandonner
+      const message = status
+        ? `Stage0 HTTP ${status}`
+        : `Stage0 fetch failed: ${err?.message || "unknown"}`;
+      return { ok: false, stage: "stage0", error: message };
     }
-    if (/<title>.*?access denied.*?<\/title>/i.test(html) || /blocked/i.test(html.substring(0, 500))) {
-      return { ok: false, stage: "stage0", error: "Blocked by server" };
-    }
-    const extracted = extractFromHtmlContent(html, url);
-    if (!isValidResult(extracted)) {
-      return { ok: false, stage: "stage0", error: "Stage0 extraction invalid or incomplete" };
-    }
-    const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
-    return buildSuccessPayload(extracted, {
-      stage: "stage0", fallbackUsed: false, blocked: false,
-      durationSeconds, network: { durationSeconds },
-      userAgent: ua, navigationWaitUntil: "fetch", navigationTimedOut: false,
-    });
-  } catch (err) {
-    const status = err?.response?.status;
-    const message = status
-      ? `Stage0 HTTP ${status}`
-      : `Stage0 fetch failed: ${err?.message || "unknown"}`;
-    return { ok: false, stage: "stage0", error: message };
   }
+
+  return { ok: false, stage: "stage0", error: "Stage0 blocked on all UA attempts" };
 }
 
 async function runStage3(url) {
