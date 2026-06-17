@@ -1698,6 +1698,108 @@ function isBrightDataForcedDomain(url) {
   }
 }
 
+// ─── STAGE APIFY : Sephora uniquement via API mobile officielle ─────────────
+// Utilise l'Actor Apify autofacts/sephora qui appelle l'API mobile Sephora
+// avec TLS fingerprint impersonation + OAuth2 guest token.
+// Activé seulement pour les domaines Sephora + si APIFY_API_TOKEN est défini.
+async function runApify(url) {
+  const apiToken = process.env.APIFY_API_TOKEN;
+  if (!apiToken) return { ok: false, stage: "apify", error: "APIFY_API_TOKEN missing" };
+
+  const stageStart = performance.now();
+
+  try {
+    // 1. Lancer le run Apify
+    const runResponse = await axios.post(
+      "https://api.apify.com/v2/acts/autofacts~sephora/runs?waitForFinish=60",
+      {
+        startUrls: [{ url }],
+        proxy: { useApifyProxy: true, apifyProxyGroups: ["RESIDENTIAL"] },
+        maxConcurrency: 1,
+        maxRequestsPerCrawl: 1,
+      },
+      {
+        headers: {
+          "Authorization": `Bearer ${apiToken}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 70000,
+      }
+    );
+
+    const run = runResponse.data?.data;
+    if (!run || run.status !== "SUCCEEDED") {
+      return { ok: false, stage: "apify", error: `Apify run status: ${run?.status || "unknown"}` };
+    }
+
+    // 2. Récupérer les résultats
+    const datasetResponse = await axios.get(
+      `https://api.apify.com/v2/datasets/${run.defaultDatasetId}/items`,
+      {
+        headers: { "Authorization": `Bearer ${apiToken}` },
+        timeout: 10000,
+      }
+    );
+
+    const items = datasetResponse.data;
+    if (!items || items.length === 0) {
+      return { ok: false, stage: "apify", error: "Apify returned no items" };
+    }
+
+    const product = items[0];
+
+    // 3. Extraire titre, prix, images
+    const title = product.title || null;
+    const brand = product.brand || null;
+    const fullTitle = brand && title && !title.includes(brand) ? `${title} | ${brand}` : title;
+
+    // Prix = premier variant en stock
+    let price = null;
+    if (product.variants?.length > 0) {
+      const inStock = product.variants.find(v => v.price?.stockStatus === "IN_STOCK");
+      const variant = inStock || product.variants[0];
+      price = variant?.price?.current ? String(variant.price.current) : null;
+    }
+
+    // Images = medias hi-res
+    const images = (product.medias || [])
+      .filter(m => m.type === "hi-res" && m.url)
+      .map(m => ({ url: m.url, filename: m.url.split("/").pop()?.split("?")[0] || "" }))
+      .slice(0, 10);
+
+    if (!fullTitle && !price && images.length === 0) {
+      return { ok: false, stage: "apify", error: "Apify returned empty product" };
+    }
+
+    const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
+    return {
+      ok: true,
+      stage: "apify",
+      title: fullTitle,
+      price,
+      description: product.description || null,
+      images,
+      meta: {
+        stage: "apify",
+        durationSeconds,
+        network: { durationSeconds },
+        blocked: false,
+        fallbackUsed: false,
+        navigationTimedOut: false,
+        navigationWaitUntil: "api",
+        userAgent: "ApifyActor",
+        costEstimate: 0.006,
+      },
+    };
+  } catch (err) {
+    const status = err?.response?.status;
+    const message = status
+      ? `Apify HTTP ${status}: ${err?.response?.data?.error?.message || ""}`
+      : `Apify error: ${err?.message || "unknown"}`;
+    return { ok: false, stage: "apify", error: message };
+  }
+}
+
 // ─── STAGE 4 : BrightData Scraping Browser (dernier recours) ────────────────
 // Vrai Chrome hébergé chez BrightData — quasi impossible à bloquer par Akamai.
 // Activé seulement si BRIGHTDATA_SCRAPING_BROWSER_ENDPOINT est défini.
@@ -1917,6 +2019,22 @@ async function scrapeWithStages(url) {
   } else {
     steps.stage1 = "skipped";
   }
+
+  // ── STAGE APIFY : Sephora uniquement ────────────────────────────────────
+  let apifyResult = null;
+  let apifyAttempted = false;
+  if (!finalResult && isBrightDataForcedDomain(url) && process.env.APIFY_API_TOKEN) {
+    apifyAttempted = true;
+    console.log(JSON.stringify({ event: "APIFY_ATTEMPT", url }));
+    apifyResult = await runApify(url);
+    if (apifyResult?.ok) {
+      finalResult = apifyResult;
+      finalStage = "apify";
+    }
+  }
+  steps.apify = apifyAttempted
+    ? (apifyResult?.ok ? "success" : "failed")
+    : "skipped";
 
   // ── STAGE 3 : BrightData Web Unlocker (une seule tentative) ────────────────
   let stage3Result = null;
