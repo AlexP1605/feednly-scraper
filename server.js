@@ -1513,17 +1513,32 @@ function pickCrawlerUserAgent() {
 async function runStage0(url) {
   const stageStart = performance.now();
 
-  // Essayer d'abord avec un User-Agent crawler (whitelisté par Akamai)
-  // puis fallback sur un User-Agent browser classique
+  // Tentative 1 & 2 : User-Agent crawler puis browser (sans proxy)
   const attemptsConfig = [
-    { ua: pickCrawlerUserAgent(), label: "crawler" },
-    { ua: pickUserAgent(), label: "browser" },
+    { ua: pickCrawlerUserAgent(), label: "crawler", useProxy: false },
+    { ua: pickUserAgent(), label: "browser", useProxy: false },
   ];
 
-  for (const { ua, label } of attemptsConfig) {
+  // Tentative 3 : proxy BrightData HTTP résidentiel (si configuré)
+  // Permet de bypasser Akamai sur les sites qui bloquent les IPs datacenter
+  const proxyUser = process.env.SCRAPER_PROXY_POOL
+    ? (() => {
+        try {
+          const u = new URL(process.env.SCRAPER_PROXY_POOL);
+          return { host: u.hostname, port: parseInt(u.port) || 22225, username: u.username, password: u.password };
+        } catch { return null; }
+      })()
+    : null;
+
+  if (proxyUser) {
+    attemptsConfig.push({ ua: pickCrawlerUserAgent(), label: "proxy_crawler", useProxy: true });
+    attemptsConfig.push({ ua: pickUserAgent(), label: "proxy_browser", useProxy: true });
+  }
+
+  for (const { ua, label, useProxy } of attemptsConfig) {
     try {
-      const response = await axios.get(url, {
-        timeout: 8000,
+      const axiosConfig = {
+        timeout: 10000,
         responseType: "text",
         headers: {
           "User-Agent": ua,
@@ -1533,7 +1548,18 @@ async function runStage0(url) {
           "Cache-Control": "no-cache",
         },
         maxRedirects: 5,
-      });
+      };
+
+      if (useProxy && proxyUser) {
+        axiosConfig.proxy = {
+          host: proxyUser.host,
+          port: proxyUser.port,
+          auth: { username: proxyUser.username, password: proxyUser.password },
+          protocol: "http",
+        };
+      }
+
+      const response = await axios.get(url, axiosConfig);
 
       const html = response.data;
       if (!html || html.length < 1000) continue;
@@ -1544,20 +1570,21 @@ async function runStage0(url) {
 
       const durationSeconds = roundDuration((performance.now() - stageStart) / 1000);
       return buildSuccessPayload(extracted, {
-        stage: "stage0", fallbackUsed: false, blocked: false,
+        stage: "stage0", fallbackUsed: useProxy, blocked: false,
         durationSeconds, network: { durationSeconds },
         userAgent: ua, navigationWaitUntil: "fetch", navigationTimedOut: false,
         crawlerUa: label,
       });
     } catch (err) {
       const status = err?.response?.status;
-      // Si 403 avec crawler UA → essayer browser UA
-      if (status === 403 || status === 429) continue;
-      // Autre erreur → abandonner
+      if (status === 403 || status === 429 || status === 407) continue;
+      // Erreur réseau/proxy → continuer
+      if (err?.code === "ECONNREFUSED" || err?.code === "ETIMEDOUT") continue;
       const message = status
         ? `Stage0 HTTP ${status}`
         : `Stage0 fetch failed: ${err?.message || "unknown"}`;
-      return { ok: false, stage: "stage0", error: message };
+      if (!useProxy) return { ok: false, stage: "stage0", error: message };
+      continue;
     }
   }
 
