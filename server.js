@@ -1975,13 +1975,22 @@ async function scrapeWithStages(url) {
     }
   }
 
-  // ── STAGE 0 : fetch HTTP simple (gratuit, ~1-2s) ─────────────────────────
+  // ── STAGE 0 : fetch HTTP simple (gratuit, ~1-2s) avec retry sur différents UA ────
   let stage0Result = null;
   let stage0Attempted = false;
   // Tenter stage0 seulement si ce n'est pas un domaine qui force BrightData d'emblée
   // (on le tente quand même sur Sephora car c'est SSR Next.js)
   stage0Attempted = true;
-  stage0Result = await runStage0(url);
+  
+  // Retry stage0 avec différents UA si le premier échoue
+  for (let i = 0; i < USER_AGENTS.length && !stage0Result?.ok; i++) {
+    stage0Result = await runStageWithHardTimeout("stage0", 8000, () => runStage0(url, USER_AGENTS[i]));
+    if (stage0Result?.ok) {
+      if (i > 0) console.log(JSON.stringify({ event: "STAGE0_SUCCESS_ON_RETRY", url, uaIndex: i }));
+      break;
+    }
+  }
+  
   steps.stage0 = resolveStageStatus(stage0Result, true, false);
   let finalResult = null;
   let finalStage = "stage0";
@@ -2161,6 +2170,24 @@ app.get("/scrape", async (req, res) => {
 // Stockage en mémoire des jobs (réinitialisé au redémarrage de l'instance)
 const jobs = new Map();
 
+// ── Nettoyage automatique des vieux jobs toutes les 5 min ────────────────────
+setInterval(() => {
+  const now = Date.now();
+  const maxAge = 30 * 60 * 1000; // 30 minutes
+  let cleaned = 0;
+  
+  for (const [jobId, job] of jobs.entries()) {
+    if (now - job.createdAt > maxAge) {
+      jobs.delete(jobId);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(JSON.stringify({ event: "JOBS_CLEANUP", cleaned, remaining: jobs.size }));
+  }
+}, 5 * 60 * 1000); // Toutes les 5 minutes
+
 function generateJobId() {
   return `job_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 }
@@ -2242,9 +2269,6 @@ app.get("/scrape-async", async (req, res) => {
         }
       }
     });
-
-  // Nettoyer les vieux jobs après 10 minutes
-  setTimeout(() => jobs.delete(jobId), 10 * 60 * 1000);
 
   // Répondre immédiatement avec le job_id
   res.json({ ok: true, job_id: jobId, status: "pending" });
