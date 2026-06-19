@@ -352,7 +352,7 @@ async function runShopifyApi(url) {
 
     const title = product.title || null;
     const description = product.body_html
-      ? cheerio.load(product.body_html).text().replace(/\s+/g, " ").trim().slice(0, 300) || null
+      ? stripHtml(cheerio.load(product.body_html).text()).slice(0, 300) || null
       : null;
 
     const variant = product.variants?.[0];
@@ -1425,7 +1425,7 @@ function buildSuccessPayload(data, meta) {
   return {
     ok: true,
     title: decodeHtmlEntities(data.title) || null,
-    description: decodeHtmlEntities(data.description) || null,
+    description: stripHtml(decodeHtmlEntities(data.description)) || null,
     price: data.price || null,
     images: imageObjects,
     meta,
@@ -1864,8 +1864,36 @@ async function runStage4(url) {
   }
 }
 
+// ── Strip UTM params de l'URL ────────────────────────────────────────────────
+function stripUtmParams(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    const utmKeys = ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "gclid", "gbraid", "gad_source", "gad_campaignid"];
+    utmKeys.forEach(key => parsed.searchParams.delete(key));
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+// ── Strip HTML brut → texte propre ───────────────────────────────────────────
+function stripHtml(html) {
+  if (!html) return '';
+  return html
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function scrapeWithStages(url) {
   if (!url) throw new Error("URL is required");
+  // Strip UTM params pour éviter les URLs trackées
+  url = stripUtmParams(url);
   const requestStart = performance.now();
   const steps = { shopify_api: "skipped", stage0: "skipped", stage1: "skipped", stage3: "skipped", stage4: "skipped" };
 
