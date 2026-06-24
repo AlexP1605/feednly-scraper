@@ -1777,7 +1777,7 @@ async function runApify(url) {
       stage: "apify",
       title: fullTitle,
       price,
-      description: product.description || null,
+      description: product.description ? stripHtml(product.description) : null,
       images,
       meta: {
         stage: "apify",
