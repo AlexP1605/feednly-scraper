@@ -223,6 +223,7 @@ const MARKETING_URL_PATTERNS = [
   /dw\/image\/v2.*Library/i,
   /mysephora.*fid/i,
   /blackfid|goldfid|bronzefid/i,
+  /-blob\./i,  // PATCH: Nocibe swatches de couleurs
 ];
 
 const MIN_IMAGE_DIMENSION = 300;
@@ -1777,7 +1778,7 @@ async function runApify(url) {
       stage: "apify",
       title: fullTitle,
       price,
-      description: product.description ? stripHtml(product.description) : null,
+      description: product.description || null,
       images,
       meta: {
         stage: "apify",
