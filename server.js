@@ -816,7 +816,7 @@ function createImageDedupKey(url) {
       "h", "height", "hei", "rh", "mh",
       "sw", "sh", "sm", "frz-v", "frzv",
       "scalewidth", "scaleheight", "scalemode",
-      "imwidth", "imheight", "size", "scale", "scaling",
+      "imwidth", "imheight", "imdensity", "size", "scale", "scaling",
       "fit", "crop", "dpr", "ar", "trim",
       "quality", "q", "compression",
       "format", "auto", "ext", "fm",
