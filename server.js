@@ -2128,6 +2128,10 @@ async function scrapeWithStages(url) {
     };
   }
 
+  if (finalResult?.description) {
+    finalResult.description = stripHtml(decodeHtmlEntities(finalResult.description));
+  }
+
   const durationSeconds = roundDuration((performance.now() - requestStart) / 1000);
   const blocked = Boolean(
     finalResult?.meta?.blocked || finalResult?.status === "blocked" ||
